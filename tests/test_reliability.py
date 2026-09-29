@@ -17,6 +17,14 @@ class ReliabilityTests(unittest.TestCase):
         with patch('newsroom.core.request_response',side_effect=AIResponseError('HTTP_403')),patch('newsroom.core.fetch_google_news',return_value=FetchedItems([{'url':'https://tass.ru/1'}])) as fallback:
             result=fetch_web_search('цифровая валюта',{})
         self.assertEqual(len(result),1);self.assertIn('SEARCH_FALLBACK:HTTP_403',result.diagnostics);fallback.assert_called_once()
+    def test_search_fallback_failure_preserves_both_safe_error_codes(self):
+        with patch('newsroom.core.request_response',side_effect=AIResponseError('NETWORK_TIMEOUT')), \
+             patch('newsroom.core.fetch_google_news',side_effect=TimeoutError('https://private.example timed out')):
+            with self.assertRaises(AIResponseError) as caught:
+                fetch_web_search('цифровая валюта',{})
+        self.assertEqual(caught.exception.code,
+                         'SEARCH_FALLBACK_FAILED:NETWORK_TIMEOUT:NETWORK_TIMEOUT')
+        self.assertNotIn('private.example',str(caught.exception))
     def test_roundups_screened_before_read_for_all_sources(self):
         for typ in ['rss','telegram']:
             for title in ['#календарь Ключевые события','Что случилось на крипторынке, пока все спали — обзор','Дайджест новостей']:

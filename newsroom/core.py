@@ -803,7 +803,14 @@ def fetch_web_search(query: str, ai_settings: dict, interest_exclusions: list[st
         # Independent public index keeps discovery working during an API outage.
         search_query = query + " " + " ".join('-"' + term.replace('"', '') + '"' for term in (interest_exclusions or [])[:12])
         url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({"q":search_query, "hl":"ru", "gl":"RU", "ceid":"RU:ru"})
-        items = fetch_google_news(url)
+        try:
+            items = fetch_google_news(url)
+        except Exception as fallback_exc:
+            # Keep both safe codes so an unavailable fallback is distinguishable
+            # from an API timeout alone without retaining URLs or response text.
+            fallback_code = _safe_source_error(fallback_exc)
+            raise AIResponseError(
+                f"SEARCH_FALLBACK_FAILED:{exc.code}:{fallback_code}") from None
         items.diagnostics = list(getattr(items, "diagnostics", [])) + ["SEARCH_FALLBACK:" + exc.code]
         return items
     links, seen = [], set()
