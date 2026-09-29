@@ -153,8 +153,12 @@ def screen(db, item_id, item, settings):
     cached = _state(db, 'triage:'+str(item_id))
     if cached and cached.get('fingerprint') == fingerprint:
         return cached
-    if settings.get('_triage_disabled') or settings.get('_triage_budget', 1) <= 0:
-        return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен до следующего цикла'}
+    if settings.get('_triage_disabled'):
+        return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен: ИИ временно недоступен в этом цикле',
+                'retry_without_count': True}
+    if settings.get('_triage_budget', 1) <= 0:
+        return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен: исчерпан лимит проверок текущего цикла',
+                'retry_without_count': True}
     if '_triage_budget' in settings:
         settings['_triage_budget'] -= 1
     try:
@@ -163,13 +167,14 @@ def screen(db, item_id, item, settings):
         settings['_triage_disabled'] = True
         code = exc.code if isinstance(exc, AIResponseError) else type(exc).__name__
         db.execute('INSERT INTO errors(timestamp,message) VALUES(?,?)', (datetime.now(timezone.utc).isoformat(), 'TRIAGE:'+code))
-        return {'decision': 'DEFER', 'reason': 'Ранний отбор временно недоступен'}
+        return {'decision': 'DEFER', 'reason': f'Ранний отбор не завершён: {code}',
+                'retry_without_count': False}
     result = {**result, 'fingerprint': fingerprint, 'origin': 'ai'}
     save_state(db, 'triage:'+str(item_id), result)
     return result
 
 
-def schedule_retry(db, item_id, outcome, now=None, retry=True):
+def schedule_retry(db, item_id, outcome, now=None, retry=True, reason=None, delay_seconds=None):
     now = now or datetime.now(timezone.utc)
     key = 'selection_retry:'+str(item_id)
     if outcome not in {'PRIMARY_RETRY', 'AI_RETRY', 'WAITING_CONFIRMATION', 'ERROR'}:
@@ -177,8 +182,13 @@ def schedule_retry(db, item_id, outcome, now=None, retry=True):
         return
     prior = _state(db, key) or {}
     attempts = prior.get('attempts', 0) + (1 if retry else 0)
-    if not retry and prior:
-        return prior.get('attempts', 0)
     minutes = (1, 2, 3, 3, 3)[min(max(attempts - 1, 0), 4)]
-    save_state(db, key, {'attempts': attempts, 'next_at': (now + timedelta(minutes=minutes)).isoformat(), 'outcome': outcome})
+    next_at = now + (timedelta(seconds=max(1, int(delay_seconds))) if delay_seconds is not None
+                     else timedelta(minutes=minutes))
+    state = {'attempts': attempts, 'next_at': next_at.isoformat(), 'outcome': outcome}
+    if reason:
+        state['reason'] = str(reason)[:300]
+    elif prior.get('outcome') == outcome and prior.get('reason'):
+        state['reason'] = prior['reason']
+    save_state(db, key, state)
     return attempts

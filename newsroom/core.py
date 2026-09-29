@@ -1489,7 +1489,13 @@ def process_item(db, source, item: dict, threshold: float, max_length: int, fres
                          (source["source_id"], canonicalize(item["url"]))).fetchone()
         if row and row["disposition"] == outcome:
             if outcome in {"PRIMARY_RETRY", "AI_RETRY", "WAITING_CONFIRMATION"}:
-                attempts = schedule_retry(db, row["item_id"], outcome, retry=existing_item_id is not None and not item.get("_source_search_deferred"))
+                retry_without_count = bool(item.get("_retry_without_count") or item.get("_source_search_deferred"))
+                attempts = schedule_retry(
+                    db, row["item_id"], outcome,
+                    retry=existing_item_id is not None and not retry_without_count,
+                    reason=item.get("_retry_reason"),
+                    delay_seconds=(ai_settings or {}).get("_retry_cycle_delay_seconds") if retry_without_count else None,
+                )
                 if attempts >= MAX_AUTOMATIC_RETRIES:
                     db.execute("UPDATE items SET disposition='REJECTED',processed_at=? WHERE item_id=?",
                                (NOW(), row["item_id"]))
@@ -1551,16 +1557,17 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
     canonical = canonicalize(item["url"])
     body = item.get("content") or item.get("description") or item["title"]
     content_hash, title_hash = digest(body), digest(item["title"].lower().strip())
+    feed_content_hash = digest(" ".join(str(body).split()))
     try:
         source_status = item.get("primary_source_status") or "NOT_CHECKED"
         primary_source = _primary_source_from_item(item, source_status)
         if existing_item_id is None:
             try:
                 cur = db.execute("""INSERT INTO items(source_id,url,canonical_url,title,description,content,author,published_at,updated_at,
-                  discovered_at,content_hash,title_hash,primary_source_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  discovered_at,content_hash,title_hash,feed_content_hash,primary_source_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (source["source_id"], item["url"], canonical, item["title"], item.get("description", ""),
                    item.get("content", ""), item.get("author"), item.get("published_at"), item.get("updated_at"),
-                   now, content_hash, title_hash,
+                   now, content_hash, title_hash, feed_content_hash,
                    _stored_primary(item, primary_source, source_status)))
                 item_id = cur.lastrowid
             except Exception as exc:
@@ -1573,20 +1580,29 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                 if db.execute("SELECT 1 FROM items WHERE source_id=? AND content_hash=? AND item_id<>?",
                               (source["source_id"], content_hash, prior["item_id"])).fetchone():
                     return "DUPLICATE"
-                unchanged = (prior["content_hash"] == content_hash and prior["title_hash"] == title_hash
-                             and prior["description"] == item.get("description", "")
-                             and prior["published_at"] == item.get("published_at")
-                             and prior["updated_at"] == item.get("updated_at"))
+                same_metadata = (prior["title_hash"] == title_hash
+                                 and prior["description"] == item.get("description", "")
+                                 and prior["author"] == item.get("author")
+                                 and prior["published_at"] == item.get("published_at")
+                                 and prior["updated_at"] == item.get("updated_at"))
+                stored_feed_hash = prior["feed_content_hash"] if "feed_content_hash" in prior.keys() else ""
+                # `items.content` is enriched with fetched article text. Compare a
+                # feed poll to its own last-seen body so enrichment cannot reset retries.
+                unchanged = same_metadata and (not stored_feed_hash or stored_feed_hash == feed_content_hash)
                 if unchanged:
+                    if not stored_feed_hash:
+                        db.execute("UPDATE items SET feed_content_hash=? WHERE item_id=?",
+                                   (feed_content_hash, prior["item_id"]))
+                        db.commit()
                     return "DUPLICATE"
                 item_id = prior["item_id"]
                 _archive_item_revision(db, item_id, prior)
                 db.execute("""UPDATE items SET url=?,title=?,description=?,content=?,author=?,published_at=?,updated_at=?,
-                              content_hash=?,title_hash=?,primary_source_json=?,disposition='PENDING',processed_at=NULL
+                              content_hash=?,title_hash=?,feed_content_hash=?,primary_source_json=?,disposition='PENDING',processed_at=NULL
                               WHERE item_id=?""",
                            (item["url"], item["title"], item.get("description", ""), body, item.get("author"),
                             item.get("published_at"), item.get("updated_at"), content_hash, title_hash,
-                            _stored_primary(item, primary_source, source_status), item_id))
+                            feed_content_hash, _stored_primary(item, primary_source, source_status), item_id))
                 db.execute("DELETE FROM item_analysis WHERE item_id=?", (item_id,))
                 db.executemany("DELETE FROM app_state WHERE key=?", [(f"triage:{item_id}",),
                                  (f"selection_retry:{item_id}",), (f"editor_retry:{item_id}",)])
@@ -1635,6 +1651,9 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         decision = selection["decision"]
         if decision in {"NOISE", "DEFER"} or (decision == "DUPLICATE" and not memory_enforced):
             outcome = "AI_RETRY" if decision == "DEFER" else decision
+            if decision == "DEFER":
+                item["_retry_without_count"] = bool(selection.get("retry_without_count"))
+                item["_retry_reason"] = selection.get("reason")
             story_id = int(selection["story_id"]) if decision == "DUPLICATE" else None
             db.execute("UPDATE items SET disposition=?,story_id=?,processed_at=? WHERE item_id=?",
                        (outcome, story_id, now, item_id))
@@ -1753,6 +1772,8 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             db.commit()
             ai_settings["_disabled_for_cycle"] = True
             ai_result = None
+            item["_retry_reason"] = f"ИИ-разбор не завершён: {reason}"
+            item["_retry_without_count"] = False
         if ai_result is not None:
             db.execute("INSERT INTO app_state(key,value) VALUES('ai_last_success',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (NOW(),))
             # Missing evidence is not evidence of irrelevance. Keep plausible local
@@ -1796,6 +1817,16 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
 
     if ai_result is None:
         held = "AI_RETRY" if (source_status == "READ" and primary_source) or publisher_report else "PRIMARY_RETRY"
+        if not item.get("_retry_reason"):
+            if ai_settings.get("_disabled_for_cycle"):
+                item["_retry_reason"] = "ИИ-разбор отложен: модель временно недоступна в этом цикле"
+                item["_retry_without_count"] = True
+            elif ai_settings.get("_analysis_budget", 1) <= 0:
+                item["_retry_reason"] = "ИИ-разбор отложен: исчерпан лимит проверок текущего цикла"
+                item["_retry_without_count"] = True
+            else:
+                item["_retry_reason"] = "ИИ-разбор отложен: проверьте настройки доступа модели"
+                item["_retry_without_count"] = True
         db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (held, now, item_id))
         db.commit()
         return held
@@ -2007,6 +2038,16 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
     counts: dict[str, int] = {}
     if not source_by_id or limit <= 0:
         return counts
+    # Retries share model budgets with fresh stories. Keep a small retry slice so
+    # held items cannot consume the entire cycle before current feeds arrive.
+    limit = min(limit, max(1, int(config.get("newsroom", {}).get("retry_items_per_cycle", 4))))
+    ai_settings = config.get("ai", {})
+    if ai_settings.get("triage_enabled"):
+        limit = min(limit, max(0, int(ai_settings.get("_triage_budget", 0))))
+    if "_analysis_budget" in ai_settings:
+        limit = min(limit, max(0, int(ai_settings.get("_analysis_budget", 0))))
+    if limit <= 0:
+        return counts
     placeholders = ",".join("?" for _ in source_by_id)
     # Apply due times before LIMIT, so sleeping retries cannot starve fresh work.
     due_filter = (" AND COALESCE(julianday((SELECT json_extract(value,'$.next_at') FROM app_state WHERE key='selection_retry:'||items.item_id)),0)<=julianday('now') "
@@ -2087,6 +2128,80 @@ def _close_exhausted_retries(db) -> int:
     return count
 
 
+def _reconcile_legacy_retry_loops(db) -> int:
+    """Close unchanged items already analyzed past the automatic retry limit.
+
+    Older builds confused an enriched article body with a changed feed entry,
+    which reset retry state on every poll. Use the append-only snapshots once
+    to enforce the existing retry limit for those same unchanged versions.
+    """
+    marker = "retry_enrichment_reconciled_v2"
+    if db.execute("SELECT 1 FROM app_state WHERE key=?", (marker,)).fetchone():
+        return 0
+
+    rows = db.execute("""SELECT item_id,title,description,author,published_at,updated_at,content,disposition
+        FROM items WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION')""").fetchall()
+    closed = 0
+    for item in rows:
+        revisions = db.execute("""SELECT source_snapshot_json,decision_snapshot_json
+            FROM item_revisions WHERE item_id=? ORDER BY revision_id""", (item["item_id"],)).fetchall()
+        completed = 0
+        for revision in revisions:
+            try:
+                source = json.loads(revision["source_snapshot_json"])
+                decision = json.loads(revision["decision_snapshot_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            same_version = all(source.get(key) == item[key]
+                               for key in ("title", "description", "author", "published_at", "updated_at"))
+            if same_version and decision.get("analysis"):
+                completed += 1
+        current_analysis = db.execute("SELECT 1 FROM item_analysis WHERE item_id=?", (item["item_id"],)).fetchone()
+        if current_analysis:
+            completed += 1
+        if completed <= 0:
+            continue
+
+        prior = db.execute("SELECT value FROM app_state WHERE key=?",
+                           (f"selection_retry:{item['item_id']}",)).fetchone()
+        try:
+            retry = json.loads(prior[0]) if prior else {}
+        except (TypeError, json.JSONDecodeError):
+            retry = {}
+        prior_attempts = int(retry.get("attempts") or 0)
+        attempts = max(prior_attempts, min(MAX_AUTOMATIC_RETRIES, completed - 1))
+        attempts_updated = attempts > prior_attempts
+        if attempts_updated:
+            retry["attempts"] = attempts
+            retry["reason"] = f"По журналу версий учтено {completed} завершённых разборов этой версии."
+        if attempts < MAX_AUTOMATIC_RETRIES:
+            if attempts_updated:
+                db.execute("INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (f"selection_retry:{item['item_id']}", json.dumps(retry, ensure_ascii=False)))
+            continue
+
+        reason = (f"Эта версия уже прошла {MAX_AUTOMATIC_RETRIES} повторных проверок; "
+                  "дальнейшие автоматические попытки остановлены.")
+        retry.update({"attempts": MAX_AUTOMATIC_RETRIES, "outcome": item["disposition"], "reason": reason})
+        retry["next_at"] = NOW()
+        db.execute("INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (f"selection_retry:{item['item_id']}", json.dumps(retry, ensure_ascii=False)))
+        db.execute("UPDATE items SET disposition='REJECTED',processed_at=? WHERE item_id=?",
+                   (NOW(), item["item_id"]))
+        from .decisions import record
+        record(db, item["item_id"], "REJECTED", extra={
+            "reason": reason,
+            "reason_code": "RETRY_HISTORY_RECONCILIATION",
+            "completed_analyses_for_unchanged_version": completed,
+        })
+        closed += 1
+
+    db.execute("INSERT INTO app_state(key,value) VALUES(?,?)",
+               (marker, json.dumps({"at": NOW(), "closed": closed}, ensure_ascii=False)))
+    db.commit()
+    return closed
+
+
 def _requeue_social_quote_repairs(db, ai_settings, freshness_hours: int) -> int:
     """Re-evaluate fresh rejected exact social posts once under the current filter."""
     if not get_api_key(ai_settings or {}):
@@ -2149,6 +2264,7 @@ def _requeue_social_quote_repairs(db, ai_settings, freshness_hours: int) -> int:
 def run_cycle(config: dict) -> dict[str, int]:
     config = {**config, "ai": {k: v for k, v in config.get("ai", {}).items() if k not in {"_disabled_for_cycle", "_triage_disabled"}}}
     config["ai"]["_analysis_budget"] = int(config["newsroom"].get("analysis_per_cycle", 25))
+    config["ai"]["_retry_cycle_delay_seconds"] = max(30, int(config["newsroom"].get("poll_interval_seconds", 180)))
     config["ai"]["_recovery_search_budget"] = 2
     config["ai"]["_triage_budget"] = int(config["newsroom"].get("triage_per_cycle", 12))
     watch_reserve = min(3, max(0, config['ai']['_analysis_budget']), max(0, config['ai']['_triage_budget'])) if config['newsroom'].get('story_watch_enabled') else 0
@@ -2159,6 +2275,9 @@ def run_cycle(config: dict) -> dict[str, int]:
                    "matching_seconds": 0.0, "processing_seconds": 0.0}
     db = connect(config["newsroom"]["database"])
     counts: dict[str, int] = {}
+    reconciled = _reconcile_legacy_retry_loops(db)
+    if reconciled:
+        counts["RETRY_HISTORY_RECONCILED"] = reconciled
     sources = []
     active_configs = [
         (source_cfg, source_cfg.get("type", "rss"))

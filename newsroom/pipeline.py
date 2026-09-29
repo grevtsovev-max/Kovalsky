@@ -1,6 +1,7 @@
 """Read-only editorial intake view. Counts represent saved items, not feed polls."""
 import json
 from datetime import datetime, timedelta, timezone
+from .triage import MAX_AUTOMATIC_RETRIES
 
 STAGES = [
     ('received', 'Ждут обработки'), ('primary', 'Чтение источника'),
@@ -102,7 +103,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         post = min(candidates, key=lambda p: p['created_at']) if candidates and disposition in {'NEW_STORY','UPDATE_CANDIDATE'} else None
         category = {'PRIMARY_RETRY':'primary', 'AI_RETRY':'ai',
                     'WAITING_CONFIRMATION':'confirmation', 'PENDING':'received'}.get(disposition, 'processed')
-        reason = REASONS.get(disposition, 'Обработка завершена; связанный пост не найден.')
+        reason = retry.get('reason') or REASONS.get(disposition, 'Обработка завершена; связанный пост не найден.')
         if disposition in {'NOISE','DUPLICATE','STALE','BASELINE_SKIPPED','UNDATED','EDITOR_REJECTED','REJECTED'}:
             category = 'filtered'
         if post:
@@ -124,6 +125,10 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             primary_status=PRIMARY_LABELS.get(primary.get('status'), 'Проверка не завершена' if primary else 'Нет сохранённой проверки'),
             primary_url=primary.get('url'), summary=analysis.get('summary_ru'),
             analyzed_at=item.get('analyzed_at'), retry_at=retry.get('next_at'),
+            last_attempt_at=item.get('processed_at'),
+            retry_attempts=int(retry.get('attempts') or 0),
+            retry_limit=(MAX_AUTOMATIC_RETRIES if disposition in {'AI_RETRY', 'PRIMARY_RETRY', 'WAITING_CONFIRMATION'} else 0),
+            retry_reason=retry.get('reason'),
             what_is_new=analysis.get('what_is_new'), issues=analysis.get('editorial_issues') or [],
             independent_note=analysis.get('independent_check_note'),
             interest_vote=item.get('interest_vote'),

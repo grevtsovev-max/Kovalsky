@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS items (
   description TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '', author TEXT,
   published_at TEXT, updated_at TEXT, discovered_at TEXT NOT NULL, processed_at TEXT,
   content_hash TEXT NOT NULL, title_hash TEXT NOT NULL,
+  feed_content_hash TEXT NOT NULL DEFAULT '',
   disposition TEXT NOT NULL DEFAULT 'PENDING', story_id INTEGER,
   primary_source_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE(source_id, canonical_url), UNIQUE(source_id, content_hash)
@@ -182,6 +183,8 @@ def connect(path: str) -> sqlite3.Connection:
     from .archive_memory import SCHEMA as ARCHIVE_SCHEMA
     db.executescript(ARCHIVE_SCHEMA)
     item_columns = {row[1] for row in db.execute("PRAGMA table_info(items)")}
+    if "feed_content_hash" not in item_columns:
+        db.execute("ALTER TABLE items ADD COLUMN feed_content_hash TEXT NOT NULL DEFAULT ''")
     edit_columns = {row[1] for row in db.execute("PRAGMA table_info(telegram_post_edits)")}
     for name, declaration in (("capture_source", "TEXT NOT NULL DEFAULT 'TELEGRAM_UPDATE'"), ("source_url", "TEXT")):
         if name not in edit_columns:
