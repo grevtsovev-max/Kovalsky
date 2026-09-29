@@ -1,6 +1,9 @@
 [newsroom]
 database = "data/newsroom.sqlite3"
 poll_interval_seconds = 180
+retry_items_per_cycle = 8
+analysis_per_cycle = 25
+triage_per_cycle = 12
 # Включать после переноса истории и проверки memory_mode=enforce.
 story_watch_enabled = false
 story_watch_per_cycle = 2

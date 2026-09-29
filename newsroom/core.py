@@ -1477,6 +1477,17 @@ def _archive_item_revision(db, item_id: int, prior_row) -> None:
                             "processed_at": source_snapshot.get("processed_at")}, ensure_ascii=False)))
 
 
+def _trace_item(item: dict, stage: str, outcome: str, reason: str, **details) -> None:
+    """Keep a compact, user-readable trace alongside the immutable decision snapshot."""
+    trace = item.setdefault("_audit_trace", [])
+    event = {"stage": stage[:80], "outcome": outcome[:60], "reason": str(reason or "")[:400]}
+    for key, value in details.items():
+        if value is None or value == "":
+            continue
+        event[key] = value[:400] if isinstance(value, str) else value
+    trace.append(event)
+
+
 def process_item(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
                  initial_backfill_minutes: int | None = None, relevance_terms: list[str] | None = None,
                  ai_settings: dict | None = None, existing_item_id: int | None = None) -> str:
@@ -1497,13 +1508,44 @@ def process_item(db, source, item: dict, threshold: float, max_length: int, fres
                     delay_seconds=(ai_settings or {}).get("_retry_cycle_delay_seconds") if retry_without_count else None,
                 )
                 if attempts >= MAX_AUTOMATIC_RETRIES:
+                    exhausted_reason = (f"Исчерпан лимит: {attempts} автоматических повторных проверок; "
+                                        "эта версия закрыта без публикации.")
+                    item["_retry_reason"] = exhausted_reason
+                    _trace_item(item, "Лимит повторов", "Закрыт", exhausted_reason,
+                                attempts=attempts, limit=MAX_AUTOMATIC_RETRIES)
+                    retry_key = f"selection_retry:{row['item_id']}"
+                    retry_row = db.execute("SELECT value FROM app_state WHERE key=?", (retry_key,)).fetchone()
+                    if retry_row:
+                        try:
+                            retry_state = json.loads(retry_row["value"] or "{}")
+                        except (TypeError, json.JSONDecodeError):
+                            retry_state = {}
+                        retry_state.update({"reason": exhausted_reason, "outcome": "REJECTED", "next_at": NOW()})
+                        db.execute("UPDATE app_state SET value=? WHERE key=?",
+                                   (json.dumps(retry_state, ensure_ascii=False), retry_key))
                     db.execute("UPDATE items SET disposition='REJECTED',processed_at=? WHERE item_id=?",
                                (NOW(), row["item_id"]))
                     outcome = "REJECTED"
             else:
                 schedule_retry(db, row["item_id"], outcome)
+            trace = item.get("_audit_trace", [])
+            last_reason = trace[-1].get("reason") if trace else ""
+            summary = (item.get("_retry_reason") or last_reason or {
+                "NEW_STORY": "Создан новый сюжет; черновик передан на автоматический допуск.",
+                "UPDATE_CANDIDATE": "Добавлено новое сообщение к известному сюжету; черновик передан на автоматический допуск.",
+                "DUPLICATE": "Новое существенное сведение не найдено.",
+                "NOISE": "Материал отсеян до публикации.",
+                "REJECTED": "Автоматическая обработка завершена по лимиту повторных проверок.",
+                "STORE_ONLY": "Свидетельство сохранено в памяти; нового повода для поста нет.",
+            }.get(outcome, "Обработка завершена."))
+            _trace_item(item, "Итог обработки", outcome, summary)
+            audit = {}
+            if item.get("_audit_trace"):
+                audit["audit_trace"] = item["_audit_trace"]
+            if item.get("_audit_triage"):
+                audit["audit_triage"] = item["_audit_triage"]
             from .decisions import record
-            record(db, row["item_id"], outcome, (ai_settings or {}).get("model"))
+            record(db, row["item_id"], outcome, (ai_settings or {}).get("model"), extra=audit)
             db.commit()
     except Exception as exc:
         outcome = "ERROR"
@@ -1617,11 +1659,13 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             return "DUPLICATE"
         raise
     if is_non_news_telegram_format(source, item):
+        _trace_item(item, "Формат материала", "Отсеян", "Сообщение не является новостной публикацией.")
         db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "NOISE"
     event_time = item.get("updated_at") or item.get("published_at")
     if not event_time:
+        _trace_item(item, "Дата публикации", "Отсеян", "У материала не указана дата публикации.")
         db.execute("UPDATE items SET disposition='UNDATED',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "UNDATED"
@@ -1630,16 +1674,20 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
     except ValueError:
         age_hours = 0
     if initial_backfill_minutes is not None and age_hours * 60 > initial_backfill_minutes:
+        _trace_item(item, "Первичная загрузка", "Отсеян", "Материал старше окна первичной загрузки.")
         db.execute("UPDATE items SET disposition='BASELINE_SKIPPED',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "BASELINE_SKIPPED"
     if age_hours > freshness_hours:
+        _trace_item(item, "Свежесть", "Отсеян", f"Материал старше окна свежести ({freshness_hours} ч).")
         db.execute("UPDATE items SET disposition='STALE',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "STALE"
     # Use the headline and publisher's summary for topic screening; long article bodies can mention unrelated keywords.
     relevance_text = f"{item['title']} {item.get('description', '')}"
     if relevance_terms and not is_relevant(relevance_text, relevance_terms):
+        _trace_item(item, "Тематический фильтр", "Отсеян",
+                    "В заголовке и описании не найдено совпадений с темами мониторинга.")
         db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "NOISE"
@@ -1649,6 +1697,11 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         selection = screen_item(db, item_id, item, ai_settings)
         timings["ai_seconds"] += time.perf_counter() - stage_started
         decision = selection["decision"]
+        item["_audit_triage"] = {key: selection.get(key) for key in
+                                 ("decision", "reason", "evidence", "confidence", "origin") if selection.get(key) is not None}
+        _trace_item(item, "Предварительный ИИ-отбор", decision,
+                    selection.get("reason") or "Предварительный отбор завершён.",
+                    evidence=selection.get("evidence"), confidence=selection.get("confidence"))
         if decision in {"NOISE", "DEFER"} or (decision == "DUPLICATE" and not memory_enforced):
             outcome = "AI_RETRY" if decision == "DEFER" else decision
             if decision == "DEFER":
@@ -1666,6 +1719,9 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         timings["primary_source_read_seconds"] += time.perf_counter() - stage_started
         source_status = item.get("primary_source_status", "ARTICLE_UNREADABLE")
         primary_source = _primary_source_from_item(item, source_status)
+        read_reason = ("Материал прочитан; текст сохранён для проверки." if source_status == "READ"
+                       else f"Не удалось прочитать материал ({source_status}).")
+        _trace_item(item, "Чтение материала", source_status, read_reason)
         content_hash = digest(body)
         title_hash = digest(item["title"].lower().strip())
         db.execute("""UPDATE items SET title=?,description=?,content=?,content_hash=?,title_hash=?,primary_source_json=?
@@ -1693,6 +1749,9 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         primary_source = None
     if selection and (not primary_source or source_status != "READ") and not publisher_report:
         held = "PRIMARY_RETRY" if selection["decision"] == "KEEP" else "WAITING_CONFIRMATION"
+        _trace_item(item, "Проверка источника", held,
+                    "Для следующего этапа пока нет прочитанного пригодного материала.",
+                    source_status=source_status)
         db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (held, now, item_id))
         db.commit()
         return held
@@ -1725,7 +1784,8 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         ai_options = dict(ai_settings)
         ai_options["max_post_length"] = max_length
         try:
-            ai_input = dict(item)
+            ai_input = {key: value for key, value in item.items()
+                        if key not in {"_audit_trace", "_audit_triage"}}
             ai_input["primary_source"] = primary_source
             ai_input["primary_source_status"] = source_status
             ai_input["publisher_report_exception"] = bool(publisher_report)
@@ -1774,7 +1834,11 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             ai_result = None
             item["_retry_reason"] = f"ИИ-разбор не завершён: {reason}"
             item["_retry_without_count"] = False
+            _trace_item(item, "Редакторский ИИ-разбор", "Ошибка", item["_retry_reason"])
         if ai_result is not None:
+            _trace_item(item, "Редакторский ИИ-разбор", "Завершён",
+                        "ИИ подготовил результат редакторского разбора.",
+                        action=ai_result.get("action"), recommendation=ai_result.get("publication_recommendation"))
             db.execute("INSERT INTO app_state(key,value) VALUES('ai_last_success',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (NOW(),))
             # Missing evidence is not evidence of irrelevance. Keep plausible local
             # stories for source recovery; duplicates need no new publication evidence.
@@ -1827,12 +1891,16 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             else:
                 item["_retry_reason"] = "ИИ-разбор отложен: проверьте настройки доступа модели"
                 item["_retry_without_count"] = True
+        _trace_item(item, "Редакторский ИИ-разбор", "Ожидает повтора", item["_retry_reason"])
         db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (held, now, item_id))
         db.commit()
         return held
 
     if (ai_result and ai_result.get("publication_recommendation") == "WAIT_FOR_AUTOMATION"
             and (source_status != "READ" or not primary_source) and not publisher_report):
+        _trace_item(item, "Проверка источника", "Ожидает повтора",
+                    "Разбор завершён, но нет прочитанного материала, на котором можно обосновать публикацию.",
+                    source_status=source_status)
         db.execute("UPDATE items SET disposition='PRIMARY_RETRY',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "PRIMARY_RETRY"
@@ -1843,6 +1911,8 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         ai_story = next((s for s in story_rows if str(s["story_id"]) == chosen_id), None)
         action = ai_result.get("action")
         if action == "DUPLICATE" and not memory_enforced:
+            _trace_item(item, "Сверка с опубликованными сюжетами", "Дубликат",
+                        "ИИ сопоставил материал с уже опубликованным сюжетом.")
             if ai_story:
                 db.execute("UPDATE items SET story_id=?,disposition='DUPLICATE',processed_at=? WHERE item_id=?",
                            (ai_story["story_id"], now, item_id))
@@ -1864,6 +1934,21 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         direct_impact = ai_result.get("russia_cis_impact") == "DIRECT" and _impact_evidence_is_grounded(ai_result, evidence_source)
         if (not ai_result.get("is_relevant") or not direct_impact or action == "NOISE" or category == "PRICE_FORECAST"
                 or tech_not_in_scope or outside_target_market):
+            filter_reasons = []
+            if not ai_result.get("is_relevant") or action == "NOISE":
+                filter_reasons.append("ИИ не подтвердил тематическую значимость")
+            if not direct_impact:
+                filter_reasons.append("не подтверждено прямое влияние на Россию/СНГ")
+            if category == "PRICE_FORECAST":
+                filter_reasons.append("ценовой прогноз исключён редакционными правилами")
+            if tech_not_in_scope:
+                filter_reasons.append("техническая новость не прошла требования к конкретности, географии или стадии")
+            if outside_target_market:
+                filter_reasons.append("событие вне целевой географии")
+            _trace_item(item, "Тематический и географический допуск", "Отсеян",
+                        "; ".join(filter_reasons) or "Не выполнены условия допуска.",
+                        geographic_scope=geographic_scope, category=category,
+                        impact=ai_result.get("russia_cis_impact"), evidence=ai_result.get("impact_evidence"))
             db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
             db.commit()
             return "NOISE"
@@ -1873,6 +1958,7 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                 resolved_story_id = exact_story(db, ai_result.get('memory'))
             except MemoryInvalid as exc:
                 ai_result['memory_issues'] = [str(exc)]
+                _trace_item(item, "Проверка памяти сюжетов", "Нужна повторная проверка", str(exc))
                 db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
                            (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
                 db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION',processed_at=? WHERE item_id=?",(now,item_id))
@@ -1897,6 +1983,8 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         # Use similarity as a repeat filter only when there is no explicit material-update decision.
         if (not memory_enforced and (ai_result is None or ai_result.get("action") != "UPDATE")
                 and similarity(candidate, best["latest_information"]) > 0.8):
+            _trace_item(item, "Сверка с известным сюжетом", "Дубликат",
+                        "Существенное новое сведение не найдено; содержание совпадает с уже известным сюжетом.")
             db.execute("UPDATE items SET story_id=?,disposition='DUPLICATE',processed_at=? WHERE item_id=?",
                        (story_id, now, item_id))
             db.commit()
@@ -1919,6 +2007,10 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                    (story_id, item_id, item.get("published_at") or now, publisher_name, body[:2000], 0.6))
         status = "NEW_STORY"
         headline = ai_result.get("headline_ru") or item["title"] if ai_result else item["title"]
+    _trace_item(item, "Сюжет и черновик", status,
+                "Новое событие передано на автоматический допуск." if status == "NEW_STORY"
+                else "Новые сведения добавлены к известному сюжету и переданы на автоматический допуск.",
+                what_is_new=(ai_result or {}).get("what_is_new"))
     memory_diff = None
     if memory_mode in {"shadow", "enforce"}:
         from .knowledge import ingest, MemoryInvalid
@@ -1927,17 +2019,25 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                                  publisher_report=bool(publisher_report))
         except MemoryInvalid as exc:
             ai_result['memory_issues'] = [str(exc)]
+            _trace_item(item, "Проверка памяти сюжетов", "Нужна повторная проверка", str(exc))
             if memory_enforced:
                 ai_result['publication_recommendation'] = 'WAIT_FOR_AUTOMATION'
         else:
             ai_result['story_diff'] = memory_diff
             if memory_enforced and memory_diff['conflict_state'] != 'NONE':
                 ai_result['publication_recommendation'] = 'WAIT_FOR_AUTOMATION'
+                _trace_item(item, "Проверка памяти сюжетов", "Нужна повторная проверка",
+                            "Найден конфликт между новым материалом и сохранёнными сведениями.",
+                            conflict_state=memory_diff.get('conflict_state'))
             elif memory_enforced and not memory_diff['significant_update']:
                 disposition = 'STORE_ONLY' if memory_diff['unpublished_facts'] else 'DUPLICATE'
+                _trace_item(item, "Проверка новизны сюжета", disposition,
+                            "Нового существенного повода для отдельной публикации не найдено.")
                 if memory_diff['unpublished_facts'] and ai_result.get('publication_recommendation') == 'AUTO_PUBLISH':
                     ai_result['memory_issues'] = ['PUBLICATION_RECOMMENDATION_WITHOUT_MATERIAL_FACT: оцените существенность для читателя, а не новизну для памяти; REPEAT неопубликованного факта допускает material=true']
                     disposition = 'WAITING_CONFIRMATION'
+                    _trace_item(item, "Проверка допуска", disposition,
+                                "Рекомендация к публикации не подтверждена существенным новым фактом.")
                 db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (disposition,now,item_id))
                 db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
                            (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
@@ -1956,6 +2056,17 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                     disposition = "REJECTED" if retries and int(retries[0]) >= 3 else "WAITING_CONFIRMATION"
             else:
                 disposition = "REJECTED"
+            reasons = []
+            if ai_result.get("memory_issues"):
+                reasons.extend(str(value) for value in ai_result["memory_issues"][:3])
+            if ai_result.get("source_review_required"):
+                reasons.append("нужна дополнительная проверка источника или доказательства")
+            if ai_result.get("independent_check_required"):
+                reasons.append("нужна сверка выявленного расхождения")
+            if not reasons:
+                reasons.append(f"редакторская рекомендация: {recommendation or 'не задана'}")
+            _trace_item(item, "Автоматический редакторский допуск", disposition,
+                        "; ".join(reasons))
             db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (disposition, now, item_id))
             db.commit()
             return disposition
@@ -1963,6 +2074,8 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         issues = editorial_issues(headline, quality_body or "", ai_result)
         if issues:
             ai_result["editorial_issues"] = issues
+            _trace_item(item, "Автоматическая проверка текста", "Нужна повторная проверка",
+                        "; ".join(issues), issues=issues)
             db.execute("UPDATE item_analysis SET result_json=? WHERE item_id=?",
                        (json.dumps({**ai_result, "_filter_version": FILTER_VERSION}, ensure_ascii=False), item_id))
             retries = db.execute("SELECT CAST(value AS INTEGER) FROM app_state WHERE key=?", ("editor_retry:"+str(item_id),)).fetchone()
