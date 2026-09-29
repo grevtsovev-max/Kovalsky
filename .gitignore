@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+data/*.sqlite3*
+config.toml
+.DS_Store
+/data/
+*.zip
+/Kovalsky-audit-snapshot*
+/WORKSPACE-MIGRATION-*.json
+
+data/openai_api_key

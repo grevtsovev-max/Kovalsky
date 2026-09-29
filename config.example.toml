@@ -1,0 +1,77 @@
+[newsroom]
+database = "data/newsroom.sqlite3"
+poll_interval_seconds = 180
+# Включать после переноса истории и проверки memory_mode=enforce.
+story_watch_enabled = false
+story_watch_per_cycle = 2
+story_watch_items_per_job = 3
+digest_enabled = false
+weekly_digest_enabled = false
+weekly_digest_time = "19:30"
+weekly_digest_title = "Крипторынок: главное за неделю"
+weekly_digest_lookback_hours = 168
+weekly_analysis_enabled = false
+weekly_analysis_time = "20:00"
+weekly_analysis_lookback_hours = 168
+weekly_analysis_max_output_tokens = 2400
+digest_interval_hours = 48
+digest_lookback_hours = 48
+digest_title = "Главное за последние два дня"
+max_post_length = 3500
+similarity_threshold = 0.35
+freshness_window_hours = 48
+# При подключении источника проверять последние 48 часов.
+initial_backfill_minutes = 2880
+auto_publish_since = "ЗАДАЙТЕ_ДАТУ_СТАРТА_ISO8601"
+relevance_terms = ["криптовалют", "криптоактив", "crypto", "digital asset", "биткоин", "bitcoin", "ethereum", "эфириум", "токен", "блокчейн", "blockchain", "web3", "defi", "стейблкоин", "цифровой актив", "цифровая валюта", "цифровой рубль", "цфа", "майнинг", "смарт-контракт", "криптобиржа", "криптообменник", "bitget", "binance", "coinbase", "bybit", "okx", "kraken", "uniswap", "opensea", "metamask", "tether", "circle", "ripple", "solana"]
+
+[ai]
+# off / shadow / enforce. Переход на enforce требует переноса опубликованной истории.
+memory_mode = "off"
+model = "gpt-6-luna"
+api_key_env = "OPENAI_API_KEY"
+keychain_service = "KiperNewsroomOpenAI"
+max_output_tokens = 1800
+timeout_seconds = 45
+
+[telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+chat_id_env = "TELEGRAM_CHAT_ID"
+keychain_service = "KiperNewsroomTelegram"
+
+[[sources]]
+name = "Example feed"
+type = "rss"
+url = "https://example.com/feed.xml"
+active = false
+priority = 1
+reputation = "unknown"
+source_role = "aggregator"
+[[sources]]
+name = "Web Search — крипторынок"
+type = "web_search"
+url = "https://api.openai.com/v1/responses#crypto-news"
+query = "latest official cryptocurrency and digital asset news Russia CIS regulation exchange stablecoin"
+active = false
+priority = 2
+reputation = "unknown"
+source_role = "discovery"
+
+[web_search]
+min_interval_minutes = 15
+
+[x]
+token_env = "X_BEARER_TOKEN"
+token_file = "data/x_bearer_token"
+min_interval_minutes = 5
+timeout_seconds = 20
+
+[[sources]]
+name = "X Recent Search — крипторынок"
+type = "x"
+url = "https://api.x.com/2/tweets/search/recent#crypto-news"
+query = "((crypto OR cryptocurrency OR bitcoin OR stablecoin) lang:en) OR ((криптовалют OR криптоактив OR биткоин OR стейблкоин) lang:ru) -is:retweet"
+active = false
+priority = 2
+reputation = "unknown"
+source_role = "discovery"

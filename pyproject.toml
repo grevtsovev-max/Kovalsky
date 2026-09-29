@@ -1,0 +1,9 @@
+[project]
+name = "kovalsky-newsroom"
+version = "0.1.0"
+description = "Local event-driven news monitoring and editorial memory"
+requires-python = ">=3.9"
+dependencies = ["tomli>=2; python_version < '3.11'"]
+
+[project.scripts]
+newsroom = "newsroom.cli:main"
