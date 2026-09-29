@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -6,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from newsroom.core import (_WebSearchQuota, _requeue_social_quote_repairs,
+                           _web_search_queue_category,
                            _restore_exact_social_headline_evidence,
                            process_item, require_primary_source_review, run_cycle)
 from newsroom.db import connect, connect_readonly
@@ -107,6 +109,36 @@ class SelfAuditRegressionTests(unittest.TestCase):
         self.db.execute("UPDATE app_state SET value=? WHERE key='web_search_last_call_at'", (earlier,))
         self.db.commit()
         self.assertTrue(quota.reserve("https://search.example/two"))
+
+    def test_global_search_queue_rotates_between_consumer_types(self):
+        demands = (True, True, True)
+        self.assertEqual(_web_search_queue_category(self.db, *demands), "feeds")
+
+    def test_retry_search_is_a_queue_demand_only_after_google_news_attempt(self):
+        from newsroom.core import _web_search_recovery_due
+        from newsroom.source_search import log
+        demands = (True, True, True)
+        url = "https://example.org/crypto-story"
+        title = "Банк России расширит правила для крипторынка"
+        content = "Банк России сообщил о новых правилах для участников крипторынка."
+        cursor = self.db.execute(
+            "INSERT INTO items(source_id,url,canonical_url,title,description,content,published_at,discovered_at,"
+            "content_hash,title_hash,disposition,primary_source_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.source["source_id"], url, url, title, content, content, self.now, self.now,
+             "hash-content", "hash-title", "PRIMARY_RETRY", json.dumps({"status": "UNREADABLE"})))
+        self.db.commit()
+        settings = {"newsroom": {"freshness_window_hours": 48},
+                    "ai": {"_analysis_budget": 2, "_recovery_search_budget": 2}}
+        with patch("newsroom.core.get_api_key", return_value="test-key"):
+            self.assertFalse(_web_search_recovery_due(self.db, settings))
+            revision_hash = hashlib.sha256((title + "\n" + content).encode()).hexdigest()
+            log(self.db, url, 1, "TITLE_AND_QUOTE_SEARCH", title, "NOT_FOUND", [], revision_hash)
+            self.db.commit()
+            self.assertTrue(_web_search_recovery_due(self.db, settings))
+        self.assertEqual(_web_search_queue_category(self.db, *demands), "feeds")
+        self.assertEqual(_web_search_queue_category(self.db, *demands), "primary_recovery")
+        self.assertEqual(_web_search_queue_category(self.db, *demands), "story_watch")
+        self.assertEqual(_web_search_queue_category(self.db, *demands), "feeds")
 
     def test_cycle_schedules_only_one_configured_search_per_global_window(self):
         config = {"newsroom": {"database": self.path}, "ai": {},

@@ -87,7 +87,9 @@ def run(db,config,search,process,now=None):
         job=db.execute("SELECT j.*,m.priority,m.interval_minutes,m.lifecycle FROM story_monitoring_jobs j JOIN story_monitoring m USING(story_id) WHERE j.active=1 AND j.next_check_at<=? AND m.lifecycle NOT IN ('CLOSED','ARCHIVED') ORDER BY j.next_check_at,m.priority DESC,j.job_id LIMIT 1",(stamp(now),)).fetchone()
         if not job:
             db.commit();break
-        reserve=getattr(search,'reserve',None)
+        reserve=getattr(search,'reserve_story_watch',None)
+        if reserve is None:
+            reserve=getattr(search,'reserve',None)
         if reserve and not reserve():
             db.rollback()
             counts['DEFERRED']=counts.get('DEFERRED',0)+1

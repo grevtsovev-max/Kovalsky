@@ -56,7 +56,9 @@ def recover(db,item,settings,news_search,web_search,terms,similarity):
         return None
     settings['_recovery_search_budget']-=1
     attempt=prior+1; strategy=STRATEGIES[attempt-1]; query=query_for(item,attempt)
-    quota_reserve=getattr(web_search,'reserve',None)
+    quota_reserve=getattr(web_search,'reserve_primary_recovery',None)
+    if quota_reserve is None:
+        quota_reserve=getattr(web_search,'reserve',None)
     if attempt > 1 and quota_reserve and not quota_reserve():
         settings['_recovery_search_budget']+=1
         item['_source_search_deferred']=True

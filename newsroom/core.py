@@ -1340,30 +1340,100 @@ def _likely_local(item):
 class _WebSearchQuota:
     """Persistent process-wide cooldown shared by feeds, recovery, and story watch."""
 
-    def __init__(self, db, interval_minutes: int):
+    def __init__(self, db, interval_minutes: int, allowed_category: str = "feeds"):
         self.db = db
         self.interval_minutes = max(1, int(interval_minutes))
+        self.allowed_category = allowed_category
 
-    def reserve(self, source_url: str | None = None) -> bool:
+    def available(self) -> bool:
         row = self.db.execute("SELECT value FROM app_state WHERE key='web_search_last_call_at'").fetchone()
         if row:
             try:
                 checked = datetime.fromisoformat(row["value"].replace("Z", "+00:00"))
+                if checked.tzinfo is None:
+                    checked = checked.replace(tzinfo=timezone.utc)
                 if (datetime.now(timezone.utc) - checked).total_seconds() < self.interval_minutes * 60:
                     return False
             except ValueError:
                 pass
+        return True
+
+    def reserve(self, source_url: str | None = None, *, category: str = "feeds") -> bool:
+        if category != self.allowed_category or not self.available():
+            return False
         now = NOW()
         self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_call_at',?) "
                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
+        self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_category',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (category,))
         if source_url:
             self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_source_url',?) "
                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (source_url,))
         self.db.commit()
         return True
 
+    def reserve_primary_recovery(self) -> bool:
+        return self.reserve(category="primary_recovery")
+
+    def reserve_story_watch(self) -> bool:
+        return self.reserve(category="story_watch")
+
     def __call__(self, query: str, ai_settings: dict) -> list[dict]:
         return fetch_web_search(query, ai_settings)
+
+
+def _web_search_queue_category(db, feeds_due: bool, recovery_due: bool,
+                               story_watch_due: bool) -> str | None:
+    due = {"feeds": feeds_due, "primary_recovery": recovery_due, "story_watch": story_watch_due}
+    if not any(due.values()):
+        return None
+    order = ("feeds", "primary_recovery", "story_watch")
+    row = db.execute("SELECT value FROM app_state WHERE key='web_search_last_scheduled_category'").fetchone()
+    prior = row["value"] if row else None
+    start = (order.index(prior) + 1) % len(order) if prior in order else 0
+    rotated = order[start:] + order[:start]
+    selected = next(category for category in rotated if due[category])
+    db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_scheduled_category',?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (selected,))
+    db.commit()
+    return selected
+
+
+def _web_search_recovery_due(db, config: dict) -> bool:
+    ai_settings = config.get("ai", {})
+    if (ai_settings.get("_recovery_search_budget", 0) <= 0
+            or ai_settings.get("_analysis_budget", 0) <= 0
+            or not get_api_key(ai_settings)):
+        return False
+    rows = db.execute("""SELECT i.item_id,i.url,i.title,i.description,i.content,i.published_at,i.updated_at,
+                   i.primary_source_json FROM items i
+        WHERE i.disposition IN ('PRIMARY_RETRY','AI_RETRY','WAITING_CONFIRMATION')
+          AND julianday(COALESCE(i.updated_at,i.published_at))>=julianday('now',?)
+          AND COALESCE((SELECT CAST(value AS INTEGER) FROM app_state
+               WHERE key='editor_retry:'||i.item_id),0)<?
+          AND COALESCE((SELECT CAST(json_extract(value,'$.attempts') AS INTEGER) FROM app_state
+               WHERE key='selection_retry:'||i.item_id),0)<?
+          AND COALESCE((SELECT julianday(json_extract(value,'$.next_at')) FROM app_state
+               WHERE key='selection_retry:'||i.item_id),0)<=julianday('now')
+        ORDER BY COALESCE(i.processed_at,i.discovered_at),i.item_id LIMIT 100""",
+                       ("-" + str(int(config.get("newsroom", {}).get("freshness_window_hours", 48))) + " hours",
+                        MAX_AUTOMATIC_RETRIES, MAX_AUTOMATIC_RETRIES)).fetchall()
+    from .source_search import STRATEGIES
+    for row in rows:
+        if not _likely_local({"title": row["title"], "description": row["description"]}):
+            continue
+        try:
+            primary = json.loads(row["primary_source_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            primary = {}
+        if primary.get("status") == "READ" or primary.get("_material_read") is True:
+            continue
+        revision_hash = digest(str(row["title"] or "") + "\n" + str(row["content"] or ""))
+        prior = db.execute("SELECT MAX(attempt) FROM source_search_log WHERE item_url=? AND revision_hash=?",
+                           (row["url"], revision_hash)).fetchone()[0] or 0
+        if 1 <= int(prior) < len(STRATEGIES):
+            return True
+    return False
 
 
 def _recover_primary(db, item, settings):
@@ -2113,8 +2183,6 @@ def run_cycle(config: dict) -> dict[str, int]:
     if config.get('newsroom',{}).get('story_watch_enabled'):
         source_by_id.update({r['source_id']:r for r in db.execute("SELECT * FROM sources WHERE url LIKE 'story-watch://%'")})
     web_search_interval = int(config.get("web_search", {}).get("min_interval_minutes", 15))
-    web_search_quota = _WebSearchQuota(db, web_search_interval)
-    config["ai"]["_web_search_quota"] = web_search_quota
     web_search_infos = [info for info in sources if info[3] == "web_search"]
     eligible_web_search = []
     for info in web_search_infos:
@@ -2125,8 +2193,20 @@ def run_cycle(config: dict) -> dict[str, int]:
         checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
         if (datetime.now(timezone.utc) - checked).total_seconds() >= web_search_interval * 60:
             eligible_web_search.append(info)
+    quota_probe = _WebSearchQuota(db, web_search_interval)
+    recovery_due = _web_search_recovery_due(db, config)
+    watch_due = False
+    if (config.get("newsroom", {}).get("story_watch_enabled") and watch_reserve > 0):
+        watch_due = bool(db.execute("""SELECT 1 FROM story_monitoring_jobs j
+            JOIN story_monitoring m USING(story_id)
+            WHERE j.active=1 AND j.next_check_at<=? AND m.lifecycle NOT IN ('CLOSED','ARCHIVED') LIMIT 1""",
+                                    (NOW(),)).fetchone())
+    queue_category = (_web_search_queue_category(db, bool(eligible_web_search), recovery_due, watch_due)
+                      if quota_probe.available() else None)
+    web_search_quota = _WebSearchQuota(db, web_search_interval, queue_category or "")
+    config["ai"]["_web_search_quota"] = web_search_quota
     scheduled_web_search_url = None
-    if eligible_web_search:
+    if eligible_web_search and queue_category == "feeds":
         last_source = db.execute("SELECT value FROM app_state WHERE key='web_search_last_source_url'").fetchone()
         info_by_url = {info[0]["url"]: info for info in web_search_infos}
         ordered_urls = [info[0]["url"] for info in web_search_infos]
@@ -2136,7 +2216,7 @@ def run_cycle(config: dict) -> dict[str, int]:
             ordered_urls = ordered_urls[start:] + ordered_urls[:start]
         selected = next((info_by_url[url] for url in ordered_urls
                          if info_by_url[url] in eligible_web_search), None)
-        if selected and web_search_quota.reserve(selected[0]["url"]):
+        if selected and web_search_quota.reserve(selected[0]["url"], category="feeds"):
             scheduled_web_search_url = selected[0]["url"]
     if web_search_infos and scheduled_web_search_url is None:
         counts["WEB_SEARCH_DEFERRED"] = len(web_search_infos)
