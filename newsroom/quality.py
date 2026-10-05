@@ -122,14 +122,18 @@ def editorial_issues(headline, body, facts, *, final_post=False, source_name=Non
     if final_post:
         lines = [line.strip() for line in (headline + '\n' + body).splitlines() if line.strip()]
         source_lines = [line for line in lines if line.startswith(('Источник:', 'Источники:'))]
+        source_urls = (re.findall(r"\[[^\]]+\]\((https?://[^)]+)\)", source_lines[0])
+                       if len(source_lines) == 1 else [])
         if (not lines or lines[0] != headline.strip() or len(source_lines) != 1
                 or lines[-1] != source_lines[0]):
             issues.append('SOURCE_FOOTER_FORMAT')
-        elif not re.search(r"^(?:Источник|Источники):\s*\[[^\]]+\]\(https?://[^)]+\)$", source_lines[0]):
+        elif (not source_urls or not re.fullmatch(
+                r"(?:Источник|Источники):\s*\[[^\]]+\]\(https?://[^)]+\)(?:,\s*\[[^\]]+\]\(https?://[^)]+\))*",
+                source_lines[0])):
             issues.append('SOURCE_LINK_FORMAT')
         source = facts.get('primary_source') or facts.get('publisher_report') or {}
         source_url = source.get('url') if isinstance(source, dict) else None
-        if source_url and source_url not in (source_lines[0] if source_lines else ''):
+        if source_url and source_url not in source_urls:
             issues.append('SOURCE_URL_MISMATCH')
     return issues
 

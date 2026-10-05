@@ -4,6 +4,7 @@ import hashlib
 import gzip
 import io
 import html
+import http.client
 import json
 import ipaddress
 import re
@@ -18,7 +19,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -140,22 +141,61 @@ def parse_date(value: str | None) -> str | None:
             return None
 
 
-def _validate_public_http_url(url: str) -> None:
-    parsed = urllib.parse.urlsplit(url)
-    if (parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password
-            or parsed.port not in (None, 443)):
-        raise ValueError("URL_NOT_ALLOWED")
-    host = parsed.hostname.rstrip(".").encode("idna").decode("ascii")
+def _public_host_addresses(host: str, port: int = 443) -> list[str]:
+    host = host.rstrip(".").encode("idna").decode("ascii")
     try:
         addresses = {str(ipaddress.ip_address(host))}
     except ValueError:
         try:
             addresses = {result[4][0].split("%", 1)[0]
-                         for result in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
+                         for result in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)}
         except OSError as exc:
             raise ValueError("URL_HOST_UNRESOLVABLE") from exc
-    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+    if not addresses or any(not ipaddress.ip_address(address).is_global
+                            or ipaddress.ip_address(address).is_multicast for address in addresses):
         raise ValueError("URL_NOT_PUBLIC")
+    return sorted(addresses)
+
+
+def _validate_public_http_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.port not in (None, 443)):
+        raise ValueError("URL_NOT_ALLOWED")
+    _public_host_addresses(parsed.hostname)
+
+
+class _PublicHttpsConnection(http.client.HTTPSConnection):
+    def connect(self):
+        # Connect to a checked numeric address, retaining the hostname for TLS.
+        # A second DNS lookup by the socket must not undo the public-address gate.
+        if self.port != 443 or self._tunnel_host:
+            raise ValueError("URL_NOT_ALLOWED")
+        addresses = _public_host_addresses(self.host, self.port)
+        deadline = time.monotonic() + float(self.timeout)
+        for index, address in enumerate(addresses):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("PUBLIC_CONNECTION_TIMEOUT")
+            try:
+                sock = socket.create_connection((address, self.port), remaining, self.source_address)
+            except OSError:
+                if index == len(addresses) - 1:
+                    raise
+                continue
+            try:
+                sock.settimeout(max(0.001, deadline - time.monotonic()))
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+            except BaseException:
+                sock.close()
+                raise
+            return
+
+
+class _PublicHttpsHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PublicHttpsConnection, req, context=self._context,
+                            check_hostname=self._check_hostname)
 
 
 class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -171,7 +211,8 @@ def _request_with_url(url: str, timeout: int = 20, public_only: bool = False) ->
     if public_only:
         _validate_public_http_url(url)
         opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(context=TLS_CONTEXT), _PublicHttpsRedirectHandler())
+            urllib.request.ProxyHandler({}), _PublicHttpsHandler(context=TLS_CONTEXT),
+            _PublicHttpsRedirectHandler())
     else:
         opener = None
     request_headers = [
@@ -894,45 +935,93 @@ def fetch_google_news(url: str) -> list[dict]:
     diagnostics = [diagnostic for _, diagnostic in fetched if diagnostic]
     return FetchedItems(result, diagnostics)
 
-def _read_discovery_links(links: list[dict]) -> list[dict]:
-    """Turn search links into ordinary publisher articles before editorial processing."""
-    result, diagnostics = [], []
-    for link in links[:8]:
+def _read_discovery_links(links: list[dict], max_results: int = 8, page_timeout: int = 20) -> list[dict]:
+    """Read a bounded set of search results concurrently, preserving result order."""
+    candidates = [link for link in links[:max(1, min(8, int(max_results)))]
+                  if str(link.get("url", "")).startswith(("https://", "http://"))]
+    if not candidates:
+        return FetchedItems([], [])
+
+    def read_link(link):
         url = link.get("url", "")
-        if not url.startswith(("https://", "http://")):
-            continue
         try:
-            article = fetch_publisher_article(url, urllib.parse.urlsplit(url).hostname or "", link.get("published_at"))
+            article = fetch_publisher_article(url, urllib.parse.urlsplit(url).hostname or "",
+                                              link.get("published_at"), timeout=max(3, min(20, int(page_timeout))),
+                                              public_only=True)
             article["published_at"] = article.get("published_at") or link.get("published_at")
-            result.append(article)
+            return article, None
         except Exception as exc:
-            diagnostics.append(_safe_source_error(exc) + "@" + (urllib.parse.urlsplit(url).hostname or ""))
+            return None, _safe_source_error(exc) + "@" + (urllib.parse.urlsplit(url).hostname or "")
+
+    with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as pool:
+        fetched = list(pool.map(read_link, candidates))
+    result = [article for article, _ in fetched if article is not None]
+    diagnostics = [diagnostic for _, diagnostic in fetched if diagnostic]
     return FetchedItems(result, diagnostics)
 
 
-def fetch_web_search(query: str, ai_settings: dict, interest_exclusions: list[str] | None = None) -> list[dict]:
+def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
+                     interest_exclusions: list[str] | None = None,
+                     max_results: int = 8, page_timeout: int = 20) -> list[dict]:
     """Use Responses web_search for discovery, then read publisher pages."""
+    raw_scopes = [query] if isinstance(query, str) else query
+    scopes = []
+    for value in raw_scopes:
+        if isinstance(value, dict):
+            scope_query = str(value.get("query", "")).strip()
+            scope_exclusions = [str(term).strip() for term in value.get("interest_exclusions", []) if str(term).strip()]
+        else:
+            scope_query = str(value).strip()
+            scope_exclusions = []
+        if scope_query:
+            scopes.append({"query": scope_query, "interest_exclusions": scope_exclusions})
+    scopes = scopes or [{"query": "cryptocurrency digital assets Russia CIS regulation exchange stablecoin",
+                         "interest_exclusions": []}]
+    query_text = "\n".join(
+        f"{index}. {scope['query']}" + (f"\n   Avoid: {'; '.join(scope['interest_exclusions'])}"
+                                         if scope["interest_exclusions"] else "")
+        for index, scope in enumerate(scopes, 1))
     try:
         data = request_response({"model": ai_settings.get("search_model", ai_settings.get("model", "gpt-6-luna")),
             "store": False, "tools": [{"type": "web_search"}], "max_output_tokens": 1800,
-            "input": f"Find recent primary-source news matching this query. Return titles, dates and URLs. Query: {query}\n"
+            "input": "Search each query scope below for recent news. Return titles, dates and URLs for the strongest relevant results from all scopes. "
+                     "Prefer material published within the last 24 hours and retain the publisher URL. Query scopes:\n"
+                     f"{query_text}\n"
                      f"Respect this user's negative interest examples and avoid similar topics: {'; '.join(interest_exclusions or [])}"}, ai_settings)
         if data.get("status") == "incomplete":
             raise AIResponseError("SEARCH_INCOMPLETE")
     except AIResponseError as exc:
-        # Independent public index keeps discovery working during an API outage.
-        search_query = query + " " + " ".join('-"' + term.replace('"', '') + '"' for term in (interest_exclusions or [])[:12])
-        url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({"q":search_query, "hl":"ru", "gl":"RU", "ceid":"RU:ru"})
-        try:
-            items = fetch_google_news(url)
-        except Exception as fallback_exc:
-            # Keep both safe codes so an unavailable fallback is distinguishable
-            # from an API timeout alone without retaining URLs or response text.
-            fallback_code = _safe_source_error(fallback_exc)
+        # Keep the query scopes together in one scheduled request so every
+        # configured discovery topic is refreshed on the same three-minute slot.
+        # On API failure, try each scope through the independent public index.
+        fallback_items, fallback_diagnostics, fallback_errors = [], [], []
+        for scope in scopes:
+            exclusions = list(dict.fromkeys((interest_exclusions or []) + scope["interest_exclusions"]))
+            negative_terms = " ".join('-"' + term.replace('"', '') + '"' for term in exclusions[:12])
+            search_query = (scope["query"] + " " + negative_terms).strip()
+            url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+                {"q": search_query, "hl": "ru", "gl": "RU", "ceid": "RU:ru"})
+            try:
+                items = fetch_google_news(url)
+                fallback_items.extend(items)
+                fallback_diagnostics.extend(getattr(items, "diagnostics", []))
+            except Exception as fallback_exc:
+                fallback_errors.append(_safe_source_error(fallback_exc))
+        deduplicated, seen_urls = [], set()
+        for item in sorted(fallback_items, key=lambda value: value.get("published_at") or "", reverse=True):
+            canonical = canonicalize(item.get("url") or "")
+            if not canonical or canonical in seen_urls:
+                continue
+            seen_urls.add(canonical)
+            deduplicated.append(item)
+            if len(deduplicated) >= 8:
+                break
+        if not deduplicated and fallback_errors:
+            # Keep safe codes so fallback failure is distinguishable from an
+            # API timeout without retaining URLs or response text.
             raise AIResponseError(
-                f"SEARCH_FALLBACK_FAILED:{exc.code}:{fallback_code}") from None
-        items.diagnostics = list(getattr(items, "diagnostics", [])) + ["SEARCH_FALLBACK:" + exc.code]
-        return items
+                f"SEARCH_FALLBACK_FAILED:{exc.code}:{','.join(fallback_errors[:3])}") from None
+        return FetchedItems(deduplicated, fallback_diagnostics + ["SEARCH_FALLBACK:" + exc.code])
     links, seen = [], set()
     for output in data.get("output", []):
         for block in output.get("content", []):
@@ -942,7 +1031,7 @@ def fetch_web_search(query: str, ai_settings: dict, interest_exclusions: list[st
                     if url and url not in seen:
                         seen.add(url)
                         links.append({"url": url, "title": annotation.get("title", "")})
-    return _read_discovery_links(links)
+    return _read_discovery_links(links, max_results=max_results, page_timeout=page_timeout)
 
 
 def fetch_x_recent(query: str, x_settings: dict) -> list[dict]:
@@ -1258,6 +1347,8 @@ def _primary_source_from_item(item: dict, status: str) -> dict | None:
         "title": item.get("primary_source_title") or "",
         "content": item["primary_source_content"][:12000],
         "status": status,
+        **({"published_at": item["primary_source_published_at"]}
+           if item.get("primary_source_published_at") else {}),
         **({"document_url": item["primary_source_document_url"]}
            if item.get("primary_source_document_url") else {}),
     }
@@ -1470,15 +1561,21 @@ def _likely_local(item):
 
 
 class _WebSearchQuota:
-    """Persistent process-wide cooldown shared by feeds, recovery, and story watch."""
+    """Persistent per-purpose cooldown for feeds, source recovery, and story watch."""
 
-    def __init__(self, db, interval_minutes: int, allowed_category: str = "feeds"):
+    def __init__(self, db, interval_minutes: int, allowed_category: str | None = None):
         self.db = db
-        self.interval_minutes = max(1, int(interval_minutes))
+        self.interval_minutes = min(3, max(1, int(interval_minutes)))
         self.allowed_category = allowed_category
 
-    def available(self) -> bool:
-        row = self.db.execute("SELECT value FROM app_state WHERE key='web_search_last_call_at'").fetchone()
+    def available(self, category: str = "feeds") -> bool:
+        category_key = "web_search_last_call_at:" + category
+        row = self.db.execute("SELECT value FROM app_state WHERE key=?", (category_key,)).fetchone()
+        # Respect the old shared cooldown during the first interval after upgrade.
+        if row is None:
+            migrated = self.db.execute("SELECT 1 FROM app_state WHERE key GLOB 'web_search_last_call_at:*' LIMIT 1").fetchone()
+            if not migrated:
+                row = self.db.execute("SELECT value FROM app_state WHERE key='web_search_last_call_at'").fetchone()
         if row:
             try:
                 checked = datetime.fromisoformat(row["value"].replace("Z", "+00:00"))
@@ -1491,16 +1588,19 @@ class _WebSearchQuota:
         return True
 
     def reserve(self, source_url: str | None = None, *, category: str = "feeds") -> bool:
-        if category != self.allowed_category or not self.available():
+        if (self.allowed_category is not None and category != self.allowed_category) or not self.available(category):
             return False
         now = NOW()
         self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_call_at',?) "
                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
+        category_key = "web_search_last_call_at:" + category
+        self.db.execute("INSERT INTO app_state(key,value) VALUES(?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (category_key, now))
         self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_category',?) "
                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (category,))
         if source_url:
-        self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_source_url',?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (source_url,))
+            self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_source_url',?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (source_url,))
         self.db.commit()
         _log_timing("web_search_slot_reserved", category=category,
                     source_url=source_url, interval_minutes=self.interval_minutes)
@@ -1516,65 +1616,226 @@ class _WebSearchQuota:
         return fetch_web_search(query, ai_settings)
 
 
-def _web_search_queue_category(db, feeds_due: bool, recovery_due: bool,
-                               story_watch_due: bool) -> str | None:
-    due = {"feeds": feeds_due, "primary_recovery": recovery_due, "story_watch": story_watch_due}
-    if not any(due.values()):
-        return None
-    order = ("feeds", "primary_recovery", "story_watch")
-    row = db.execute("SELECT value FROM app_state WHERE key='web_search_last_scheduled_category'").fetchone()
-    prior = row["value"] if row else None
-    start = (order.index(prior) + 1) % len(order) if prior in order else 0
-    rotated = order[start:] + order[:start]
-    selected = next(category for category in rotated if due[category])
-    db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_scheduled_category',?) "
-               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (selected,))
-    db.commit()
-    return selected
-
-
-def _web_search_recovery_due(db, config: dict) -> bool:
-    ai_settings = config.get("ai", {})
-    if (ai_settings.get("_recovery_search_budget", 0) <= 0
-            or ai_settings.get("_analysis_budget", 0) <= 0
-            or not get_api_key(ai_settings)):
-        return False
-    rows = db.execute("""SELECT i.item_id,i.url,i.title,i.description,i.content,i.published_at,i.updated_at,
-                   i.primary_source_json FROM items i
-        WHERE i.disposition IN ('PRIMARY_RETRY','AI_RETRY','WAITING_CONFIRMATION')
-          AND julianday(COALESCE(i.updated_at,i.published_at))>=julianday('now',?)
-          AND COALESCE((SELECT CAST(value AS INTEGER) FROM app_state
-               WHERE key='editor_retry:'||i.item_id),0)<?
-          AND COALESCE((SELECT CAST(json_extract(value,'$.attempts') AS INTEGER) FROM app_state
-               WHERE key='selection_retry:'||i.item_id),0)<?
-          AND COALESCE((SELECT julianday(json_extract(value,'$.next_at')) FROM app_state
-               WHERE key='selection_retry:'||i.item_id),0)<=julianday('now')
-        ORDER BY COALESCE(i.processed_at,i.discovered_at),i.item_id LIMIT 100""",
-                       ("-" + str(int(config.get("newsroom", {}).get("freshness_window_hours", 24))) + " hours",
-                        MAX_AUTOMATIC_RETRIES, MAX_AUTOMATIC_RETRIES)).fetchall()
-    from .source_search import STRATEGIES
-    for row in rows:
-        if not _likely_local({"title": row["title"], "description": row["description"]}):
-            continue
-        try:
-            primary = json.loads(row["primary_source_json"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            primary = {}
-        if primary.get("status") == "READ" or primary.get("_material_read") is True:
-            continue
-        revision_hash = digest(str(row["title"] or "") + "\n" + str(row["content"] or ""))
-        prior = db.execute("SELECT MAX(attempt) FROM source_search_log WHERE item_url=? AND revision_hash=?",
-                           (row["url"], revision_hash)).fetchone()[0] or 0
-        if 1 <= int(prior) < len(STRATEGIES):
-            return True
-    return False
-
-
 def _recover_primary(db, item, settings):
     """Source recovery candidates still pass the normal factual/editorial gates."""
     from .source_search import recover
     return recover(db, item, settings, fetch_google_news,
                    settings.get("_web_search_quota") or fetch_web_search, terms, similarity)
+
+
+def _agent_recover_primary(db, item, settings, source, item_id=None):
+    """Let the bounded research agent choose a recovery step for unreadable news.
+
+    Search results are not evidence until their publisher page is read. The
+    agent can only read URLs returned by its own allowlisted search tool; the
+    ordinary editor and publication gates remain authoritative.
+    """
+    from .agent import run_research_agent
+
+    quota = settings.get("_web_search_quota")
+    searched: dict[str, dict] = {}
+    read: dict[str, dict] = {}
+    history: list[dict] = []
+
+    def search(args):
+        revision_hash = digest(str(item.get("title", "")) + "\n" + str(item.get("content", "")))
+        prior = db.execute("SELECT MAX(attempt) FROM source_search_log WHERE item_url=? AND revision_hash=?",
+                           (item["url"], revision_hash)).fetchone()[0] or 0
+        if prior >= 3:
+            return {"status": "BUDGET_LIMIT", "results": []}
+        if settings.get("_recovery_search_budget", 0) <= 0:
+            item["_source_search_deferred"] = True
+            return {"status": "DEFERRED", "results": []}
+        if not quota or not quota.reserve_primary_recovery():
+            return {"status": "DEFERRED", "results": []}
+        settings["_recovery_search_budget"] -= 1
+        attempt = prior + 1
+        from .source_search import log as log_source_search
+        try:
+            results = fetch_web_search(
+                args["query"], {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))},
+                max_results=3, page_timeout=8)
+        except Exception as exc:
+            log_source_search(db, item["url"], attempt, "AGENT_SEARCH_WEB", args["query"],
+                              "ERROR", [{"error_code": type(exc).__name__}], revision_hash)
+            db.commit()
+            raise
+        rows = []
+        checked = []
+        for result in results[:6]:
+            url = result.get("material_url") or result.get("url")
+            if not url or not str(url).startswith(("https://", "http://")):
+                continue
+            searched[url] = result
+            checked.append({key: result.get(key) for key in ("url", "title", "content", "publisher_name",
+                              "published_at", "material_read", "primary_source_url",
+                              "primary_source_content", "primary_source_status", "primary_source_type")})
+            rows.append({"title": result.get("title", "")[:240], "url": url,
+                         "publisher": result.get("publisher_name", "")[:120],
+                         "published_at": result.get("published_at")})
+        log_source_search(db, item["url"], attempt, "AGENT_SEARCH_WEB", args["query"],
+                          "FOUND_CANDIDATE" if rows else "NOT_FOUND", checked, revision_hash)
+        db.commit()
+        return {"status": "OK" if rows else "NO_RESULTS", "results": rows}
+
+    def read_url(args):
+        url = args["url"]
+        result = searched.get(url)
+        if result is None:
+            return {"status": "REJECTED", "reason": "URL_NOT_FROM_SEARCH"}
+        article = result
+        content = str(article.get("content") or "")
+        if result.get("material_read") is not True or len(content.strip()) < 100:
+            parsed = urllib.parse.urlsplit(url)
+            try:
+                article = fetch_publisher_article(
+                    url, result.get("publisher_name") or parsed.hostname or "Издание",
+                    result.get("published_at"), discover_primary=True,
+                    timeout=8, public_only=True,
+                )
+                content = str(article.get("content") or "")
+            except Exception as exc:
+                code = _safe_source_error(exc)
+                article = {"url": url, "title": result.get("title", ""),
+                           "content": "", "publisher_name": result.get("publisher_name", ""),
+                           "material_read": False, "read_error": code}
+                content = ""
+
+        revision_hash = digest(str(item.get("title", "")) + "\n" + str(item.get("content", "")))
+        prior_search = db.execute(
+            "SELECT attempt,query FROM source_search_log WHERE item_url=? AND revision_hash=? "
+            "ORDER BY search_id DESC LIMIT 1", (item["url"], revision_hash),
+        ).fetchone()
+        attempt = int(prior_search["attempt"] or 1) if prior_search else 1
+        from .source_search import log as log_source_search
+        primary_content = str(article.get("primary_source_content") or "")
+        article_readable = article.get("material_read") is True and len(content.strip()) >= 100
+        primary_readable = (article.get("primary_source_status") == "READ"
+                            and len(primary_content.strip()) >= 100)
+        readable = article_readable or primary_readable
+        checked = [{"url": article.get("url") or url, "title": article.get("title", ""),
+                    "publisher_name": article.get("publisher_name", ""),
+                    "published_at": article.get("published_at"),
+                    "content": content[:12000], "material_read": article_readable,
+                    "primary_source_url": article.get("primary_source_url"),
+                    "primary_source_title": article.get("primary_source_title"),
+                    "primary_source_content": primary_content[:12000],
+                    "primary_source_status": article.get("primary_source_status", "NOT_CHECKED"),
+                    "primary_source_type": article.get("primary_source_type"),
+                    **({"error_code": article.get("read_error")} if article.get("read_error") else {})}]
+        log_source_search(db, item["url"], attempt, "AGENT_READ_URL", url,
+                          "READ" if readable else "UNREADABLE", checked, revision_hash)
+        db.commit()
+        if not readable:
+            return {"status": "UNREADABLE", "url": url,
+                    "error_code": article.get("read_error", "ARTICLE_TEXT_TOO_SHORT")}
+
+        article = {**article, "url": article.get("url") or url, "content": content,
+                   "publisher_name": article.get("publisher_name") or result.get("publisher_name"),
+                   "material_read": article_readable}
+        read[url] = article
+        read[article["url"]] = article
+        primary_url = article.get("primary_source_url")
+        if (primary_url and article.get("primary_source_status") == "READ"
+                and len(primary_content.strip()) >= 100):
+            read[primary_url] = {
+                "url": primary_url, "title": article.get("primary_source_title") or "",
+                "publisher_name": article.get("primary_source_publisher") or "",
+                "content": primary_content[:12000], "material_read": True,
+                "primary_source_status": "READ",
+                "primary_source_type": article.get("primary_source_type"),
+            }
+        return {"status": "READ" if article_readable else "PRIMARY_SOURCE_READ",
+                "title": article.get("title", "")[:240],
+                "url": article["url"], "publisher": article.get("publisher_name", "")[:120],
+                "published_at": article.get("published_at"),
+                "content": content[:8000],
+                "primary_source_url": primary_url or "",
+                "primary_source_title": article.get("primary_source_title", "")[:240],
+                "primary_source_status": article.get("primary_source_status", "NOT_CHECKED"),
+                "primary_source_content_excerpt": primary_content[:3000]}
+
+    def check_history(args):
+        query = args["query"]
+        rows = db.execute("SELECT story_id,headline,canonical_topic,latest_information,last_published_at "
+                          "FROM stories ORDER BY last_updated_at DESC LIMIT 1000").fetchall()
+        matches = sorted(((similarity(query, " ".join(str(row[k] or "") for k in
+                          ("headline", "canonical_topic", "latest_information"))), row) for row in rows),
+                         key=lambda pair: pair[0], reverse=True)[:5]
+        history[:] = [{"story_id": row["story_id"], "headline": row["headline"],
+                       "latest_information": row["latest_information"][:800],
+                       "last_published_at": row["last_published_at"], "similarity": round(score, 3)}
+                      for score, row in matches if score >= 0.2]
+        return {"status": "OK", "matches": history}
+
+    def record_agent_event(event):
+        _trace_item(item, "Исследователь", event.get("status", "ШАГ"),
+                    event.get("rationale") or event.get("tool", ""),
+                    tool=event.get("tool"), step=event.get("step"))
+        _log_timing("research_agent_action_timing", item_id=item_id,
+                    tool=event.get("tool"), outcome=event.get("status"),
+                    model_seconds=event.get("model_seconds"),
+                    tool_seconds=event.get("tool_seconds"))
+
+    try:
+        result = run_research_agent(
+            {"title": item.get("title", ""), "description": item.get("description", "")[:1500],
+             "source": source["name"], "source_url": item.get("url", ""),
+             "published_at": item.get("published_at"), "read_text": str(item.get("content") or "")[:3000],
+             "goal": "Найти прочитанный первоисточник или пригодный материал СМИ для проверки этой свежей новости."},
+            {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))},
+            {"search_web": search, "read_url": read_url, "check_story_history": check_history},
+            max_steps=int(settings.get("research_agent_max_steps", 4)), execute_tools=True,
+            on_event=record_agent_event)
+    except Exception as exc:
+        _trace_item(item, "Исследователь", "Ошибка", type(exc).__name__)
+        return None
+
+    selected = result.get("selected_primary_url") or result.get("selected_report_url")
+    material = read.get(selected)
+    if not material:
+        return None
+    if (len(terms(item.get("title", "")) & terms(material.get("title", ""))) < 3
+            or similarity(item.get("title", ""), material.get("title", "")) < 0.2):
+        _trace_item(item, "Исследователь", "Несовпадение", "Найденная страница не совпала с заголовком исходной новости.")
+        return None
+    host = urllib.parse.urlsplit(selected).hostname or ""
+    article_text = str(material.get("content") or "")[:12000]
+    if len(article_text.strip()) < 100:
+        _trace_item(item, "Исследователь", "Непрочитанный результат",
+                    "Не передаю поисковую страницу в редакторский этап без читаемого текста.")
+        return None
+    publisher = material.get("publisher_name") or host
+    if _is_official_source_host(host):
+        return {"primary_source_url": selected, "primary_source_title": material.get("title", ""),
+                "primary_source_content": article_text, "primary_source_type": "OFFICIAL",
+                "primary_source_publisher": publisher, "primary_source_status": "READ",
+                "primary_source_published_at": material.get("published_at"),
+                "material_read": True, "content": article_text, "url": selected,
+                "title": material.get("title", ""), "publisher_name": publisher,
+                "published_at": material.get("published_at")}
+    return {"material_read": True, "content": article_text, "url": selected,
+            "title": material.get("title", ""), "publisher_name": publisher,
+            "published_at": material.get("published_at")}
+
+
+def _shadow_research_agent(item, settings, source):
+    """Record one proposed recovery action without invoking its tool."""
+    from .agent import run_research_agent
+    try:
+        return run_research_agent(
+            {"title": item.get("title", ""), "description": item.get("description", "")[:1500],
+             "source": source["name"], "source_url": item.get("url", ""),
+             "published_at": item.get("published_at"), "read_text": str(item.get("content") or "")[:3000],
+             "goal": "Выбрать следующий полезный шаг для восстановления читаемого источника."},
+            {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))},
+            {}, max_steps=1, execute_tools=False,
+            on_event=lambda event: _trace_item(item, "Исследователь · тень", event.get("status", "ШАГ"),
+                                                event.get("tool", ""), tool=event.get("tool"),
+                                                step=event.get("step")))
+    except Exception as exc:
+        _trace_item(item, "Исследователь · тень", "Ошибка", type(exc).__name__)
+        return None
 
 
 def _history_context(db, item):
@@ -1583,6 +1844,75 @@ def _history_context(db, item):
     rows = db.execute("SELECT title,url,published_at,content FROM items WHERE published_at<? AND disposition IN ('NEW_STORY','UPDATE_CANDIDATE') ORDER BY published_at DESC LIMIT 300", (item.get("published_at") or NOW(),)).fetchall()
     matches = [dict(r) for r in rows if any(name in r["title"] for name in names)]
     return [{"scope":"local_archive","title":r["title"],"url":r["url"],"published_at":r["published_at"],"content":r["content"][:1200]} for r in matches[:4]]
+
+
+def _editorial_examples(db, item: dict, item_id: int, limit: int = 12,
+                        story_id: int | None = None) -> list[dict]:
+    """Prefer feedback tied to this story or similar coverage over merely recent notes."""
+    current = " ".join(str(item.get(key) or "") for key in ("title", "description"))
+    if story_id is None:
+        story = db.execute("SELECT story_id FROM items WHERE item_id=?", (item_id,)).fetchone()
+        story_id = story["story_id"] if story else None
+    columns = ("feedback_id,feedback_type,reason,item_title,substr(post_text,1,900) AS post_text,"
+               "item_id,story_id,created_at")
+    related = db.execute(
+        f"SELECT {columns} FROM editorial_feedback WHERE item_id=? OR (? IS NOT NULL AND story_id=?) "
+        "ORDER BY created_at DESC LIMIT 200", (item_id, story_id, story_id),
+    ).fetchall()
+    recent = db.execute(
+        f"SELECT {columns} FROM editorial_feedback ORDER BY created_at DESC LIMIT 400"
+    ).fetchall()
+    rows_by_id = {row["feedback_id"]: row for row in (*related, *recent)}
+    rows = list(rows_by_id.values())
+    scored = []
+    general = []
+    for row in rows:
+        exact_item = row["item_id"] == item_id
+        same_story = bool(story_id and row["story_id"] == story_id)
+        topic_score = max(similarity(current, row["item_title"] or ""),
+                          0.65 * similarity(current, row["reason"] or ""))
+        # Owner-authored notes and confirmed/refined lessons can express style
+        # preferences across topics; the editor prompt still forbids using them
+        # as evidence for facts in the current story.
+        is_general = row["feedback_type"] in {
+            "OTHER", "TELEGRAM_LINK_FEEDBACK", "TELEGRAM_EDIT_CONFIRMATION",
+            "TELEGRAM_EDIT_REFINEMENT",
+        }
+        score = (2.0 if exact_item else 0.0) + (1.4 if same_story else 0.0) + topic_score
+        if is_general:
+            # A direct owner note about a post or a refinement of the agent's
+            # inferred lesson is a stronger editorial signal than a generic
+            # recent comment. Keep that signal in the small cross-topic slice.
+            owner_priority = {
+                "TELEGRAM_EDIT_REFINEMENT": 3,
+                "TELEGRAM_LINK_FEEDBACK": 2,
+                "TELEGRAM_EDIT_CONFIRMATION": 1,
+            }.get(row["feedback_type"], 0)
+            general.append((owner_priority, score, row))
+        if score > 0.05 and not is_general:
+            scored.append((score, row))
+    scored.sort(key=lambda pair: (pair[0], pair[1]["created_at"] or ""), reverse=True)
+    general.sort(key=lambda pair: (pair[0], pair[1]["created_at"] or ""), reverse=True)
+    general_limit = min(3, limit)
+    selected = [row for _, row in scored[:max(0, limit - general_limit)]]
+    selected_ids = {row["feedback_id"] for row in selected}
+    for _, _, row in general:
+        if sum(candidate["feedback_type"] in {
+                "OTHER", "TELEGRAM_LINK_FEEDBACK", "TELEGRAM_EDIT_CONFIRMATION",
+                "TELEGRAM_EDIT_REFINEMENT",
+        } for candidate in selected) >= general_limit:
+            break
+        if row["feedback_id"] not in selected_ids:
+            selected.append(row)
+            selected_ids.add(row["feedback_id"])
+    for _, row in scored:
+        if len(selected) >= limit:
+            break
+        if row["feedback_id"] not in selected_ids:
+            selected.append(row)
+            selected_ids.add(row["feedback_id"])
+    return [{key: row[key] for key in ("feedback_type", "reason", "item_title", "post_text")}
+            for row in selected[:limit]]
 
 
 def _archive_item_revision(db, item_id: int, prior_row) -> None:
@@ -1617,9 +1947,13 @@ def _trace_item(item: dict, stage: str, outcome: str, reason: str, **details) ->
 
 def process_item(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
                  initial_backfill_minutes: int | None = None, relevance_terms: list[str] | None = None,
-                 ai_settings: dict | None = None, existing_item_id: int | None = None) -> str:
-    timings = {"primary_source_read_seconds": 0.0, "ai_seconds": 0.0}
+                 ai_settings: dict | None = None, existing_item_id: int | None = None,
+                 post_ready_callback=None) -> str:
+    timings = {"primary_source_read_seconds": 0.0, "ai_seconds": 0.0,
+               "research_agent_seconds": 0.0}
     started = time.perf_counter()
+    post_ids_ready = []
+    post_ready_item_id = None
     try:
         outcome = _process_item(db, source, item, threshold, max_length, freshness_hours,
                                 initial_backfill_minutes, relevance_terms, ai_settings, timings, existing_item_id)
@@ -1674,6 +2008,16 @@ def process_item(db, source, item: dict, threshold: float, max_length: int, fres
             from .decisions import record
             record(db, row["item_id"], outcome, (ai_settings or {}).get("model"), extra=audit)
             db.commit()
+        if outcome in {"NEW_STORY", "UPDATE_CANDIDATE"} and post_ready_callback:
+            item_row = db.execute("SELECT item_id FROM items WHERE source_id=? AND canonical_url=?",
+                                  (source["source_id"], canonicalize(item["url"]))).fetchone()
+            if item_row:
+                post_ready_item_id = item_row["item_id"]
+                post_ids_ready = [entry["post_id"] for entry in db.execute(
+                    "SELECT post_id FROM posts WHERE origin_item_id=? AND status='PENDING' ORDER BY post_id",
+                    (item_row["item_id"],)).fetchall()]
+                if post_ids_ready:
+                    db.commit()
     except Exception as exc:
         outcome = "ERROR"
         db.rollback()
@@ -1693,14 +2037,23 @@ def process_item(db, source, item: dict, threshold: float, max_length: int, fres
                     discovered_at=item_row["discovered_at"] if item_row else None,
                     processed_at=NOW(), total_seconds=round(time.perf_counter() - started, 3),
                     primary_source_read_seconds=round(timings["primary_source_read_seconds"], 3),
-                    ai_seconds=round(timings["ai_seconds"], 3))
+                    ai_seconds=round(timings["ai_seconds"], 3),
+                    research_agent_seconds=round(timings["research_agent_seconds"], 3))
         if (timings["primary_source_read_seconds"] > 0 or timings["ai_seconds"] > 0
+                or timings["research_agent_seconds"] > 0
                 or outcome not in {"DUPLICATE", "NOISE", "STALE", "UNDATED", "BASELINE_SKIPPED"}):
             _log_timing("news_processing_timing", source=source["name"],
                         title=item.get("title", "")[:160], outcome=outcome,
                         primary_source_read_seconds=round(timings["primary_source_read_seconds"], 3),
                         ai_seconds=round(timings["ai_seconds"], 3),
+                        research_agent_seconds=round(timings["research_agent_seconds"], 3),
                         total_seconds=round(time.perf_counter() - started, 3))
+    if post_ids_ready and post_ready_callback:
+        try:
+            post_ready_callback(post_ids_ready)
+        except Exception as callback_error:
+            _log_timing("post_ready_callback_error", item_id=post_ready_item_id,
+                        error_type=type(callback_error).__name__)
     return outcome
 
 
@@ -1718,6 +2071,7 @@ def _read_material_report(source, item: dict, body: str) -> dict | None:
     return {"publisher": item.get("publisher_name") or source["name"], "url": url,
             "title": item.get("title", ""), "content": body, "type": "ATTRIBUTED_REPORT",
             "material_read": True, "source_role": role,
+            "published_at": item.get("published_at") or item.get("updated_at"),
             "forwarded": bool(item.get("telegram_forwarded")),
             "priority": int(source["priority"]), "reputation": source["reputation"]}
 
@@ -1886,7 +2240,19 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
     # Linked originals have already been attempted. Search recovery must not hold
     # an otherwise readable account hostage to an unavailable original.
     if not publisher_report and (not primary_source or source_status != "READ") and ai_settings and _likely_local(item) and (selection is None or selection["decision"] == "KEEP"):
-        recovered = _recover_primary(db, item, ai_settings)
+        agent_mode = ai_settings.get("research_agent_mode", "active")
+        if (agent_mode in {"active", "shadow"}
+                and int(ai_settings.get("_research_agent_budget", 0)) > 0):
+            ai_settings["_research_agent_budget"] -= 1
+            agent_started = time.perf_counter()
+            if agent_mode == "active":
+                recovered = _agent_recover_primary(db, item, ai_settings, source, item_id)
+            else:
+                _shadow_research_agent(item, ai_settings, source)
+                recovered = _recover_primary(db, item, ai_settings)
+            timings["research_agent_seconds"] += time.perf_counter() - agent_started
+        else:
+            recovered = _recover_primary(db, item, ai_settings)
         if recovered:
             recovered_status = recovered.get("primary_source_status") or "NOT_CHECKED"
             if (recovered_status == "READ" and recovered.get("primary_source_url")
@@ -1903,6 +2269,7 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                     "url": recovered["url"], "title": recovered.get("title", ""),
                     "content": recovered["content"], "type": "ATTRIBUTED_REPORT",
                     "material_read": True,
+                    "published_at": recovered.get("published_at"),
                     "source_role": source["source_role"] if "source_role" in source.keys() else "aggregator",
                     "forwarded": False,
                 }
@@ -1966,9 +2333,8 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             if memory_mode in {"shadow", "enforce"}:
                 from .knowledge import context
                 ai_input["knowledge_context"] = context(db, [s['story_id'] for s in shortlist])
-            ai_input["editorial_examples"] = [dict(row) for row in db.execute(
-                "SELECT feedback_type,reason,item_title,substr(post_text,1,900) AS post_text "
-                "FROM editorial_feedback ORDER BY created_at DESC LIMIT 12").fetchall()]
+            ai_input["editorial_examples"] = _editorial_examples(
+                db, item, item_id, story_id=best["story_id"] if best else None)
             previous_analysis = db.execute("SELECT result_json FROM item_analysis WHERE item_id=?", (item_id,)).fetchone()
             if previous_analysis:
                 previous_result = json.loads(previous_analysis["result_json"])
@@ -2214,9 +2580,69 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             ai_result['story_diff'] = memory_diff
             if memory_enforced and memory_diff['conflict_state'] != 'NONE':
                 ai_result['publication_recommendation'] = 'WAIT_FOR_AUTOMATION'
+                queued_corrections = []
+                correction_owner = str(ai_settings.get("_correction_owner_chat_id") or "")
+                changed_fact_ids = list(dict.fromkeys(
+                    memory_diff.get("contradicted_facts", []) + memory_diff.get("changed_facts", [])))
+                if correction_owner and primary_source and source_status == "READ" and changed_fact_ids:
+                    old_claims = db.execute(
+                        "SELECT DISTINCT p.post_id FROM fact_relations r "
+                        "JOIN post_facts pf ON pf.fact_id=r.old_fact_id "
+                        "JOIN posts p ON p.post_id=pf.post_id "
+                        "WHERE r.new_fact_id IN (" + ",".join("?" for _ in changed_fact_ids) + ") "
+                        "AND r.relation IN ('CONTRADICTS','SUPERSEDES','RETRACTS') "
+                        "AND p.story_id=? AND p.status='PUBLISHED' "
+                        "ORDER BY p.published_at DESC LIMIT 3",
+                        (*changed_fact_ids, story_id),
+                    ).fetchall()
+                    if old_claims:
+                        from .review import enqueue_agent_fact_correction
+                        for claim in old_claims:
+                            correction_id = enqueue_agent_fact_correction(
+                                db, item_id=item_id, story_id=story_id,
+                                post_id=claim["post_id"], owner_chat_id=correction_owner)
+                            if correction_id:
+                                queued_corrections.append(correction_id)
+                if queued_corrections:
+                    disposition = "AGENT_CORRECTION_QUEUED"
+                    _trace_item(item, "Самостоятельная проверка опубликованного поста", disposition,
+                                "Новый прочитанный источник противоречит факту в опубликованном посте; правка поставлена в обычную редакторскую очередь.",
+                                correction_ids=queued_corrections)
+                    db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?",
+                               (disposition, now, item_id))
+                    db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
+                               (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
+                    db.commit()
+                    return disposition
                 _trace_item(item, "Проверка памяти сюжетов", "Нужна повторная проверка",
                             "Найден конфликт между новым материалом и сохранёнными сведениями.",
                             conflict_state=memory_diff.get('conflict_state'))
+            elif (memory_enforced and memory_diff['significant_update']
+                  and memory_diff.get('material_unpublished_facts')
+                  and (primary_source or publisher_report)):
+                correction_owner = str(ai_settings.get("_correction_owner_chat_id") or "")
+                prior_post = db.execute(
+                    "SELECT post_id FROM posts WHERE story_id=? AND status='PUBLISHED' "
+                    "AND julianday(published_at)>=julianday('now',?) "
+                    "ORDER BY published_at DESC,post_id DESC LIMIT 1",
+                    (story_id, f"-{int(freshness_hours)} hours"),
+                ).fetchone()
+                if correction_owner and prior_post:
+                    from .review import enqueue_agent_fact_correction
+                    correction_id = enqueue_agent_fact_correction(
+                        db, item_id=item_id, story_id=story_id, post_id=prior_post["post_id"],
+                        owner_chat_id=correction_owner, supplement=True)
+                    if correction_id:
+                        _trace_item(item, "Самостоятельное дополнение опубликованного поста",
+                                    "AGENT_CORRECTION_QUEUED",
+                                    "Найдено новое существенное подтверждённое сведение в свежем опубликованном сюжете; редактор проверит, стоит ли дополнить тот же пост.",
+                                    correction_id=correction_id)
+                        db.execute("UPDATE items SET disposition='AGENT_CORRECTION_QUEUED',processed_at=? WHERE item_id=?",
+                                   (now, item_id))
+                        db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
+                                   (json.dumps({**ai_result, '_filter_version': FILTER_VERSION}, ensure_ascii=False), item_id))
+                        db.commit()
+                        return "AGENT_CORRECTION_QUEUED"
             elif memory_enforced and not memory_diff['significant_update']:
                 disposition = 'STORE_ONLY' if memory_diff['unpublished_facts'] else 'DUPLICATE'
                 _trace_item(item, "Проверка новизны сюжета", disposition,
@@ -2338,8 +2764,12 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
     db.commit()
     discovered_row = db.execute("SELECT discovered_at FROM items WHERE item_id=?", (item_id,)).fetchone()
     ready_post = db.execute("SELECT post_id FROM posts WHERE origin_item_id=? AND post_hash=?", (item_id, post_hash)).fetchone()
+    used_source_published_at = (item.get("published_at")
+                                or (primary_source or {}).get("published_at")
+                                or (publisher_report or {}).get("published_at")
+                                or item.get("updated_at"))
     _log_timing("post_ready", post_id=ready_post["post_id"] if ready_post else None, item_id=item_id,
-                source_published_at=item.get("updated_at") or item.get("published_at"),
+                source_published_at=used_source_published_at,
                 item_discovered_at=discovered_row["discovered_at"] if discovered_row else None)
     return status
 
@@ -2406,7 +2836,8 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
                                    config["newsroom"].get("max_post_length", 3500),
                                    config["newsroom"].get("freshness_window_hours", 24), None,
                                    config["newsroom"].get("relevance_terms", []), config.get("ai", {}),
-                                   existing_item_id=row["item_id"])
+                                   existing_item_id=row["item_id"],
+                                   post_ready_callback=config.get("_publish_ready_callback"))
             counts[outcome] = counts.get(outcome, 0) + 1
         except Exception as exc:
             db.rollback()
@@ -2575,8 +3006,14 @@ def _requeue_social_quote_repairs(db, ai_settings, freshness_hours: int) -> int:
 
 def run_cycle(config: dict) -> dict[str, int]:
     config = {**config, "ai": {k: v for k, v in config.get("ai", {}).items() if k not in {"_disabled_for_cycle", "_triage_disabled"}}}
+    owner_ids = config.get("telegram", {}).get("interest_owner_user_ids") or []
+    if owner_ids:
+        config["ai"]["_correction_owner_chat_id"] = str(owner_ids[0])
     config["ai"]["_analysis_budget"] = int(config["newsroom"].get("analysis_per_cycle", 25))
-    config["ai"]["_retry_cycle_delay_seconds"] = max(30, int(config["newsroom"].get("poll_interval_seconds", 180)))
+    config["ai"]["_research_agent_budget"] = max(
+        0, min(3, int(config["ai"].get("research_agent_per_cycle", 1))))
+    config["ai"]["_retry_cycle_delay_seconds"] = min(
+        180, max(30, int(config["newsroom"].get("poll_interval_seconds", 180))))
     config["ai"]["_recovery_search_budget"] = 2
     config["ai"]["_triage_budget"] = int(config["newsroom"].get("triage_per_cycle", 12))
     watch_reserve = min(3, max(0, config['ai']['_analysis_budget']), max(0, config['ai']['_triage_budget'])) if config['newsroom'].get('story_watch_enabled') else 0
@@ -2606,7 +3043,10 @@ def run_cycle(config: dict) -> dict[str, int]:
         if source_cfg.get("type", "rss") in {"rss", "web", "telegram", "google_news", "web_search", "x"}
         and source_cfg.get("active", True)
     ]
-    active_configs.sort(key=lambda entry: (0 if entry[1] == "google_news" else 1, -int(entry[0].get("priority", 1))))
+    active_configs.sort(key=lambda entry: (
+        0 if entry[1] == "google_news" else
+        1 if entry[1] == "web_search" else 2,
+        -int(entry[0].get("priority", 1))))
     active_urls = [cfg["url"] for cfg, _ in active_configs]
     if active_urls:
         placeholders = ",".join("?" for _ in active_urls)
@@ -2634,31 +3074,25 @@ def run_cycle(config: dict) -> dict[str, int]:
     source_by_id.update({source["source_id"]: source for source in manual_retry_sources})
     if config.get('newsroom',{}).get('story_watch_enabled'):
         source_by_id.update({r['source_id']:r for r in db.execute("SELECT * FROM sources WHERE url LIKE 'story-watch://%'")})
-    web_search_interval = int(config.get("web_search", {}).get("min_interval_minutes", 15))
+    # Breaking-news discovery shares one persistent search slot across source
+    # feeds, source recovery, and story watch. Keep the effective cooldown at
+    # or below the three-minute collection cadence so stale config cannot
+    # silently defeat the publication-latency target.
+    web_search_interval = min(3, max(1, int(config.get("web_search", {}).get("min_interval_minutes", 3))))
     web_search_infos = [info for info in sources if info[3] == "web_search"]
-    eligible_web_search = []
-    for info in web_search_infos:
-        checked_at = info[1]["last_checked_at"]
-        if not checked_at:
-            eligible_web_search.append(info)
-            continue
-        checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
-        if (datetime.now(timezone.utc) - checked).total_seconds() >= web_search_interval * 60:
-            eligible_web_search.append(info)
+    web_search_queries = [
+        {"query": str(info[0].get("query", "")).strip(),
+         "interest_exclusions": info[0].get("interest_exclusions", [])}
+        for info in web_search_infos if str(info[0].get("query", "")).strip()]
     quota_probe = _WebSearchQuota(db, web_search_interval)
-    recovery_due = _web_search_recovery_due(db, config)
-    watch_due = False
-    if (config.get("newsroom", {}).get("story_watch_enabled") and watch_reserve > 0):
-        watch_due = bool(db.execute("""SELECT 1 FROM story_monitoring_jobs j
-            JOIN story_monitoring m USING(story_id)
-            WHERE j.active=1 AND j.next_check_at<=? AND m.lifecycle NOT IN ('CLOSED','ARCHIVED') LIMIT 1""",
-                                    (NOW(),)).fetchone())
-    queue_category = (_web_search_queue_category(db, bool(eligible_web_search), recovery_due, watch_due)
-                      if quota_probe.available() else None)
-    web_search_quota = _WebSearchQuota(db, web_search_interval, queue_category or "")
+    # The persisted per-category reservation timestamp is the scheduler clock.
+    # Source health timestamps are written after result processing and can lag
+    # by most of a cycle, which would otherwise skip every other three-minute run.
+    eligible_web_search = list(web_search_infos) if quota_probe.available("feeds") else []
+    web_search_quota = quota_probe
     config["ai"]["_web_search_quota"] = web_search_quota
     scheduled_web_search_url = None
-    if eligible_web_search and queue_category == "feeds":
+    if eligible_web_search and quota_probe.available("feeds"):
         last_source = db.execute("SELECT value FROM app_state WHERE key='web_search_last_source_url'").fetchone()
         info_by_url = {info[0]["url"]: info for info in web_search_infos}
         ordered_urls = [info[0]["url"] for info in web_search_infos]
@@ -2671,10 +3105,11 @@ def run_cycle(config: dict) -> dict[str, int]:
         if selected and web_search_quota.reserve(selected[0]["url"], category="feeds"):
             scheduled_web_search_url = selected[0]["url"]
             _log_timing("web_search_scheduled", category="feeds", eligible_count=len(eligible_web_search),
+                        query_count=len(web_search_queries),
                         interval_minutes=web_search_interval)
     if web_search_infos and scheduled_web_search_url is None:
         counts["WEB_SEARCH_DEFERRED"] = len(web_search_infos)
-        _log_timing("web_search_deferred", category=queue_category or "cooldown_or_not_due",
+        _log_timing("web_search_deferred", category="cooldown_or_not_due",
                     eligible_count=len(eligible_web_search), configured_sources=len(web_search_infos),
                     interval_minutes=web_search_interval)
     for source_cfg, source_type in active_configs:
@@ -2708,7 +3143,7 @@ def run_cycle(config: dict) -> dict[str, int]:
         if source_type == "google_news":
             return fetch_google_news(source["url"])
         if source_type == "web_search":
-            return fetch_web_search(source_cfg.get("query", ""), config.get("ai", {}), source_cfg.get("interest_exclusions", []))
+            return fetch_web_search(web_search_queries, config.get("ai", {}))
         if source_type == "x":
             return fetch_x_recent(source_cfg.get("query", ""), config.get("x", {}))
         since = source["recovery_since"] or source["last_seen_published_at"] or (
@@ -2733,14 +3168,21 @@ def run_cycle(config: dict) -> dict[str, int]:
         and urllib.parse.urlsplit(source_cfg["url"]).hostname
     }
 
-    # Fetch feeds concurrently so a slower publisher does not delay all other sources.
+    # Fetch concurrently and begin processing each source as soon as it returns;
+    # waiting in configuration order would let one slow publisher hold up every
+    # already available news item and consume the source-to-publication budget.
     with ThreadPoolExecutor(max_workers=min(12, max(1, len(sources)))) as pool:
-        pending = [(info, pool.submit(timed_fetch, info)) for info in sources]
-        for info, future in pending:
+        pending = {pool.submit(timed_fetch, info): info for info in sources}
+        for future in as_completed(pending):
+            info = pending[future]
             source_cfg, source, first_check, source_type = info
-            wait_started = time.perf_counter()
             items, fetch_seconds, fetch_error = future.result()
-            stage_times["fetch_wait_seconds"] += time.perf_counter() - wait_started
+            # Futures are already complete when as_completed yields them; time
+            # spent calling result() is effectively zero. Track the slowest
+            # concurrent fetch so the cycle report reflects the actual wait
+            # imposed by its least responsive source without summing overlaps.
+            stage_times["fetch_wait_seconds"] = max(
+                stage_times["fetch_wait_seconds"], fetch_seconds)
             if items is None and fetch_error is None:
                 continue
             if fetch_error or fetch_seconds >= 2:
@@ -2773,7 +3215,8 @@ def run_cycle(config: dict) -> dict[str, int]:
                                                config["newsroom"].get("max_post_length", 3500),
                                                config["newsroom"].get("freshness_window_hours", 24),
                                                config["newsroom"].get("initial_backfill_minutes", config["newsroom"].get("freshness_window_hours", 24) * 60) if first_check else None,
-                                               config["newsroom"].get("relevance_terms", []), config.get("ai", {}))
+                                               config["newsroom"].get("relevance_terms", []), config.get("ai", {}),
+                                               post_ready_callback=config.get("_publish_ready_callback"))
                         counts[outcome] = counts.get(outcome, 0) + 1
                     except Exception as exc:
                         db.rollback()
@@ -2819,11 +3262,21 @@ def run_cycle(config: dict) -> dict[str, int]:
                 db.execute("UPDATE sources SET last_checked_at=?,last_error=?,consecutive_failures=consecutive_failures+1 WHERE source_id=?", (NOW(), _safe_source_error(exc), source["source_id"]))
                 db.execute("INSERT INTO errors(source_id,timestamp,message) VALUES(?,?,?)", (source["source_id"], NOW(), _safe_source_error(exc)))
                 db.commit()
+    if scheduled_web_search_url:
+        # One request contains every active configured search scope, so they
+        # share the same freshness timestamp even though results use one source
+        # row for provenance and downstream processing.
+        db.execute("UPDATE sources SET last_checked_at=? WHERE type='web_search' AND active=1 AND url!=?",
+                   (NOW(), scheduled_web_search_url))
+        db.commit()
     from .watch import run as run_story_watch
     config['ai']['_analysis_budget'] += watch_reserve
     config['ai']['_triage_budget'] += watch_reserve
     story_watch_started = time.perf_counter()
-    counts.update(run_story_watch(db, config, web_search_quota, process_item))
+    def process_story_watch_item(*args, **kwargs):
+        kwargs["post_ready_callback"] = config.get("_publish_ready_callback")
+        return process_item(*args, **kwargs)
+    counts.update(run_story_watch(db, config, web_search_quota, process_story_watch_item))
     stage_times["story_watch_seconds"] = time.perf_counter() - story_watch_started
     # Give newly fetched material and due story watches first access to the
     # shared model budgets. Held-item retries are bounded and run afterward;

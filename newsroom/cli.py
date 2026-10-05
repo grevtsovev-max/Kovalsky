@@ -361,7 +361,8 @@ def is_eligible_for_auto_publish(post, cutoff: str) -> bool:
             and created_at >= cutoff_at)
 
 
-def auto_publish_since(db_path: str, config: dict, *, post_ids=None) -> tuple[int, int, int]:
+def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
+                      exclude_post_ids=None) -> tuple[int, int, int]:
     """Publish qualified recent posts; retry Telegram errors three times, then close them."""
     cutoff = config["newsroom"].get("auto_publish_since")
     if not cutoff:
@@ -375,8 +376,11 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None) -> tuple[in
     ).fetchall()
     published = failed = rejected = 0
     selected_ids = None if post_ids is None else set(post_ids)
+    excluded_ids = set(exclude_post_ids or [])
     for row in rows:
         post_id = row["post_id"]
+        if post_id in excluded_ids:
+            continue
         if selected_ids is not None and post_id not in selected_ids:
             continue
         delivery = db.execute("SELECT status FROM publication_attempts WHERE post_id=? AND channel_id=?", (post_id, channel(config))).fetchone()
@@ -434,6 +438,7 @@ def _performance_summary(config: dict, now: datetime) -> list[str]:
         "source_fetch_timing": [], "primary_source_read_timing": [],
         "news_processing_timing": [], "telegram_publish_timing": [], "cycle_timing": [],
         "collection_stage_timing": [], "item_processing_timing": [],
+        "research_agent_action_timing": [],
         "post_ready": [], "post_publish_confirmed": [],
         "web_search_scheduled": [], "web_search_deferred": [], "web_search_slot_reserved": [],
     }
@@ -476,8 +481,25 @@ def _performance_summary(config: dict, now: datetime) -> list[str]:
     lines.append(f"Чтение первоисточников: {range_text(reads)} · замеров {len(reads)}.")
     processing = events["news_processing_timing"]
     ai = [event["ai_seconds"] for event in processing if isinstance(event.get("ai_seconds"), (int, float)) and event["ai_seconds"] > 0]
+    research = [event["research_agent_seconds"] for event in processing
+                if isinstance(event.get("research_agent_seconds"), (int, float))
+                and event["research_agent_seconds"] > 0]
     totals = [event["total_seconds"] for event in processing if isinstance(event.get("total_seconds"), (int, float))]
     lines.append(f"AI: {range_text(ai)} · разборов {len(ai)}; обработка материалов с AI/чтением/новым событием: {range_text(totals)} · замеров {len(totals)}.")
+    if research:
+        lines.append(f"Исследовательский агент: {range_text(research)} · запусков {len(research)}.")
+    agent_actions = events["research_agent_action_timing"]
+    if agent_actions:
+        model_times = [event["model_seconds"] for event in agent_actions
+                       if isinstance(event.get("model_seconds"), (int, float))]
+        tool_times = [event["tool_seconds"] for event in agent_actions
+                      if isinstance(event.get("tool_seconds"), (int, float))]
+        lines.append(f"Шаги исследователя: модель {range_text(model_times)} · действий {len(model_times)}; инструменты {range_text(tool_times)} · действий {len(tool_times)}.")
+        if model_times and _percentile(model_times, 0.95) >= 15:
+            lines.append("Рекомендация по исследованию: p95 ответа модели выше 15 с; проверьте задержки API и размер передаваемого контекста.")
+        if tool_times and _percentile(tool_times, 0.95) >= 15:
+            slowest_tool = max(agent_actions, key=lambda event: event.get("tool_seconds", 0))
+            lines.append(f"Рекомендация по исследованию: p95 инструмента выше 15 с; самый долгий шаг — {slowest_tool.get('tool', 'неизвестно')} ({slowest_tool.get('tool_seconds', 0):.1f} с). Проверьте сетевой ответ и тайм-аут этого действия.")
     all_items = [event["total_seconds"] for event in events["item_processing_timing"]
                  if isinstance(event.get("total_seconds"), (int, float))]
     lines.append(f"Вся обработка материалов: {range_text(all_items)} · замеров {len(all_items)}.")
@@ -491,7 +513,7 @@ def _performance_summary(config: dict, now: datetime) -> list[str]:
         for key, label in (("retry_seconds", "Повторная обработка"),
                            ("fetch_wait_seconds", "Ожидание лент"),
                            ("matching_seconds", "Подбор независимых источников"),
-                           ("processing_seconds", "Обработка всех материалов"),
+                           ("processing_seconds", "Обработка материалов и быстрая отправка новых постов"),
                            ("other_seconds", "Прочие стадии сбора")):
             values = [event[key] for event in stages if isinstance(event.get(key), (int, float))]
             lines.append(f"{label}: {range_text(values)}.")
@@ -506,9 +528,20 @@ def _performance_summary(config: dict, now: datetime) -> list[str]:
         except (TypeError, ValueError):
             return None
 
-    confirmed_by_post = {event.get("post_id"): event for event in events["post_publish_confirmed"] if event.get("post_id")}
-    source_to_detect, detect_to_ready, ready_to_telegram, source_to_telegram = [], [], [], []
+    confirmed_by_post = {}
+    for event in events["post_publish_confirmed"]:
+        post_id = event.get("post_id")
+        if post_id and (post_id not in confirmed_by_post
+                        or str(event.get("timestamp") or "") < str(confirmed_by_post[post_id].get("timestamp") or "")):
+            confirmed_by_post[post_id] = event
+    ready_by_post = {}
     for event in events["post_ready"]:
+        post_id = event.get("post_id")
+        if post_id and (post_id not in ready_by_post
+                        or str(event.get("timestamp") or "") < str(ready_by_post[post_id].get("timestamp") or "")):
+            ready_by_post[post_id] = event
+    source_to_detect, detect_to_ready, ready_to_telegram, source_to_telegram = [], [], [], []
+    for event in ready_by_post.values():
         detected = event.get("item_discovered_at")
         source_time = event.get("source_published_at")
         source_gap = seconds_between(source_time, detected)
@@ -531,15 +564,96 @@ def _performance_summary(config: dict, now: datetime) -> list[str]:
         lines.append(f"Обнаружение → пост готов: {range_text(detect_to_ready)} · пар {len(detect_to_ready)}.")
         lines.append(f"Пост готов → подтверждение Telegram: {range_text(ready_to_telegram)} · пар {len(ready_to_telegram)}.")
         lines.append(f"Источник → Telegram: {range_text(source_to_telegram)} · пар {len(source_to_telegram)}.")
+        full_p95 = _percentile(source_to_telegram, 0.95)
+        stage_values = {
+            "обнаружение": _percentile(source_to_detect, 0.95),
+            "редакционная обработка": _percentile(detect_to_ready, 0.95),
+            "доставка в Telegram": _percentile(ready_to_telegram, 0.95),
+        }
+        measured_stages = {name: value for name, value in stage_values.items() if value is not None}
+        if not source_to_telegram:
+            lines.append("Рекомендация по задержке: сквозной SLA пока не подтверждён — нет пар «готовый пост → подтверждение Telegram» с надёжной датой источника. Проверьте, что сборщик и публикация работают и runtime-журнал получает оба события.")
+        elif len(source_to_telegram) < 10:
+            sample_note = (f"пока только {len(source_to_telegram)} подтверждённых пар; для устойчивой оценки p95 накопите не менее 10")
+            if full_p95 is not None and full_p95 > 180 and measured_stages:
+                bottleneck = max(measured_stages, key=measured_stages.get)
+                suggestions = {
+                    "обнаружение": "проверьте свежесть источников и ожидание слота Web Search",
+                    "редакционная обработка": "проверьте очередь и задержки чтения источников и AI-разбора",
+                    "доставка в Telegram": "проверьте длительность запросов Telegram и повторы доставки",
+                }
+                sample_note += f"; текущий p95 выше трёх минут, самый медленный участок — {bottleneck}: {suggestions[bottleneck]}"
+            lines.append(f"Рекомендация по задержке: SLA пока нельзя надёжно оценить: {sample_note}.")
+        elif full_p95 is not None and full_p95 > 180 and measured_stages:
+            bottleneck = max(measured_stages, key=measured_stages.get)
+            suggestions = {
+                "обнаружение": "проверить свежесть и частоту опроса медленных источников, а также ожидание слота Web Search",
+                "редакционная обработка": "сократить очередь свежих материалов и проверить задержки чтения источников и AI-разбора",
+                "доставка в Telegram": "проверить длительность запросов Telegram и повторы доставки",
+            }
+            if full_p95 > 300:
+                latency_state = "p95 превысил верхнюю границу 5 минут"
+            else:
+                latency_state = "p95 выше рабочей цели 3 минуты, но не превысил верхнюю границу 5 минут"
+            lines.append(f"Рекомендация по задержке: {latency_state}; наибольший участок — {bottleneck}. {suggestions[bottleneck]}.")
+    else:
+        lines.append("Сквозная задержка: за последние 24 часа нет событий подготовки или подтверждения публикации.")
+        lines.append("Рекомендация по задержке: SLA пока не проверен. Убедитесь, что сборщик и публикация работают и runtime-журнал получает события готовности поста и подтверждения Telegram.")
     slots = events["web_search_slot_reserved"]
     if slots:
         intervals = [event["interval_minutes"] for event in slots if isinstance(event.get("interval_minutes"), (int, float))]
+        slot_times: dict[str, list[datetime]] = {}
+        for event in slots:
+            category = str(event.get("category") or "unknown")
+            try:
+                stamp = datetime.fromisoformat(str(event["timestamp"]).replace("Z", "+00:00"))
+                slot_times.setdefault(category, []).append(stamp)
+            except (KeyError, ValueError, TypeError):
+                continue
+        feed_times = sorted(slot_times.get("feeds", []))
+        feed_gaps = [(later - earlier).total_seconds() / 60
+                     for earlier, later in zip(feed_times, feed_times[1:])]
+        category_counts = ", ".join(
+            f"{label} {len(slot_times.get(category, []))}"
+            for category, label in (("feeds", "новости"), ("primary_recovery", "первоисточник"), ("story_watch", "сюжеты"))
+            if slot_times.get(category)
+        )
         scheduled_counts = [event["eligible_count"] for event in events["web_search_scheduled"]
                             if isinstance(event.get("eligible_count"), (int, float))]
-        lines.append(f"Web Search: {len(slots)} вызовов зарезервировано за 24 ч; минимум между ними {max(intervals) if intervals else 'нет данных'} мин; отложенных циклов {len(events['web_search_deferred'])}.")
+        query_counts = [event["query_count"] for event in events["web_search_scheduled"]
+                        if isinstance(event.get("query_count"), (int, float))]
+        largest_feed_gap = f"{max(feed_gaps):.1f} мин" if feed_gaps else "недостаточно замеров"
+        lines.append(f"Web Search за 24 ч: {len(slots)} резервирований ({category_counts or 'категории не записаны'}); интервал слота до {max(intervals) if intervals else 'нет данных'} мин; наибольший интервал новостного поиска {largest_feed_gap}; отложенных циклов {len(events['web_search_deferred'])}.")
         if scheduled_counts:
             lines.append(f"В выбранном цикле было готово к запуску поисковых лент: максимум {max(scheduled_counts)}.")
+        if query_counts:
+            lines.append(f"Поисковых запросов объединено в вызов: {max(query_counts)}.")
     return lines
+
+
+def _improvement_recommendations(errors: Counter, failing_sources: int, stale_sources: int) -> list[str]:
+    """Turn recurring operational signals into bounded, human-reviewable actions."""
+    recommendations = []
+    for label, count in errors.most_common():
+        if count < 3:
+            continue
+        if label == "AI_EDITOR_FALLBACK":
+            recommendations.append(f"AI-редактор переходил в резервный режим {count} раз: проверьте доступность модели, лимиты и сеть; отслеживайте долю материалов, обработанных резервными правилами.")
+        elif label == "NETWORK_TIMEOUT":
+            recommendations.append(f"Зафиксировано {count} сетевых тайм-аутов: сравните медленные источники и запросы, затем настройте тайм-аут или исключите источник, который стабильно задерживает цикл.")
+        elif label == "HTTP_429":
+            recommendations.append(f"Получено {count} ответов HTTP 429: проверьте частоту запросов и квоты затронутых источников, затем разнесите обращения по циклам.")
+        elif label == "TLS_CONNECTION_ERROR":
+            recommendations.append(f"Зафиксировано {count} ошибок TLS: проверьте сертификат и поддержку HTTPS на затронутых источниках.")
+        elif label.startswith("HTTP_5"):
+            recommendations.append(f"Получено {count} серверных ошибок ({label}): проверьте доступность затронутых источников и оставьте повтор по текущему расписанию.")
+        if len(recommendations) >= 3:
+            break
+    if failing_sources >= 3:
+        recommendations.append(f"Сейчас {failing_sources} источников сообщают об ошибках: сгруппируйте их по коду, проверьте общую сетевую причину и пересмотрите недоступные источники.")
+    if stale_sources >= 3:
+        recommendations.append(f"{stale_sources} источников давно не проверялись: проверьте длительность цикла и не блокируют ли медленные источники опрос остальных.")
+    return recommendations[:5]
 
 
 def build_health_report(db, config: dict, now: datetime | None = None) -> str:
@@ -610,7 +724,7 @@ def build_health_report(db, config: dict, now: datetime | None = None) -> str:
         modes[mode if mode in {"AI", "RULE_BASED"} else "OTHER"] += 1
         eligible += int(is_eligible_for_auto_publish(row, cutoff))
     held_items = Counter({row["disposition"]: row["n"] for row in db.execute(
-        "SELECT disposition,COUNT(*) AS n FROM items WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION') GROUP BY disposition")})
+        "SELECT disposition,COUNT(*) AS n FROM items WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION','AGENT_CORRECTION_QUEUED') GROUP BY disposition")})
     baseline_missed_at_discovery = db.execute(
         "SELECT COUNT(*) FROM items WHERE disposition='BASELINE_SKIPPED' "
         "AND julianday(discovered_at)-julianday(published_at) BETWEEN 0 AND ?",
@@ -634,7 +748,7 @@ def build_health_report(db, config: dict, now: datetime | None = None) -> str:
         f"Цикл источников последний раз отмечен: {latest}.",
         f"Пропущено при подключении в окне свежести: {baseline_missed_at_discovery}; сейчас в этом окне остаются {baseline_still_fresh} записей.",
         f"Очередь: {sum(modes.values())} · AI {modes['AI']} · резервный режим {modes['RULE_BASED']} · без метки {modes['OTHER']}.",
-        f"Задержанные материалы: AI {held_items['AI_RETRY']} · чтение первоисточника {held_items['PRIMARY_RETRY']} · автоматическая перепроверка {held_items['WAITING_CONFIRMATION']}.",
+        f"Задержанные материалы: AI {held_items['AI_RETRY']} · чтение первоисточника {held_items['PRIMARY_RETRY']} · автоматическая перепроверка {held_items['WAITING_CONFIRMATION']} · правка опубликованного поста {held_items['AGENT_CORRECTION_QUEUED']}.",
         f"Ожидают автопубликации по всем защитам: {eligible} (автопубликация включена).",
         f"За 24 часа: AI-разборов {ai24} · сбоев AI с отложенным повтором {fallback24} · публикаций {published24} · продолжений сюжетов {story_followups24}.",
         f"Независимая сверка (текущий фильтр): подтверждено {independent_checks24['CORROBORATED']} · расхождения {independent_checks24['CONFLICT']} · нет второго источника {independent_checks24['NO_MATCH'] + independent_checks24['NOT_ASSESSED']} · не требовалась {independent_checks24['NOT_APPLICABLE']} · старые разборы {independent_checks24['LEGACY']}.",
@@ -655,6 +769,12 @@ def build_health_report(db, config: dict, now: datetime | None = None) -> str:
     for label, count in errors24.most_common(8):
         if label != "Источник ошибки учтён":
             lines.append(f"Сбой за 24 ч · {label}: {count}")
+    recommendations = _improvement_recommendations(errors24, len(failing), len(stale))
+    if recommendations:
+        lines.append("Предложения по улучшению:")
+        lines.extend(f"- {recommendation}" for recommendation in recommendations)
+    else:
+        lines.append("Предложения по улучшению: повторяющихся операционных ошибок за 24 ч не выявлено.")
     return "\n".join(lines)
 
 
@@ -878,9 +998,12 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
                 seconds=round(publish_seconds, 3), result="OK")
     origin = db.execute("SELECT i.item_id,i.published_at,i.updated_at,i.discovered_at FROM items i "
                         "JOIN posts p ON p.origin_item_id=i.item_id WHERE p.post_id=?", (post_id,)).fetchone()
+    source_published_at = ((origin["published_at"] if origin else None)
+                           or primary.get("published_at") or report.get("published_at")
+                           or (origin["updated_at"] if origin else None))
     _log_timing("post_publish_confirmed", post_id=post_id,
                 item_id=origin["item_id"] if origin else None,
-                source_published_at=(origin["updated_at"] or origin["published_at"]) if origin else None,
+                source_published_at=source_published_at,
                 item_discovered_at=origin["discovered_at"] if origin else None,
                 telegram_confirmed_at=NOW())
 
@@ -890,8 +1013,24 @@ def run_one_cycle(config: dict, db_path: str) -> dict[str, int]:
     cycle_started = time.perf_counter()
     from .interests import expand_search_queries
     expand_search_queries(config)
-    counts = run_cycle(config)
-    published, failed, rejected = auto_publish_since(db_path, config)
+    inline_attempted_posts: set[int] = set()
+    inline_delivery_counts = [0, 0, 0]
+
+    def publish_ready_posts(post_ids):
+        selected = [int(post_id) for post_id in post_ids]
+        inline_attempted_posts.update(selected)
+        result = auto_publish_since(db_path, config, post_ids=selected)
+        for index, value in enumerate(result):
+            inline_delivery_counts[index] += value
+
+    cycle_config = dict(config)
+    cycle_config["_publish_ready_callback"] = publish_ready_posts
+    counts = run_cycle(cycle_config)
+    published, failed, rejected = auto_publish_since(
+        db_path, config, exclude_post_ids=inline_attempted_posts)
+    published += inline_delivery_counts[0]
+    failed += inline_delivery_counts[1]
+    rejected += inline_delivery_counts[2]
     if published:
         counts["AUTO_PUBLISHED"] = published
     if failed:
@@ -980,7 +1119,7 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False))
     elif args.command in {"once", "run"}:
         from .locking import acquire_cycle_lock
-        interval = max(30, int(config["newsroom"].get("poll_interval_seconds", 180)))
+        interval = min(180, max(30, int(config["newsroom"].get("poll_interval_seconds", 180))))
         while True:
             cycle_started = time.monotonic()
             config = load_config(args.config)

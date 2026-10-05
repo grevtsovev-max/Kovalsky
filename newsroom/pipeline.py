@@ -6,6 +6,7 @@ from .triage import MAX_AUTOMATIC_RETRIES
 STAGES = [
     ('received', 'Ждут обработки'), ('primary', 'Чтение источника'),
     ('ai', 'Ждут анализа'), ('confirmation', 'Автоматическая перепроверка'),
+    ('correction', 'Правки опубликованных постов'),
     ('review', 'Автоматическая публикация'), ('published', 'Опубликованы'),
     ('filtered', 'Отфильтрованы'), ('processed', 'Завершены без публикации'),
 ]
@@ -14,6 +15,7 @@ REASONS = {
     'PRIMARY_RETRY': 'Пока нет прочитанного пригодного материала. Агент повторит чтение; отдельный первоисточник не обязателен.',
     'AI_RETRY': 'Разбор ИИ не завершён. Материал оставлен на повторную обработку.',
     'WAITING_CONFIRMATION': 'Проверки не пройдены; агент повторит редакционный разбор до трёх раз и затем автоматически решит судьбу материала.',
+    'AGENT_CORRECTION_QUEUED': 'Новый прочитанный материал может исправить или существенно дополнить свежий опубликованный пост; редактор проверяет правку прежнего сообщения.',
     'NOISE': 'Не прошёл тематический или редакционный отбор.',
     'DUPLICATE': 'Повтор уже известного сюжета; отдельный пост не создан.',
     'STALE': 'Возраст материала превысил допустимое окно свежести.',
@@ -26,6 +28,7 @@ REASONS = {
 DECISION_LABELS = {
     'PENDING': 'Ожидает обработки', 'PRIMARY_RETRY': 'Ожидает чтения материала',
     'AI_RETRY': 'Ожидает ИИ-разбора', 'WAITING_CONFIRMATION': 'Ожидает повторной проверки',
+    'AGENT_CORRECTION_QUEUED': 'Проверяется самостоятельная правка опубликованного поста',
     'NEW_STORY': 'Новый сюжет передан на допуск', 'UPDATE_CANDIDATE': 'Обновление сюжета передано на допуск',
     'NOISE': 'Отсеян', 'DUPLICATE': 'Дубликат', 'STALE': 'Устарел',
     'BASELINE_SKIPPED': 'Старше окна первичной загрузки', 'UNDATED': 'Дата не определена',
@@ -257,7 +260,8 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                 post = min(time_matches, key=lambda p: p['created_at'])
                 post_link_method = 'LEGACY_PROCESSING_TIME'
         category = {'PRIMARY_RETRY':'primary', 'AI_RETRY':'ai',
-                    'WAITING_CONFIRMATION':'confirmation', 'PENDING':'received'}.get(disposition, 'processed')
+                    'WAITING_CONFIRMATION':'confirmation', 'AGENT_CORRECTION_QUEUED':'correction',
+                    'PENDING':'received'}.get(disposition, 'processed')
         reason = retry.get('reason') or REASONS.get(disposition, 'Обработка завершена; связанный пост не найден.')
         if disposition == 'NOISE' and triage.get('decision') == 'NOISE' and triage.get('reason'):
             reason = f"Предварительный ИИ-отбор: {triage['reason']}"

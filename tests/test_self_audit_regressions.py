@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from newsroom.core import (_WebSearchQuota, _requeue_social_quote_repairs,
-                           _web_search_queue_category,
                            _restore_exact_social_headline_evidence,
                            process_item, require_primary_source_review, run_cycle)
 from newsroom.db import connect, connect_readonly
@@ -99,48 +98,22 @@ class SelfAuditRegressionTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT disposition FROM items WHERE item_id=?",
                                          (cursor.lastrowid,)).fetchone()[0], "AI_RETRY")
 
-    def test_web_search_cooldown_is_shared_and_persistent(self):
+    def test_search_cooldown_is_persistent_and_independent_per_purpose(self):
         quota = _WebSearchQuota(self.db, 15)
+        self.assertEqual(quota.interval_minutes, 3)
         self.assertTrue(quota.reserve("https://search.example/one"))
         self.assertFalse(quota.reserve("https://search.example/two"))
-        last_source = self.db.execute("SELECT value FROM app_state WHERE key='web_search_last_source_url'").fetchone()[0]
-        self.assertEqual(last_source, "https://search.example/one")
-        earlier = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
-        self.db.execute("UPDATE app_state SET value=? WHERE key='web_search_last_call_at'", (earlier,))
+        self.assertTrue(quota.reserve_primary_recovery())
+        self.assertFalse(quota.reserve_primary_recovery())
+        self.assertTrue(quota.reserve_story_watch())
+        self.assertFalse(_WebSearchQuota(self.db, 15).reserve_story_watch())
+        earlier = (datetime.now(timezone.utc) - timedelta(minutes=4)).isoformat(timespec="seconds")
+        self.db.execute("UPDATE app_state SET value=? WHERE key='web_search_last_call_at:feeds'", (earlier,))
         self.db.commit()
         self.assertTrue(quota.reserve("https://search.example/two"))
+        self.assertFalse(quota.reserve_primary_recovery())
 
-    def test_global_search_queue_rotates_between_consumer_types(self):
-        demands = (True, True, True)
-        self.assertEqual(_web_search_queue_category(self.db, *demands), "feeds")
-
-    def test_retry_search_is_a_queue_demand_only_after_google_news_attempt(self):
-        from newsroom.core import _web_search_recovery_due
-        from newsroom.source_search import log
-        demands = (True, True, True)
-        url = "https://example.org/crypto-story"
-        title = "Банк России расширит правила для крипторынка"
-        content = "Банк России сообщил о новых правилах для участников крипторынка."
-        cursor = self.db.execute(
-            "INSERT INTO items(source_id,url,canonical_url,title,description,content,published_at,discovered_at,"
-            "content_hash,title_hash,disposition,primary_source_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (self.source["source_id"], url, url, title, content, content, self.now, self.now,
-             "hash-content", "hash-title", "PRIMARY_RETRY", json.dumps({"status": "UNREADABLE"})))
-        self.db.commit()
-        settings = {"newsroom": {"freshness_window_hours": 48},
-                    "ai": {"_analysis_budget": 2, "_recovery_search_budget": 2}}
-        with patch("newsroom.core.get_api_key", return_value="test-key"):
-            self.assertFalse(_web_search_recovery_due(self.db, settings))
-            revision_hash = hashlib.sha256((title + "\n" + content).encode()).hexdigest()
-            log(self.db, url, 1, "TITLE_AND_QUOTE_SEARCH", title, "NOT_FOUND", [], revision_hash)
-            self.db.commit()
-            self.assertTrue(_web_search_recovery_due(self.db, settings))
-        self.assertEqual(_web_search_queue_category(self.db, *demands), "feeds")
-        self.assertEqual(_web_search_queue_category(self.db, *demands), "primary_recovery")
-        self.assertEqual(_web_search_queue_category(self.db, *demands), "story_watch")
-        self.assertEqual(_web_search_queue_category(self.db, *demands), "feeds")
-
-    def test_cycle_schedules_only_one_configured_search_per_global_window(self):
+    def test_cycle_searches_all_topics_in_one_request_per_window(self):
         config = {"newsroom": {"database": self.path}, "ai": {},
                   "web_search": {"min_interval_minutes": 15},
                   "sources": [{"name": f"Тема {n}", "type": "web_search",
@@ -149,6 +122,7 @@ class SelfAuditRegressionTests(unittest.TestCase):
         with patch("newsroom.core.fetch_web_search", return_value=[]) as search:
             run_cycle(config)
             self.assertEqual(search.call_count, 1)
+            self.assertEqual(len(search.call_args.args[0]), 4)
             search.reset_mock()
             run_cycle(config)
             search.assert_not_called()

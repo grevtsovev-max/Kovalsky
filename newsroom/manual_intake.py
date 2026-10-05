@@ -234,7 +234,8 @@ def _submit_locked(config: dict, url: str, retry_after_credits_restored: bool = 
         ai_settings = dict(config.get("ai", {}))
         ai_settings.update({"_analysis_budget": 1, "_triage_budget": 1,
                             "_recovery_search_budget": 0,
-                            "_retry_cycle_delay_seconds": max(30, int(config["newsroom"].get("poll_interval_seconds", 180)))})
+                            "_retry_cycle_delay_seconds": min(
+                                180, max(30, int(config["newsroom"].get("poll_interval_seconds", 180))))})
         started = time.perf_counter()
         outcome = process_item(
             db, source_values, article,

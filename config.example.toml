@@ -1,7 +1,7 @@
 [newsroom]
 database = "data/newsroom.sqlite3"
 poll_interval_seconds = 180
-retry_items_per_cycle = 8
+retry_items_per_cycle = 2
 analysis_per_cycle = 25
 triage_per_cycle = 12
 # Включать после переноса истории и проверки memory_mode=enforce.
@@ -25,6 +25,11 @@ relevance_terms = ["криптовалют", "криптоактив", "crypto",
 [ai]
 # off / shadow / enforce. Переход на enforce требует переноса опубликованной истории.
 memory_mode = "off"
+# active / shadow / off. Исследователь выбирает следующий шаг, но публикация
+# остаётся за редактором и общим автоматическим допуском.
+research_agent_mode = "active"
+research_agent_per_cycle = 1
+research_agent_max_steps = 3
 model = "gpt-6-luna"
 api_key_env = "OPENAI_API_KEY"
 keychain_service = "KiperNewsroomOpenAI"
@@ -55,7 +60,7 @@ reputation = "unknown"
 source_role = "discovery"
 
 [web_search]
-min_interval_minutes = 15
+min_interval_minutes = 3
 
 [x]
 token_env = "X_BEARER_TOKEN"

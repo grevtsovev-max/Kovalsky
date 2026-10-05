@@ -29,7 +29,8 @@ class SearchIntegrationTests(unittest.TestCase):
             items = fetch_web_search("crypto news", {"api_key_env": "SEARCH_TEST_KEY", "model": "test-model"})
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["content"], "Full publisher text")
-        read.assert_called_once_with("https://publisher.example/news", "publisher.example", None)
+        read.assert_called_once_with("https://publisher.example/news", "publisher.example", None,
+                                     timeout=20, public_only=True)
 
     def test_x_recent_search_preserves_post_id_text_and_direct_source(self):
         response = {"data": [{"id": "123", "text": "A direct company announcement", "author_id": "9",

@@ -108,6 +108,7 @@ def capture_channel_edit(config, db, *, chat_id, message_id, edited_text,
                    (json.dumps({"confirmation": "observed_channel_edit", "message_id": message_id}, ensure_ascii=False), now, auto_intent["correction_id"]))
         db.execute("UPDATE telegram_feedback_corrections SET status='EDITED',result_code='CORRECTED',result_summary='Правка подтверждена сверкой с каналом.',corrected_text=?,notice_status='PENDING',updated_at=? WHERE correction_id=?",
                    (edited_text, now, auto_intent["correction_id"]))
+        _resolve_agent_correction_item(db, auto_intent["correction_id"], "EDITED")
         capture_source = "AUTOMATED_CORRECTION_CONFIRMED"
         db.commit()
     prior_edit = db.execute(
@@ -115,6 +116,9 @@ def capture_channel_edit(config, db, *, chat_id, message_id, edited_text,
         (row["post_id"],),
     ).fetchone()
     if prior_edit and _comparable_post_text(prior_edit['edited_text']) == _comparable_post_text(edited_text):
+        if auto_intent and capture_source == "AUTOMATED_CORRECTION_CONFIRMED":
+            _record_confirmed_agent_edit(db, auto_intent["correction_id"], previous_text or prior_edit["previous_text"], edited_text)
+            db.commit()
         return  # Bot event and public snapshot may arrive in either order.
     if previous_text is None:
         previous_text = prior_edit["edited_text"] if prior_edit else row["text"]
@@ -156,7 +160,9 @@ def capture_channel_edit(config, db, *, chat_id, message_id, edited_text,
         "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (update_id, row["post_id"], str(chat_id), message_id, edit_date, previous_text, edited_text, now,capture_source,source_url),
     )
-    if not (auto_intent and capture_source == "AUTOMATED_CORRECTION_CONFIRMED"):
+    if auto_intent and capture_source == "AUTOMATED_CORRECTION_CONFIRMED":
+        _record_confirmed_agent_edit(db, auto_intent["correction_id"], previous_text, edited_text)
+    else:
         db.execute(
             "INSERT INTO editorial_feedback(created_at,item_id,story_id,post_id,feedback_type,reason,item_title,post_text) "
             "VALUES(?,?,?,?,?,?,?,?)",
@@ -382,7 +388,29 @@ def _finish_correction(db, correction_id: int, status: str, code: str,
         (status, code, summary[:1000], previous_text, corrected_text,
          json.dumps(evidence or [], ensure_ascii=False), now, correction_id),
     )
+    _resolve_agent_correction_item(db, correction_id, status)
     db.commit()
+
+
+def _resolve_agent_correction_item(db, correction_id: int, status: str) -> None:
+    feedback = db.execute(
+        "SELECT item_id,feedback_type FROM editorial_feedback WHERE feedback_id="
+        "(SELECT feedback_id FROM telegram_feedback_corrections WHERE correction_id=?)",
+        (correction_id,),
+    ).fetchone()
+    if (not feedback or feedback["feedback_type"] not in {"AGENT_FACT_UPDATE", "AGENT_STORY_SUPPLEMENT"}
+            or not feedback["item_id"]):
+        return
+    if status == "EDITED":
+        disposition = "STORE_ONLY"
+    elif status in {"NO_CHANGE", "REJECTED"}:
+        disposition = "WAITING_CONFIRMATION"
+    else:
+        return
+    if feedback["feedback_type"] == "AGENT_STORY_SUPPLEMENT" and status == "NO_CHANGE":
+        disposition = "STORE_ONLY"
+    db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=? AND disposition='AGENT_CORRECTION_QUEUED'",
+               (disposition, datetime.now(timezone.utc).isoformat(timespec="seconds"), feedback["item_id"]))
 
 
 def _record_agent_edit_learning(db, correction, previous_text: str, corrected_text: str,
@@ -392,7 +420,7 @@ def _record_agent_edit_learning(db, correction, previous_text: str, corrected_te
     if db.execute("SELECT 1 FROM editorial_feedback WHERE post_id=? AND feedback_type='TELEGRAM_EDIT' AND instr(reason,?)>0 LIMIT 1",
                   (correction["post_id"], marker)).fetchone():
         return
-    owner_feedback = db.execute("SELECT reason,item_id,story_id,item_title FROM editorial_feedback WHERE feedback_id=?",
+    owner_feedback = db.execute("SELECT reason,item_id,story_id,item_title,feedback_type FROM editorial_feedback WHERE feedback_id=?",
                                 (correction["feedback_id"],)).fetchone()
     if not owner_feedback:
         return
@@ -404,10 +432,13 @@ def _record_agent_edit_learning(db, correction, previous_text: str, corrected_te
     for entry in evidence or []:
         if isinstance(entry, dict) and str(entry.get("quote") or "").strip():
             evidence_lines.append(f"Подтверждение: {str(entry['quote']).strip()[:350]}")
+    agent_origin = owner_feedback["feedback_type"] in {"AGENT_FACT_UPDATE", "AGENT_STORY_SUPPLEMENT"}
     lesson = (
-        "Подтверждённая правка агента по сигналу владельца.\n"
-        f"Замечание владельца: {str(owner_feedback['reason'] or '')[:700]}\n"
-        f"Вывод проверки: {summary[:500]}\n"
+        ("Подтверждённая самостоятельная правка агента по новому источнику.\n"
+         if agent_origin else "Подтверждённая правка агента по сигналу владельца.\n")
+        + (f"Основание: {str(owner_feedback['reason'] or '')[:700]}\n"
+           if agent_origin else f"Замечание владельца: {str(owner_feedback['reason'] or '')[:700]}\n")
+        + f"Вывод проверки: {summary[:500]}\n"
         f"Источник: {source_url}\n"
         f"Изменение:\n{diff or 'Текст исправлен.'}\n"
         + "\n".join(evidence_lines)
@@ -422,8 +453,111 @@ def _record_agent_edit_learning(db, correction, previous_text: str, corrected_te
     )
 
 
+def _bind_corrected_post_facts(db, correction, corrected_text: str,
+                               evidence: list | None) -> None:
+    """Mark memory facts as covered only after an agent edit was confirmed."""
+    feedback = db.execute("SELECT item_id,story_id,feedback_type FROM editorial_feedback WHERE feedback_id=?",
+                          (correction["feedback_id"],)).fetchone()
+    if not feedback or feedback["feedback_type"] not in {"AGENT_FACT_UPDATE", "AGENT_STORY_SUPPLEMENT"}:
+        return
+    if not feedback["item_id"]:
+        return
+    rows = db.execute(
+        "SELECT f.fact_id,fe.quote FROM fact_evidence fe "
+        "JOIN source_snapshots ss USING(snapshot_id) JOIN story_facts f USING(fact_id) "
+        "WHERE ss.item_id=? AND f.story_id=?",
+        (feedback["item_id"], feedback["story_id"]),
+    ).fetchall()
+    if not rows:
+        return
+    norm_text = _normalised_source_quote(corrected_text)
+    for entry in evidence or []:
+        if not isinstance(entry, dict):
+            continue
+        claim = str(entry.get("claim") or "").strip()
+        quote = _normalised_source_quote(entry.get("quote") or "")
+        if not claim or _normalised_source_quote(claim) not in norm_text or not quote:
+            continue
+        for fact in rows:
+            if _normalised_source_quote(fact["quote"]) == quote:
+                db.execute("INSERT OR IGNORE INTO post_facts(post_id,fact_id,post_quote) VALUES(?,?,?)",
+                           (correction["post_id"], fact["fact_id"], claim))
+
+
+def _record_confirmed_agent_edit(db, correction_id: int, previous_text: str,
+                                 corrected_text: str) -> None:
+    correction = db.execute("SELECT * FROM telegram_feedback_corrections WHERE correction_id=?",
+                            (correction_id,)).fetchone()
+    if not correction:
+        return
+    try:
+        evidence = json.loads(correction["evidence_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        evidence = []
+    learning_source_url = (evidence[0].get("source_url") if evidence and isinstance(evidence[0], dict)
+                           else ((_post_source_urls(corrected_text) or [""])[-1]))
+    db.execute("SAVEPOINT confirmed_agent_edit_learning")
+    try:
+        _bind_corrected_post_facts(db, correction, corrected_text, evidence)
+        _record_agent_edit_learning(
+            db, correction, previous_text, corrected_text,
+            correction["result_summary"] or "Правка подтверждена сверкой с каналом.",
+            evidence, learning_source_url)
+        db.execute("RELEASE confirmed_agent_edit_learning")
+    except Exception:
+        db.execute("ROLLBACK TO confirmed_agent_edit_learning")
+        db.execute("RELEASE confirmed_agent_edit_learning")
+
+
 def _normalised_source_quote(value: str) -> str:
     return " ".join(str(value or "").casefold().split())
+
+
+def _post_source_urls(text: str) -> list[str]:
+    lines = [line for line in str(text or "").splitlines()
+             if line.startswith(("Источник:", "Источники:"))]
+    if len(lines) != 1:
+        return []
+    return re.findall(r"\[[^\]]+\]\((https?://[^)]+)\)", lines[0])
+
+
+def enqueue_agent_fact_correction(db, *, item_id: int, story_id: int, post_id: int,
+                                  owner_chat_id: str, supplement: bool = False) -> int | None:
+    """Queue a same-message edit grounded in new evidence for a published story."""
+    if not owner_chat_id:
+        return None
+    feedback_type = "AGENT_STORY_SUPPLEMENT" if supplement else "AGENT_FACT_UPDATE"
+    existing = db.execute(
+        "SELECT c.correction_id,c.status FROM telegram_feedback_corrections c "
+        "JOIN editorial_feedback f USING(feedback_id) "
+        "WHERE c.post_id=? AND f.item_id=? AND f.feedback_type=? LIMIT 1",
+        (post_id, item_id, feedback_type),
+    ).fetchone()
+    if existing:
+        return int(existing["correction_id"]) if existing["status"] in {"QUEUED", "PROCESSING", "UNKNOWN"} else None
+    post = db.execute("SELECT text,headline FROM posts WHERE post_id=? AND status='PUBLISHED'", (post_id,)).fetchone()
+    item = db.execute("SELECT title,url FROM items WHERE item_id=?", (item_id,)).fetchone()
+    if not post or not item:
+        return None
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    reason = (("Самостоятельная редакторская проверка: новый прочитанный материал содержит существенное "
+               "подтверждённое дополнение к этому свежему опубликованному сюжету. Добавь его в прежний пост "
+               "только если это улучшит полноту сообщения и точная опора есть в источнике.") if supplement else
+              ("Самостоятельная редакторская перепроверка: новый прочитанный материал по тому же сюжету "
+               "содержит факт, который противоречит опубликованному утверждению. Проверь только это "
+               "противоречие по новому источнику; исправь прежний пост лишь при прямом подтверждении."))
+    cur = db.execute(
+        "INSERT INTO editorial_feedback(created_at,item_id,story_id,post_id,feedback_type,reason,item_title,post_text) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (now, item_id, story_id, post_id, feedback_type, reason,
+         item["title"] or "", post["text"] or ""),
+    )
+    feedback_id = cur.lastrowid
+    correction_id = db.execute(
+        "INSERT INTO telegram_feedback_corrections(feedback_id,post_id,owner_chat_id,created_at,updated_at) "
+        "VALUES(?,?,?,?,?)", (feedback_id, post_id, str(owner_chat_id), now, now),
+    ).lastrowid
+    return int(correction_id)
 
 
 def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | None, str | None, list]:
@@ -438,13 +572,50 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
     db.execute("UPDATE telegram_feedback_corrections SET previous_text=COALESCE(previous_text,?),updated_at=? WHERE correction_id=?",
                (current_text, datetime.now(timezone.utc).isoformat(timespec="seconds"), row["correction_id"]))
     db.commit()
-    item = db.execute("SELECT * FROM items WHERE item_id=?", (post["origin_item_id"],)).fetchone() if post["origin_item_id"] else None
+    feedback = db.execute("SELECT * FROM editorial_feedback WHERE feedback_id=?", (row["feedback_id"],)).fetchone()
+    feedback_type = feedback["feedback_type"] if feedback else ""
+    fact_update = feedback_type == "AGENT_FACT_UPDATE"
+    story_supplement = feedback_type == "AGENT_STORY_SUPPLEMENT"
+    agent_update = fact_update or story_supplement
+    source_item_id = feedback["item_id"] if agent_update else post["origin_item_id"]
+    item = db.execute("SELECT * FROM items WHERE item_id=?", (source_item_id,)).fetchone() if source_item_id else None
     if not item:
         return "REJECTED", "SOURCE_ITEM_MISSING", "Не удалось восстановить исходный материал к этому посту.", current_text, []
     try:
-        facts = json.loads(post["fact_check_result"] or "{}")
         item_source = json.loads(item["primary_source_json"] or "{}")
-    except (TypeError, json.JSONDecodeError):
+        if fact_update:
+            from .core import digest
+            analysis = db.execute("SELECT result_json FROM item_analysis WHERE item_id=?",
+                                  (item["item_id"],)).fetchone()
+            facts = json.loads((analysis["result_json"] if analysis else "{}") or "{}")
+            primary = dict(item_source)
+            primary["content_sha256"] = digest(str(primary.get("content") or ""))
+            facts["primary_source"] = primary
+            facts["primary_source_status"] = primary.get("status")
+            facts["publisher_report_exception"] = False
+            facts["publisher_report"] = None
+        elif story_supplement:
+            from .core import digest
+            analysis = db.execute("SELECT result_json FROM item_analysis WHERE item_id=?",
+                                  (item["item_id"],)).fetchone()
+            facts = json.loads((analysis["result_json"] if analysis else "{}") or "{}")
+            primary = dict(item_source)
+            if primary.get("status") == "READ" and primary.get("content"):
+                primary["content_sha256"] = digest(str(primary["content"]))
+                facts["primary_source"] = primary
+                facts["primary_source_status"] = "READ"
+            elif item_source.get("_material_read") is True and len(str(item["content"] or "").strip()) >= 100:
+                evidence = str((facts.get("original_reporting_check") or {}).get("evidence") or "")
+                report = {"type": "ATTRIBUTED_REPORT", "material_read": True,
+                          "url": item_source.get("_material_url") or item["url"],
+                          "publisher": item_source.get("_material_publisher") or "Издание",
+                          "content": item["content"], "evidence": evidence,
+                          "content_sha256": digest(str(item["content"]))}
+                facts["publisher_report_exception"] = True
+                facts["publisher_report"] = report
+        else:
+            facts = json.loads(post["fact_check_result"] or "{}")
+    except (TypeError, json.JSONDecodeError, IndexError):
         facts, item_source = {}, {}
     primary = dict(facts.get("primary_source") or {})
     report = dict(facts.get("publisher_report") or {})
@@ -453,14 +624,16 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
         primary.setdefault("url", item_source.get("url"))
         primary.setdefault("publisher", item_source.get("publisher") or item_source.get("_material_publisher"))
         primary.setdefault("status", item_source.get("status"))
-    source = primary if primary.get("content") and facts.get("primary_source_status") == "READ" else report
+    source = (primary if primary.get("content") and facts.get("primary_source_status") == "READ" else
+              report if story_supplement and facts.get("publisher_report_exception") is True
+              and report.get("material_read") is True else {}) if agent_update else (
+        primary if primary.get("content") and facts.get("primary_source_status") == "READ" else report)
     if not source.get("content") or not source.get("url"):
         return "REJECTED", "READ_SOURCE_UNAVAILABLE", "Не исправлял пост: в базе нет прочитанного текста источника, по которому можно подтвердить отзыв.", current_text, []
-    if source["url"] not in current_text:
+    if not agent_update and source["url"] not in current_text:
         return "REJECTED", "SOURCE_LINK_MISSING", "Не исправлял пост: не удалось подтвердить, какой прочитанный источник указан в его ссылке.", current_text, []
     if source is report and not (facts.get("publisher_report_exception") is True and report.get("material_read") is True):
         return "REJECTED", "REPORT_NOT_READ", "Не исправлял пост: прочитанный текст источника не подтверждён в истории публикации.", current_text, []
-    feedback = db.execute("SELECT reason FROM editorial_feedback WHERE feedback_id=?", (row["feedback_id"],)).fetchone()
     feedback_text = feedback["reason"] if feedback else ""
     reference_match = re.search(r"\n\[BACKEND_REFERENCE_MESSAGE_ID:(\d+)\]$", feedback_text)
     reference_post = None
@@ -475,7 +648,10 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
     from .ai import correct_published_post
     from .quality import editorial_issues, publication_source_ready
     from .cli import telegram_format_text
-    if not publication_source_ready(facts, current_text):
+    source_gate_text = current_text
+    if agent_update and source.get("url"):
+        source_gate_text += f"\n\nИсточник: [Подтверждающий материал]({source['url']})"
+    if not publication_source_ready(facts, source_gate_text):
         return "REJECTED", "ORIGINAL_SOURCE_GATE_FAILED", "Не исправлял пост: исходная публикация не проходит проверку сохранённого источника.", current_text, []
     last_summary = ""
     for attempt in range(1, 4):
@@ -486,7 +662,8 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
             proposal = correct_published_post(
                 current_text, feedback_text,
                 {"title": item["title"], "content": item["content"]},
-                source, config.get("ai", {}),
+                source, config.get("ai", {}), autonomous=agent_update,
+                allow_supplement=story_supplement,
             )
         except Exception as exc:
             last_summary = f"Проверка временно не завершилась ({type(exc).__name__})."
@@ -532,6 +709,15 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
                     valid = False
                     last_summary = "Структурная правка добавляет формулировку без подтверждения в источнике."
                     break
+            elif kind == "SUPPLEMENT":
+                added = new[len(old):].strip() if new.startswith(old) else ""
+                if (not story_supplement or len(added) < 24 or len(quote) < 24
+                        or _normalised_source_quote(quote) not in _normalised_source_quote(source["content"])
+                        or _normalised_source_quote(quote) not in _normalised_source_quote(added)):
+                    valid = False
+                    last_summary = "Дополнение должно сохранить прежний фрагмент и дословно добавить подтверждённое предложение из источника."
+                    break
+                evidence_used.append({"claim": added, "quote": quote, "source_url": source["url"]})
             elif kind != "COPYEDIT" or quote:
                 valid = False
                 last_summary = "Тип одной из правок не подтверждён."
@@ -543,6 +729,23 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
             last_summary = "Замены пересекаются и не могут быть безопасно применены."
         if not valid:
             continue
+        if agent_update:
+            lines = revised.splitlines()
+            source_line_indexes = [index for index, line in enumerate(lines)
+                                   if line.startswith(("Источник:", "Источники:"))]
+            prior_urls = _post_source_urls(current_text)
+            if len(source_line_indexes) != 1 or not prior_urls:
+                last_summary = "Не удалось сохранить исходную ссылку опубликованного поста при дополнении."
+                continue
+            links = re.findall(r"\[([^\]]+)\]\((https?://[^)]+)\)", lines[source_line_indexes[0]])
+            if source["url"] not in {url for _, url in links}:
+                links.append((str(source.get("publisher") or "Новый источник"), source["url"]))
+            if not set(prior_urls).issubset({url for _, url in links}):
+                last_summary = "Не удалось сохранить все прежние ссылки на источники."
+                continue
+            lines[source_line_indexes[0]] = "Источники: " + ", ".join(
+                f"[{label}]({url})" for label, url in links)
+            revised = "\n".join(lines)
         if reference_post:
             from .cli import _previous_story_label, _telegram_message_url
             reference_url = _telegram_message_url(config, str(reference_post["external_id"]))
@@ -570,7 +773,8 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
             continue
         original_source_lines = [line for line in current_text.splitlines() if line.startswith(("Источник:", "Источники:"))]
         revised_source_lines = [line for line in revised.splitlines() if line.startswith(("Источник:", "Источники:"))]
-        if original_source_lines != revised_source_lines:
+        if (not agent_update and original_source_lines != revised_source_lines) or (
+                agent_update and (len(revised_source_lines) != 1 or source["url"] not in revised_source_lines[0])):
             last_summary = "Ссылка на использованный источник изменилась."
             continue
         headline, _, body = revised.partition("\n")
@@ -609,17 +813,27 @@ def recover_feedback_correction_jobs(db) -> None:
                 db.execute("INSERT INTO telegram_post_edits(update_id,post_id,telegram_chat_id,telegram_message_id,edit_date,previous_text,edited_text,captured_at,capture_source,source_url) VALUES(?,?,?,?,?,?,?,?,?,?)",
                            (local_id, intent["post_id"], intent["channel_id"], intent["telegram_message_id"], "",
                             intent["previous_text"], intent["new_text"], now, "AUTOMATED_CORRECTION_RECOVERED",
-                            (re.search(r"(?m)^(?:Источник|Источники): \[[^\]]+\]\((https?://[^)]+)\)$", intent["previous_text"]) or [None, ""])[1]))
+                            (_post_source_urls(intent["previous_text"]) or [""])[0]))
             db.commit()
             try:
                 evidence = json.loads(row["evidence_json"] or "[]")
             except (TypeError, json.JSONDecodeError):
                 evidence = []
-            source_match = re.search(r"(?m)^(?:Источник|Источники): \[[^\]]+\]\((https?://[^)]+)\)$", intent["previous_text"])
+            try:
+                _bind_corrected_post_facts(db, row, intent["new_text"], evidence)
+                db.commit()
+            except Exception:
+                db.rollback()  # Fact coverage is ancillary to the confirmed Telegram edit.
+            source_urls = _post_source_urls(intent["previous_text"])
+            edit_feedback = db.execute("SELECT feedback_type FROM editorial_feedback WHERE feedback_id=?",
+                                       (row["feedback_id"],)).fetchone()
+            learning_source_url = (evidence[0].get("source_url") if evidence and isinstance(evidence[0], dict)
+                                   else (source_urls[-1] if edit_feedback and edit_feedback["feedback_type"] in {"AGENT_FACT_UPDATE", "AGENT_STORY_SUPPLEMENT"} and source_urls
+                                         else (source_urls[0] if source_urls else "")))
             try:
                 _record_agent_edit_learning(db, row, intent["previous_text"], intent["new_text"],
                                             row["result_summary"] or "Правка подтверждена ответом Telegram.",
-                                            evidence, source_match.group(1) if source_match else "")
+                                            evidence, learning_source_url)
             except Exception:
                 db.rollback()  # Learning failure must not change the recovered delivery result.
             db.execute("UPDATE telegram_feedback_corrections SET status='EDITED',result_code='CORRECTED',result_summary='Правка подтверждена ответом Telegram.',corrected_text=?,notice_status='PENDING',updated_at=? WHERE correction_id=?",
@@ -630,6 +844,10 @@ def recover_feedback_correction_jobs(db) -> None:
         else:
             db.execute("UPDATE telegram_feedback_corrections SET status='UNKNOWN',result_code='TELEGRAM_EDIT_UNKNOWN',result_summary='Результат правки не подтверждён; повторно её не отправлял.',notice_status='PENDING',updated_at=? WHERE correction_id=?",
                        (now, row["correction_id"]))
+        state = db.execute("SELECT status FROM telegram_feedback_corrections WHERE correction_id=?",
+                           (row["correction_id"],)).fetchone()
+        if state:
+            _resolve_agent_correction_item(db, row["correction_id"], state["status"])
     db.commit()
 
 
@@ -666,12 +884,22 @@ def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
                                    "Не менял пост: его текст изменился во время проверки отзыва.", previous_text=previous_text)
                 processed += 1
                 continue
-            source_match = re.search(r"(?m)^(?:Источник|Источники): \[[^\]]+\]\((https?://[^)]+)\)$", previous_text)
-            if not source_match:
+            source_urls = _post_source_urls(previous_text)
+            if not source_urls:
                 _finish_correction(db, row["correction_id"], "REJECTED", "SOURCE_FOOTER_INVALID",
                                    "Не менял пост: не удалось сохранить точную ссылку на использованный источник.", previous_text=previous_text)
                 processed += 1
                 continue
+            correction_feedback = db.execute("SELECT feedback_type FROM editorial_feedback WHERE feedback_id=?",
+                                             (row["feedback_id"],)).fetchone()
+            agent_update = bool(correction_feedback and correction_feedback["feedback_type"] in {"AGENT_FACT_UPDATE", "AGENT_STORY_SUPPLEMENT"})
+            if agent_update and (not evidence or not isinstance(evidence[0], dict)
+                                 or evidence[0].get("source_url") not in _post_source_urls(revised)):
+                _finish_correction(db, row["correction_id"], "REJECTED", "NEW_SOURCE_LINK_MISSING",
+                                   "Не менял пост: новый подтверждающий источник не попал в текст исправления.", previous_text=previous_text)
+                processed += 1
+                continue
+            correction_source_url = evidence[0]["source_url"] if agent_update else source_urls[0]
             existing_intent = db.execute("SELECT status FROM telegram_message_edit_intents WHERE correction_id=?", (row["correction_id"],)).fetchone()
             if existing_intent:
                 if existing_intent["status"] not in {"PREPARED", "FAILED"}:
@@ -717,7 +945,7 @@ def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
             db.execute("INSERT INTO telegram_post_edits(update_id,post_id,telegram_chat_id,telegram_message_id,edit_date,previous_text,edited_text,captured_at,capture_source,source_url) VALUES(?,?,?,?,?,?,?,?,?,?)",
                        (local_id, post["post_id"], target, str(post["external_id"]),
                         datetime.fromtimestamp(response["date"], timezone.utc).isoformat(timespec="seconds") if response.get("date") else "",
-                        previous_text, revised, saved_at, "AUTOMATED_CORRECTION", source_match.group(1)))
+                        previous_text, revised, saved_at, "AUTOMATED_CORRECTION", correction_source_url))
             db.execute("UPDATE telegram_message_edit_intents SET status='SENT',response_json=?,updated_at=? WHERE correction_id=?",
                        (json.dumps({"message_id": response["message_id"], "date": response.get("date")}, ensure_ascii=False), saved_at, row["correction_id"]))
             db.commit()
@@ -725,7 +953,8 @@ def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
                                previous_text=previous_text,
                                corrected_text=revised, evidence=evidence)
             try:
-                _record_agent_edit_learning(db, row, previous_text, revised, summary, evidence, source_match.group(1))
+                _bind_corrected_post_facts(db, row, revised, evidence)
+                _record_agent_edit_learning(db, row, previous_text, revised, summary, evidence, correction_source_url)
                 db.commit()
             except Exception:
                 db.rollback()  # The confirmed edit remains recorded even if its learning example cannot be saved.
@@ -738,98 +967,13 @@ def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
     return processed
 
 
-_DEPLOY_CORRECTION_REQUESTS = (
-    {
-        "key": "editorial-feedback-case-61-v1",
-        "message_id": "61",
-        "reference_message_id": "5",
-        "reason": (
-            "Этот пост повторяет уже опубликованное сообщение о тех же правилах. "
-            "Оставь короткое сообщение только о том, что правила вступили в силу, "
-            "без повторения подробностей. Добавь строку «Ранее» со ссылкой на подробный "
-            "разбор, публикация канала №5. Сохрани ссылку на источник внизу."
-        ),
-    },
-    {
-        "key": "editorial-feedback-case-62-v1",
-        "message_id": "62",
-        "reference_message_id": None,
-        "reason": (
-            "Убери вводное «Обновление:» из заголовка: это дополнение к новости, "
-            "а не обновление инфоповода. Удали из текста дублирующую атрибуцию "
-            "«сообщает Коммерсантъ», поскольку ссылка на издание уже стоит внизу. "
-            "Сохрани главный факт, проверенные детали и ссылку на источник."
-        ),
-    },
-)
-
-
-def enqueue_deployed_correction_requests(config: dict, db) -> int:
-    """Seed explicit editorial corrections once; the normal review worker handles them."""
-    owner_ids = config.get("telegram", {}).get("interest_owner_user_ids") or []
-    if not owner_ids:
-        return 0
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    created = 0
-    state_changed = False
-    for request in _DEPLOY_CORRECTION_REQUESTS:
-        if db.execute("SELECT 1 FROM app_state WHERE key=?", (request["key"],)).fetchone():
-            continue
-        post = db.execute(
-            "SELECT p.post_id,p.origin_item_id,p.story_id,p.text,p.status,p.external_id,s.headline "
-            "FROM posts p JOIN stories s USING(story_id) "
-            "WHERE p.external_id=? ORDER BY p.post_id DESC LIMIT 1",
-            (request["message_id"],),
-        ).fetchone()
-        if not post or post["status"] != "PUBLISHED" or not post["external_id"]:
-            continue
-        if request["reference_message_id"]:
-            reference = db.execute(
-                "SELECT 1 FROM posts WHERE external_id=? AND status='PUBLISHED' LIMIT 1",
-                (request["reference_message_id"],),
-            ).fetchone()
-            if not reference:
-                continue
-        existing = db.execute(
-            "SELECT 1 FROM telegram_feedback_corrections c "
-            "JOIN editorial_feedback f USING(feedback_id) "
-            "WHERE c.post_id=? AND f.reason=? LIMIT 1",
-            (post["post_id"], request["reason"]),
-        ).fetchone()
-        if existing:
-            db.execute("INSERT INTO app_state(key,value) VALUES(?,?)", (request["key"], "already_queued"))
-            state_changed = True
-            continue
-        latest = db.execute(
-            "SELECT edited_text FROM telegram_post_edits WHERE post_id=? "
-            "ORDER BY captured_at DESC,ABS(update_id) DESC LIMIT 1", (post["post_id"],)
-        ).fetchone()
-        feedback_reason = request["reason"]
-        if request["reference_message_id"]:
-            feedback_reason += f"\n[BACKEND_REFERENCE_MESSAGE_ID:{request['reference_message_id']}]"
-        feedback = db.execute(
-            "INSERT INTO editorial_feedback(created_at,item_id,story_id,post_id,feedback_type,reason,item_title,post_text) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (now, post["origin_item_id"], post["story_id"], post["post_id"], "TELEGRAM_EDIT",
-             feedback_reason, post["headline"] or "", (latest["edited_text"] if latest else post["text"])[:5000]),
-        )
-        db.execute(
-            "INSERT INTO telegram_feedback_corrections(feedback_id,post_id,owner_chat_id,created_at,updated_at) "
-            "VALUES(?,?,?,?,?)",
-            (feedback.lastrowid, post["post_id"], str(owner_ids[0]), now, now),
-        )
-        db.execute("INSERT INTO app_state(key,value) VALUES(?,?)", (request["key"], "queued"))
-        state_changed = True
-        created += 1
-    if state_changed:
-        db.commit()
-    return created
-
-
 def flush_feedback_correction_notices(config: dict, db) -> None:
     rows = db.execute("SELECT * FROM telegram_feedback_corrections WHERE notice_status='PENDING' AND status!='QUEUED' ORDER BY correction_id LIMIT 10").fetchall()
     for row in rows:
         status = row["status"]
+        feedback = db.execute("SELECT feedback_type FROM editorial_feedback WHERE feedback_id=?",
+                              (row["feedback_id"],)).fetchone()
+        subject = "Самостоятельно проверил опубликованный пост" if feedback and feedback["feedback_type"] in {"AGENT_FACT_UPDATE", "AGENT_STORY_SUPPLEMENT"} else "Проверил отзыв"
         if status == "EDITED":
             post = db.execute("SELECT external_id FROM posts WHERE post_id=?", (row["post_id"],)).fetchone()
             try:
@@ -841,13 +985,13 @@ def flush_feedback_correction_notices(config: dict, db) -> None:
                         f"https://t.me/c/{str(target.get('id','')).removeprefix('-100')}/{message_id}")
             except Exception:
                 link = ""
-            text = "Проверил отзыв и исправил тот же пост в канале. " + (link + "\n" if link else "") + f"Причина: {row['result_summary']}"
+            text = subject + " и исправил тот же пост в канале. " + (link + "\n" if link else "") + f"Причина: {row['result_summary']}"
         elif status == "NO_CHANGE":
-            text = "Проверил отзыв. Пост не менял: " + (row["result_summary"] or "не нашёл подтверждённой ошибки.")
+            text = subject + ". Пост не менял: " + (row["result_summary"] or "не нашёл подтверждённой ошибки.")
         elif status == "UNKNOWN":
-            text = "Не могу подтвердить, применил ли Telegram правку. Повторно её не отправлял; проверьте пост в канале."
+            text = subject + ": не могу подтвердить, применил ли Telegram правку. Повторно её не отправлял; проверьте пост в канале."
         else:
-            text = "Проверил отзыв, но пост не менял: " + (row["result_summary"] or "правка не прошла проверки.")
+            text = subject + ", но пост не менял: " + (row["result_summary"] or "правка не прошла проверки.")
         try:
             result = telegram_api(config, "sendMessage", {"chat_id": row["owner_chat_id"], "text": text})
             state = "SENT" if isinstance(result, dict) and result.get("message_id") else "UNKNOWN"
@@ -1070,9 +1214,6 @@ def run_review_bot(config: dict) -> None:
         if offset is not None:
             payload["offset"] = offset
         try:
-            seeded = enqueue_deployed_correction_requests(config, db)
-            if seeded:
-                print(f"Поставлено серверных редакторских правок в очередь: {seeded}.", flush=True)
             recover_feedback_correction_jobs(db)
             flush_feedback_correction_notices(config, db)
             process_feedback_corrections(config, db, limit=1)
