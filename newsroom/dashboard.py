@@ -13,6 +13,95 @@ from .db import connect, connect_readonly
 from .quality import publication_source_ready
 
 
+def _queue_post_correction(db, config: dict, post_id: int | None, reason: str,
+                           telegram_message_id: str | None = None,
+                           reference_message_id: int | None = None) -> tuple[dict, int]:
+    """Queue a source-checked edit of an existing published post through the backend."""
+    reason = str(reason or "").strip()
+    if len(reason) < 5 or len(reason) > 2000:
+        return {"error": "Комментарий должен содержать от 5 до 2000 символов"}, 400
+    if post_id is not None and telegram_message_id is not None:
+        post = db.execute(
+            "SELECT p.post_id,p.story_id,p.origin_item_id,p.text,p.status,p.external_id,s.headline "
+            "FROM posts p JOIN stories s USING(story_id) WHERE p.post_id=? AND p.external_id=?",
+            (post_id, str(telegram_message_id)),
+        ).fetchone()
+    elif telegram_message_id is not None:
+        post = db.execute(
+            "SELECT p.post_id,p.story_id,p.origin_item_id,p.text,p.status,p.external_id,s.headline "
+            "FROM posts p JOIN stories s USING(story_id) WHERE p.external_id=? AND p.status='PUBLISHED' "
+            "ORDER BY p.post_id DESC LIMIT 1",
+            (str(telegram_message_id),),
+        ).fetchone()
+    else:
+        post = db.execute(
+            "SELECT p.post_id,p.story_id,p.origin_item_id,p.text,p.status,p.external_id,s.headline "
+            "FROM posts p JOIN stories s USING(story_id) WHERE p.post_id=?",
+            (post_id,),
+        ).fetchone() if post_id is not None else None
+    if not post:
+        return {"error": "Пост не найден"}, 404
+    if post["status"] != "PUBLISHED" or not post["external_id"]:
+        return {"error": "Исправлять можно только подтверждённую публикацию"}, 409
+    if reference_message_id is not None:
+        reference = db.execute(
+            "SELECT post_id FROM posts WHERE external_id=? AND status='PUBLISHED' LIMIT 1",
+            (str(reference_message_id),),
+        ).fetchone()
+        if not reference:
+            return {"error": "Подробная публикация для ссылки не найдена"}, 404
+        if int(reference["post_id"]) == int(post["post_id"]):
+            return {"error": "Нельзя ссылаться на тот же пост"}, 400
+    owners = config.get("telegram", {}).get("interest_owner_user_ids") or []
+    if not owners:
+        return {"error": "Не настроен получатель результата редакторской проверки"}, 503
+    owner_chat_id = str(owners[0])
+    feedback_reason = reason
+    if reference_message_id is not None:
+        feedback_reason += f"\n[BACKEND_REFERENCE_MESSAGE_ID:{int(reference_message_id)}]"
+    active = db.execute(
+        "SELECT c.correction_id,c.status,f.reason FROM telegram_feedback_corrections c "
+        "JOIN editorial_feedback f USING(feedback_id) "
+        "WHERE c.post_id=? AND c.status IN ('QUEUED','PROCESSING') ORDER BY c.correction_id DESC LIMIT 1",
+        (post["post_id"],),
+    ).fetchone()
+    if active:
+        if active["reason"] == feedback_reason:
+            return {"ok": True, "queued": True, "reused": True,
+                    "correction_id": active["correction_id"], "status": active["status"]}, 200
+        return {"error": "Для этого поста уже выполняется другая правка",
+                "correction_id": active["correction_id"], "status": active["status"]}, 409
+    unresolved = db.execute(
+        "SELECT status FROM telegram_message_edit_intents WHERE post_id=? "
+        "AND status IN ('SENDING','UNKNOWN') LIMIT 1",
+        (post["post_id"],),
+    ).fetchone()
+    if unresolved:
+        return {"error": "Предыдущая правка не подтверждена; новую не ставил"}, 409
+    latest_edit = db.execute(
+        "SELECT edited_text FROM telegram_post_edits WHERE post_id=? "
+        "ORDER BY captured_at DESC,ABS(update_id) DESC LIMIT 1",
+        (post["post_id"],),
+    ).fetchone()
+    post_text = latest_edit["edited_text"] if latest_edit else post["text"]
+    item = db.execute("SELECT title FROM items WHERE item_id=?",
+                      (post["origin_item_id"],)).fetchone() if post["origin_item_id"] else None
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    feedback = db.execute(
+        "INSERT INTO editorial_feedback(created_at,item_id,story_id,post_id,feedback_type,reason,item_title,post_text) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (now, post["origin_item_id"], post["story_id"], post["post_id"], "TELEGRAM_EDIT",
+         feedback_reason, (item["title"] if item else post["headline"] or "")[:1000], post_text[:5000]),
+    )
+    correction = db.execute(
+        "INSERT INTO telegram_feedback_corrections(feedback_id,post_id,owner_chat_id,created_at,updated_at) "
+        "VALUES(?,?,?,?,?)",
+        (feedback.lastrowid, post["post_id"], owner_chat_id, now, now),
+    )
+    db.commit()
+    return {"ok": True, "queued": True, "reused": False,
+            "correction_id": correction.lastrowid, "status": "QUEUED"}, 202
+
 PAGE = r'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kovalsky · Newsroom</title><style>
@@ -27,7 +116,7 @@ PAGE = r'''<!doctype html>
 <section id="view-overview" class="view active"><div class="cards" id="metrics"></div><div class="panel home-collection"><div class="panel-head"><div><h2>Сбор новостей</h2><div class="muted">Автоматические проверки работают по расписанию. Здесь можно запустить цикл вручную.</div></div><button id="force-collect-button" class="btn primary" type="button" onclick="forceCollect()">↻ Собрать сейчас</button></div><div id="collection-status" class="collection-status" style="display:none"></div><div id="home-source-health" class="home-source-health"></div></div><div class="home-links"><button class="home-link" onclick="showView('news')"><span class="home-link-icon">◷</span><span><b>Новости</b><small>Просмотр новых материалов и отзыв для обучения</small></span><span class="home-link-arrow">→</span></button><button class="home-link" onclick="showView('published')"><span class="home-link-icon">↗</span><span><b>Публикации</b><small>Посты в канале и комментарии к ним</small></span><span class="home-link-arrow">→</span></button><button class="home-link" onclick="showView('sources')"><span class="home-link-icon">◎</span><span><b>Источники</b><small>Состояние и настройки лент</small></span><span class="home-link-arrow">→</span></button></div></section>
 <section id="view-news" class="view"><div class="panel"><div class="panel-head"><div><h2>Передать статью на проверку</h2><div class="muted">Вставьте ссылку на новость или исследование. Материал пройдёт обычные проверки; публикация произойдёт только при автоматическом допуске.</div></div></div><form id="manual-intake-form" class="source-add-form"><label class="wide">Ссылка на статью<input name="url" type="url" maxlength="2000" required placeholder="https://example.com/news/article"></label><div class="form-actions wide"><span class="muted">Принимаются общедоступные HTTPS-страницы с читаемым текстом.</span><button id="manual-intake-submit" class="btn primary" type="submit">Прочитать и проверить</button></div></form><div id="manual-intake-result" class="queue-reason" style="display:none"></div></div><div class="toolbar news-toolbar"><input id="news-search" placeholder="Поиск по заголовку или источнику…" oninput="newsPage=0;renderNews()"><label>Сортировка<select id="news-sort" onchange="newsPage=0;reloadNews()"><option value="discovered" selected>Сначала обнаруженные</option><option value="newest">Сначала опубликованные</option><option value="oldest">Сначала старые публикации</option></select></label><label>Показать<select id="news-filter" onchange="newsPage=0;renderNews()"><option value="relevant" selected>Релевантные</option><option value="all">Все материалы</option><option value="check">На перепроверке</option><option value="excluded">Отклонённые и повторы</option></select></label></div><div class="muted news-help">«По теме» означает соответствие фокусу редакции, а не готовность к публикации: нужны новизна, достаточные доказательства и прохождение всех проверок. Причина результата указана в карточке. По умолчанию показаны последние материалы по теме; список ограничен 500 обнаружениями.</div><div id="news-list" class="row-list"></div><div id="news-pagination" class="news-pagination"></div></section>
 
-<section id="view-published" class="view"><div class="toolbar"><input id="published-search" placeholder="Поиск по опубликованным постам…" oninput="renderPublished()"></div><div id="published-list" class="row-list"></div></section>
+<section id="view-published" class="view"><div class="panel"><div class="panel-head"><h2>Статус правок</h2></div><div id="correction-status-list" class="row-list"><div class="muted">Загрузка статусов…</div></div></div><div class="toolbar"><input id="published-search" placeholder="Поиск по опубликованным постам…" oninput="renderPublished()"></div><div id="published-list" class="row-list"></div></section>
 <section id="view-pipeline" class="view"><div class="panel"><div class="panel-head"><div><h2>Где сейчас каждый материал</h2><div class="muted">Этап берётся из последнего сохранённого состояния. Пока цикл сбора работает, новые материалы могут появиться здесь только после сохранения в базе.</div></div><button class="btn" onclick="loadPipeline()">↻ Обновить</button></div><div id="pipeline-stages" class="home-links"></div><div class="toolbar" style="margin-top:16px"><input id="pipeline-search" placeholder="Поиск по заголовку или источнику…" oninput="pipelineOffset=0;loadPipeline()"><label>Период<select id="pipeline-period" onchange="pipelineOffset=0;loadPipeline()"><option value="24">24 часа</option><option value="48" selected>48 часов</option><option value="168">7 дней</option><option value="all">Всё время</option></select></label><label>Этап<select id="pipeline-stage" onchange="pipelineOffset=0;loadPipeline()"><option value="all">Все этапы</option></select></label></div><div id="pipeline-list" class="row-list"></div><div id="pipeline-pagination" class="news-pagination"></div></div></section>
 <section id="view-regulatory" class="view"><div class="panel"><div class="panel-head"><h2>Нормативный мониторинг</h2><button class="btn" onclick="loadRegulatory()">Обновить</button></div><p class="muted">Предварительный разбор официальных материалов. Стадии и сроки требуют редакторской проверки. Поиск по индексу не гарантирует полноту охвата.</p><div id="reg-status"></div><div class="toolbar" style="margin-top:12px"><label>Показать<select id="reg-filter" onchange="loadRegulatory()"><option value="ready">Исследования</option><option value="queue">Очередь чтения</option><option value="all">Все материалы</option></select></label></div><details><summary>Охват источников</summary><div id="reg-sources"></div></details></div><div id="reg-list" class="row-list"></div></section>
 <section id="view-analysis" class="view"><div class="panel"><div class="panel-head"><h2>Авторские аналитические черновики</h2><span class="muted">Только редакторская проверка · автопубликация выключена</span></div><div id="analysis-list" class="row-list"></div></div></section>
@@ -47,8 +136,8 @@ async function submitManualIntake(event){event.preventDefault();const form=event
 function showCollectionStatus(message,tone=''){const box=document.getElementById('collection-status');box.textContent=message;box.className='queue-reason'+(tone==='ready'?' ready':'');box.style.display='block'}
 async function refreshCollectionStatus(){try{const s=await api('/api/collection'),button=document.getElementById('force-collect-button');if(s.state==='running'){collectionWasRunning=true;button.disabled=true;button.textContent='Сбор идёт…';showCollectionStatus(`Сбор запущен ${date(s.started_at)}. Панель обновится после завершения.`);if(collectionPoll)clearTimeout(collectionPoll);collectionPoll=setTimeout(refreshCollectionStatus,2500);return}button.disabled=false;button.textContent='↻ Собрать сейчас';if(s.state==='error')showCollectionStatus(`Сбор завершился с ошибкой (${s.error||'ошибка цикла'}).`);else if(s.finished_at){const outcomes=Object.entries(s.outcomes||{}).map(([k,v])=>`${k}: ${v}`).join(' · ');showCollectionStatus(`Последний цикл завершён ${date(s.finished_at)}${outcomes?' · '+outcomes:' · новых материалов нет'}`,'ready')}else document.getElementById('collection-status').style.display='none';if(collectionWasRunning){collectionWasRunning=false;await reloadAll()}}catch(e){showCollectionStatus('Не удалось получить состояние сбора.');}}
 async function forceCollect(){if(!confirm('Запустить полный цикл сбора сейчас? Если появятся материалы, подходящие под правила автопубликации, они могут быть отправлены в Telegram.'))return;const button=document.getElementById('force-collect-button');button.disabled=true;button.textContent='Запускаю…';try{await api('/api/collect',{method:'POST',body:'{}'});collectionWasRunning=true;showNotice('Полный цикл сбора запущен');await refreshCollectionStatus()}catch(e){button.disabled=false;button.textContent='↻ Собрать сейчас';showNotice(e.message);await refreshCollectionStatus()}}
-function feedbackBox(itemId,postId=''){return `<details class="editorial-feedback"><summary>💬 Оставить обратную связь агенту</summary><form onsubmit="submitEditorialFeedback(event,this)" data-item-id="${itemId}" data-post-id="${postId}"><label>Тип обратной связи<select name="feedback_type" required><option value="">Выберите тип обратной связи</option><option value="POSITIVE">Понравилось — стоит повторять</option><option value="CORRECTION">Нужно исправить или уточнить</option><option value="NOT_RELEVANT">Не относится к нашей теме</option><option value="NOT_IMPORTANT">Недостаточно важно</option><option value="DUPLICATE">Повтор уже известного сюжета</option><option value="INACCURATE">Фактическая ошибка или слабый источник</option><option value="POOR_STYLE">Не подходит подача или стиль</option><option value="OTHER">Общий комментарий</option></select></label><label>Комментарий, поправка или пожелание<textarea name="reason" required minlength="5" maxlength="2000" rows="2" placeholder="Например: удачно объяснено влияние на рынок; здесь стоит уточнить, что решение пока не вступило в силу"></textarea></label><button class="btn" type="submit">Сохранить обратную связь</button></form></details>`}
-async function submitEditorialFeedback(event,form){event.preventDefault();let button=form.querySelector('button[type=submit]'),data=Object.fromEntries(new FormData(form).entries());data.item_id=Number(form.dataset.itemId)||null;data.post_id=Number(form.dataset.postId)||null;button.disabled=true;try{await api('/api/editorial-feedback',{method:'POST',body:JSON.stringify(data)});showNotice('Отзыв сохранён и будет учтён в следующих разборах');form.reset();form.closest('details').open=false}catch(e){showNotice('Не удалось сохранить отзыв: '+e.message)}finally{button.disabled=false}}
+function feedbackBox(itemId,postId=''){let correctionOption=postId?'<option value="TELEGRAM_EDIT">Проверить и исправить опубликованный пост</option>':'';let referenceField=postId?'<label>ID подробной публикации для строки «Ранее» (необязательно)<input name="reference_message_id" type="number" min="1" step="1" placeholder="Например, 5"></label>':'';return `<details class="editorial-feedback"><summary>💬 Оставить обратную связь агенту</summary><form onsubmit="submitEditorialFeedback(event,this)" data-item-id="${itemId}" data-post-id="${postId}"><label>Тип обратной связи<select name="feedback_type" required><option value="">Выберите тип обратной связи</option>${correctionOption}<option value="POSITIVE">Понравилось — стоит повторять</option><option value="CORRECTION">Нужно исправить или уточнить</option><option value="NOT_RELEVANT">Не относится к нашей теме</option><option value="NOT_IMPORTANT">Недостаточно важно</option><option value="DUPLICATE">Повтор уже известного сюжета</option><option value="INACCURATE">Фактическая ошибка или слабый источник</option><option value="POOR_STYLE">Не подходит подача или стиль</option><option value="OTHER">Общий комментарий</option></select></label><label>Комментарий, поправка или пожелание<textarea name="reason" required minlength="5" maxlength="2000" rows="2" placeholder="Например: удачно объяснено влияние на рынок; здесь стоит уточнить, что решение пока не вступило в силу"></textarea></label>${referenceField}<button class="btn" type="submit">Сохранить обратную связь</button></form></details>`}
+async function submitEditorialFeedback(event,form){event.preventDefault();let button=form.querySelector('button[type=submit]'),data=Object.fromEntries(new FormData(form).entries());data.item_id=Number(form.dataset.itemId)||null;data.post_id=Number(form.dataset.postId)||null;button.disabled=true;try{let result=await api(data.feedback_type==='TELEGRAM_EDIT'?'/api/post-corrections':'/api/editorial-feedback',{method:'POST',body:JSON.stringify(data)});showNotice(result.queued?'Правка поставлена в очередь проверки':'Отзыв сохранён и будет учтён в следующих разборах');form.reset();form.closest('details').open=false}catch(e){showNotice('Не удалось сохранить отзыв: '+e.message)}finally{button.disabled=false}}
 function newsCard(n){let d=n.description||n.summary||'',status=n.disposition||n.status,relevance=n.is_relevant===true?pill('По теме','green'):n.is_relevant===false?pill('Не по теме','red'):pill('Тема не оценена');let tone=status==='NEW_STORY'?'green':status==='NOISE'?'red':status==='WAITING_CONFIRMATION'?'amber':'',publishedAt=Date.parse(n.published_at||''),futureDate=Number.isFinite(publishedAt)&&publishedAt>Date.now()+300000;return `<article class="row-card"><div><a class="row-title" href="${esc(safeUrl(n.url))}" target="_blank" rel="noopener">${esc(n.title||n.headline)}</a></div><div class="meta"><span>${esc(n.source_name||'Источник не указан')}</span><span>${futureDate?`Дата источника в будущем: ${date(n.published_at)}`:n.published_at?`Выход: ${date(n.published_at)}`:`Выход неизвестен`}</span><span>Обнаружена: ${date(n.discovered_at)}</span>${pill(dispositionLabel(status),tone)}${n.revision_count?pill(`Есть версия (${n.revision_count})`,'amber'):''}${relevance}</div>${n.processing_reason?`<div class="queue-reason">${esc(n.processing_reason)}${n.retry_at?` · Повтор разрешён с ${date(n.retry_at)}; запуск ожидает места в очереди и зависит от бюджета цикла`:''}${n.retry_queue_position?` · Очередь: ${n.retry_queue_position} из ${n.retry_queue_total}, до ${n.retry_queue_batch} за цикл; ориентир ${n.retry_queue_cycles} циклов`:''}</div>`:''}${d?`<div class="excerpt">${esc(d.slice(0,380))}${d.length>380?'…':''}</div>`:''}${n.selection_reason?`<div class="queue-reason">${esc(n.selection_reason)}</div>`:''}<div class="actions"><button class="btn" data-detail="${n.item_id}">Подробнее</button></div>${feedbackBox(n.item_id)}</article>`}
 function inlineText(s){let out='',i=0,re=/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g,m;while((m=re.exec(s))){out+=esc(s.slice(i,m.index));out+=m[1]?`<a href="${esc(safeUrl(m[2]))}" target="_blank" rel="noopener noreferrer">${esc(m[1])}</a>`:`<strong>${esc(m[3])}</strong>`;i=re.lastIndex}return out+esc(s.slice(i))}
 function postText(raw){let groups=String(raw||'').trim().split(/\n\s*\n/).filter(Boolean),html='';for(let i=0;i<groups.length;i++){let g=groups[i].trim(),next=groups[i+1]||'';if(/^\*\*.+?:\*\*$/.test(g)&&next.split(/\n/).every(x=>/^➠\s*/.test(x.trim()))){let label=g.replace(/^\*\*|\*\*$/g,'').replace(/:$/,'');html+=`<details class="post-details"><summary>${inlineText(label)}</summary><div class="post-details-body">${next.split(/\n/).map(x=>`<p>${inlineText(x.trim().replace(/^➠\s*/,''))}</p>`).join('')}</div></details>`;i++;continue}html+=`<p>${g.split(/\n/).map(inlineText).join('<br>')}</p>`}return `<div class="excerpt post-copy">${html}</div>`}
@@ -103,7 +192,9 @@ async function reloadAll(){try{let sort=document.getElementById('news-sort').val
 
 
 
-reloadAll();refreshCollectionStatus();if(location.hash==='#regulatory')showView('regulatory');setInterval(reloadAll,60000);
+function correctionStatusLabel(v){return ({QUEUED:'В очереди',PROCESSING:'Проверяет и готовит правку',EDITED:'Исправлено',NO_CHANGE:'Изменений не потребовалось',REJECTED:'Правка отклонена проверкой',UNKNOWN:'Результат требует сверки'})[v]||v}
+async function loadCorrections(){try{let r=await api('/api/corrections'),items=r.items||[],el=document.getElementById('correction-status-list');if(!el)return;el.innerHTML=items.length?items.map(function(c){return '<article class=\"row-card\"><div class=\"row-title\">Пост #'+esc(c.external_id||c.post_id)+' · '+esc(c.headline||'')+'</div><div class=\"meta\">'+pill(correctionStatusLabel(c.status),c.status==='EDITED'?'green':c.status==='QUEUED'||c.status==='PROCESSING'?'amber':c.status==='REJECTED'||c.status==='UNKNOWN'?'red':'')+'<span>Обновлено: '+date(c.updated_at)+'</span>'+(c.attempt_count?'<span>Проверок: '+esc(c.attempt_count)+'</span>':'')+'</div>'+(c.result_summary?'<div class=\"queue-reason\">'+esc(c.result_summary)+'</div>':'')+(c.post_url?'<div class=\"actions\"><a class=\"btn\" href=\"'+esc(safeUrl(c.post_url))+'\" target=\"_blank\" rel=\"noopener\">Открыть пост ↗</a></div>':'')+'</article>'}).join(''):'<div class=\"empty\">Нет запросов на исправление опубликованных постов</div>'}catch(e){let el=document.getElementById('correction-status-list');if(el)el.innerHTML='<div class=\"error\">Не удалось загрузить статусы правок</div>'}}
+reloadAll();refreshCollectionStatus();loadCorrections();setInterval(loadCorrections,30000);if(location.hash==='#regulatory')showView('regulatory');setInterval(reloadAll,60000);
 </script></body></html>'''
 
 
@@ -207,6 +298,8 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                     self._json(self._news(parse_qs(parsed.query)))
                 elif parsed.path == "/api/posts":
                     self._json(self._posts())
+                elif parsed.path == "/api/corrections":
+                    self._json(self._corrections())
                 elif parsed.path == "/api/analysis-drafts":
                     self._json(self._analysis_drafts())
                 elif parsed.path == "/api/sources":
@@ -398,6 +491,28 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                 return {"items":items}
             finally: db.close()
 
+        def _corrections(self):
+            db = self._read_db()
+            try:
+                rows = db.execute(
+                    "SELECT c.correction_id,c.post_id,c.status,c.result_code,c.result_summary,"
+                    "c.created_at,c.updated_at,c.attempt_count,p.external_id,s.headline "
+                    "FROM telegram_feedback_corrections c "
+                    "JOIN posts p USING(post_id) JOIN stories s USING(story_id) "
+                    "ORDER BY c.correction_id DESC LIMIT 100"
+                ).fetchall()
+                from .cli import _telegram_message_url
+                return {"items": [{
+                    "correction_id": r["correction_id"], "post_id": r["post_id"],
+                    "external_id": r["external_id"], "headline": r["headline"],
+                    "status": r["status"], "result_code": r["result_code"],
+                    "result_summary": r["result_summary"], "created_at": r["created_at"],
+                    "updated_at": r["updated_at"], "attempt_count": r["attempt_count"],
+                    "post_url": _telegram_message_url(config, str(r["external_id"])) if r["external_id"] else None,
+                } for r in rows]}
+            finally:
+                db.close()
+
         def _posts(self, all_rows=False):
             db=self._read_db()
             try:
@@ -534,6 +649,27 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                         self._json({"ok":True,"topics":topics,"is_interesting":rating})
                     except ValueError as exc: self._json({"error":str(exc)},404)
                     except Exception as exc: self._json({"error":f"Не удалось сохранить оценку ({type(exc).__name__})"},503)
+                    finally: db.close()
+                    return
+                if parts==["api","post-corrections"]:
+                    payload=json.loads(self.rfile.read(size).decode("utf-8"))
+                    try: post_id=int(payload.get("post_id")) if payload.get("post_id") else None
+                    except (ValueError,TypeError): self._json({"error":"Некорректный пост"},400); return
+                    message_id=str(payload.get("telegram_message_id") or "").strip() or None
+                    if message_id and not message_id.isdigit():
+                        self._json({"error":"Некорректный ID сообщения"},400); return
+                    try: reference_message_id=int(payload.get("reference_message_id")) if payload.get("reference_message_id") else None
+                    except (ValueError,TypeError): self._json({"error":"Некорректный ID подробной публикации"},400); return
+                    if post_id is None and message_id is None:
+                        self._json({"error":"Не указан опубликованный пост"},400); return
+                    db=self._db()
+                    try:
+                        result,status=_queue_post_correction(
+                            db,config,post_id,str(payload.get("reason") or ""),message_id,reference_message_id)
+                        self._json(result,status)
+                    except Exception as exc:
+                        db.rollback()
+                        self._json({"error":f"Не удалось поставить правку в очередь ({type(exc).__name__})"},503)
                     finally: db.close()
                     return
                 if parts==["api","editorial-feedback"]:
