@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 from .quality import editorial_issues, digest_issues, attributed_report_supported
 from .ai import FILTER_VERSION
 from .core import NOW, _log_timing, _registrable_domain, is_non_news_telegram_format, is_relevant, run_cycle, terms
+from .core import NOW, _log_timing, _registrable_domain, configure_runtime_log, is_non_news_telegram_format, is_relevant, run_cycle, terms
 from .db import connect
 from .delivery import (DeliveryRejected, DeliveryUncertain, TelegramReceipt,
                        deliver, confirm, reconcile_posts, channel)
@@ -442,7 +443,9 @@ def _performance_summary(config: dict, now: datetime) -> list[str]:
     events: dict[str, list[dict]] = {
         "source_fetch_timing": [], "primary_source_read_timing": [],
         "news_processing_timing": [], "telegram_publish_timing": [], "cycle_timing": [],
-        "collection_stage_timing": [],
+        "collection_stage_timing": [], "item_processing_timing": [],
+        "post_ready": [], "post_publish_confirmed": [],
+        "web_search_scheduled": [], "web_search_deferred": [], "web_search_slot_reserved": [],
     }
     try:
         with log_path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -485,6 +488,9 @@ def _performance_summary(config: dict, now: datetime) -> list[str]:
     ai = [event["ai_seconds"] for event in processing if isinstance(event.get("ai_seconds"), (int, float)) and event["ai_seconds"] > 0]
     totals = [event["total_seconds"] for event in processing if isinstance(event.get("total_seconds"), (int, float))]
     lines.append(f"AI: {range_text(ai)} · разборов {len(ai)}; обработка материалов с AI/чтением/новым событием: {range_text(totals)} · замеров {len(totals)}.")
+    all_items = [event["total_seconds"] for event in events["item_processing_timing"]
+                 if isinstance(event.get("total_seconds"), (int, float))]
+    lines.append(f"Вся обработка материалов: {range_text(all_items)} · замеров {len(all_items)}.")
     publishes = [event["seconds"] for event in events["telegram_publish_timing"] if isinstance(event.get("seconds"), (int, float))]
     lines.append(f"Отправка в Telegram: {range_text(publishes)} · попыток {len(publishes)}.")
     cycles = [event["total_seconds"] for event in events["cycle_timing"] if isinstance(event.get("total_seconds"), (int, float))]
@@ -499,6 +505,50 @@ def _performance_summary(config: dict, now: datetime) -> list[str]:
                            ("other_seconds", "Прочие стадии сбора")):
             values = [event[key] for event in stages if isinstance(event.get(key), (int, float))]
             lines.append(f"{label}: {range_text(values)}.")
+    def seconds_between(start, end):
+        try:
+            first = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            last = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+            if first.tzinfo is None or last.tzinfo is None:
+                return None
+            seconds = (last - first).total_seconds()
+            return seconds if seconds >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    confirmed_by_post = {event.get("post_id"): event for event in events["post_publish_confirmed"] if event.get("post_id")}
+    source_to_detect, detect_to_ready, ready_to_telegram, source_to_telegram = [], [], [], []
+    for event in events["post_ready"]:
+        detected = event.get("item_discovered_at")
+        source_time = event.get("source_published_at")
+        source_gap = seconds_between(source_time, detected)
+        detect_gap = seconds_between(detected, event.get("timestamp"))
+        if source_gap is not None:
+            source_to_detect.append(source_gap)
+        if detect_gap is not None:
+            detect_to_ready.append(detect_gap)
+        confirmation = confirmed_by_post.get(event.get("post_id"))
+        if confirmation:
+            delivery_gap = seconds_between(event.get("timestamp"), confirmation.get("telegram_confirmed_at"))
+            full_gap = seconds_between(source_time, confirmation.get("telegram_confirmed_at"))
+            if delivery_gap is not None:
+                ready_to_telegram.append(delivery_gap)
+            if full_gap is not None:
+                source_to_telegram.append(full_gap)
+    if events["post_ready"] or events["post_publish_confirmed"]:
+        lines.append("Сквозная задержка (за 24 ч, подтверждённые события):")
+        lines.append(f"Дата публикации материала → обнаружение: {range_text(source_to_detect)} · пар {len(source_to_detect)}.")
+        lines.append(f"Обнаружение → пост готов: {range_text(detect_to_ready)} · пар {len(detect_to_ready)}.")
+        lines.append(f"Пост готов → подтверждение Telegram: {range_text(ready_to_telegram)} · пар {len(ready_to_telegram)}.")
+        lines.append(f"Источник → Telegram: {range_text(source_to_telegram)} · пар {len(source_to_telegram)}.")
+    slots = events["web_search_slot_reserved"]
+    if slots:
+        intervals = [event["interval_minutes"] for event in slots if isinstance(event.get("interval_minutes"), (int, float))]
+        scheduled_counts = [event["eligible_count"] for event in events["web_search_scheduled"]
+                            if isinstance(event.get("eligible_count"), (int, float))]
+        lines.append(f"Web Search: {len(slots)} вызовов зарезервировано за 24 ч; минимум между ними {max(intervals) if intervals else 'нет данных'} мин; отложенных циклов {len(events['web_search_deferred'])}.")
+        if scheduled_counts:
+            lines.append(f"В выбранном цикле было готово к запуску поисковых лент: максимум {max(scheduled_counts)}.")
     return lines
 
 
@@ -836,6 +886,13 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
     print(f"Опубликовано в Telegram, message_id={external_id}")
     _log_timing("telegram_publish_timing", post_id=post_id,
                 seconds=round(publish_seconds, 3), result="OK")
+    origin = db.execute("SELECT i.item_id,i.published_at,i.updated_at,i.discovered_at FROM items i "
+                        "JOIN posts p ON p.origin_item_id=i.item_id WHERE p.post_id=?", (post_id,)).fetchone()
+    _log_timing("post_publish_confirmed", post_id=post_id,
+                item_id=origin["item_id"] if origin else None,
+                source_published_at=(origin["updated_at"] or origin["published_at"]) if origin else None,
+                item_discovered_at=origin["discovered_at"] if origin else None,
+                telegram_confirmed_at=NOW())
 
 
 def run_one_cycle(config: dict, db_path: str) -> dict[str, int]:
@@ -896,9 +953,13 @@ def main() -> None:
     admin_publish.add_argument("--request-key", required=True,
                                help="Устойчивый ключ одной команды; повторное использование защищает от дубля")
     args = parser.parse_args()
-    _log_timing("runtime_loaded", build="kovalsky-v2-20260929-r1", command=args.command, pid=os.getpid())
     config = load_config(args.config)
     db_path = config["newsroom"]["database"]
+    database_path = Path(db_path).expanduser()
+    if not database_path.is_absolute():
+        database_path = Path.cwd() / database_path
+    configure_runtime_log(database_path.parent / "newsroom-runtime.log")
+    _log_timing("runtime_loaded", build="kovalsky-v2-20260929-r1", command=args.command, pid=os.getpid())
     if args.command == "init":
         connect(db_path).close()
         print(f"База готова: {db_path}")

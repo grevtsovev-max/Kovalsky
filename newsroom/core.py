@@ -21,6 +21,7 @@ from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 
 from .db import connect
 from .triage import MAX_AUTOMATIC_RETRIES, screen as screen_item, schedule_retry
@@ -29,9 +30,26 @@ from .ai import request_response, AIResponseError, FILTER_VERSION, analyze as an
 
 NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+_RUNTIME_LOG_PATH: Path | None = None
+
+
+def configure_runtime_log(path: str | Path) -> None:
+    """Write structured timing events to the same local log read by `health`."""
+    global _RUNTIME_LOG_PATH
+    _RUNTIME_LOG_PATH = Path(path)
+
 
 def _log_timing(event: str, **fields) -> None:
-    print(json.dumps({"timestamp": NOW(), "event": event, **fields}, ensure_ascii=False), flush=True)
+    line = json.dumps({"timestamp": NOW(), "event": event, **fields}, ensure_ascii=False)
+    print(line, flush=True)
+    if _RUNTIME_LOG_PATH is not None:
+        try:
+            _RUNTIME_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _RUNTIME_LOG_PATH.open("a", encoding="utf-8") as stream:
+                stream.write(line + "\n")
+        except OSError:
+            # A timing-log failure must never interrupt collection or delivery.
+            pass
 
 
 def _development_date_issue(result: dict, source: dict | None, freshness_hours: int) -> tuple[str, str] | None:
@@ -1481,6 +1499,8 @@ class _WebSearchQuota:
             self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_source_url',?) "
                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (source_url,))
         self.db.commit()
+        _log_timing("web_search_slot_reserved", category=category,
+                    source_url=source_url, interval_minutes=self.interval_minutes)
         return True
 
     def reserve_primary_recovery(self) -> bool:
@@ -1659,6 +1679,18 @@ def process_item(db, source, item: dict, threshold: float, max_length: int, fres
         db.commit()
         raise
     finally:
+        try:
+            item_row = db.execute("SELECT item_id,discovered_at FROM items WHERE source_id=? AND canonical_url=?",
+                                  (source["source_id"], canonicalize(item["url"]))).fetchone()
+        except Exception:
+            item_row = None
+        _log_timing("item_processing_timing", item_id=item_row["item_id"] if item_row else None,
+                    source=source["name"], source_type=source["type"], outcome=outcome,
+                    source_published_at=(item.get("updated_at") or item.get("published_at")),
+                    discovered_at=item_row["discovered_at"] if item_row else None,
+                    processed_at=NOW(), total_seconds=round(time.perf_counter() - started, 3),
+                    primary_source_read_seconds=round(timings["primary_source_read_seconds"], 3),
+                    ai_seconds=round(timings["ai_seconds"], 3))
         if (timings["primary_source_read_seconds"] > 0 or timings["ai_seconds"] > 0
                 or outcome not in {"DUPLICATE", "NOISE", "STALE", "UNDATED", "BASELINE_SKIPPED"}):
             _log_timing("news_processing_timing", source=source["name"],
@@ -2285,6 +2317,11 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             return 'WAITING_CONFIRMATION'
     db.execute('RELEASE memory_post')
     db.commit()
+    discovered_row = db.execute("SELECT discovered_at FROM items WHERE item_id=?", (item_id,)).fetchone()
+    ready_post = db.execute("SELECT post_id FROM posts WHERE origin_item_id=? AND post_hash=?", (item_id, post_hash)).fetchone()
+    _log_timing("post_ready", post_id=ready_post["post_id"] if ready_post else None, item_id=item_id,
+                source_published_at=item.get("updated_at") or item.get("published_at"),
+                item_discovered_at=discovered_row["discovered_at"] if discovered_row else None)
     return status
 
 
@@ -2614,8 +2651,13 @@ def run_cycle(config: dict) -> dict[str, int]:
                          if info_by_url[url] in eligible_web_search), None)
         if selected and web_search_quota.reserve(selected[0]["url"], category="feeds"):
             scheduled_web_search_url = selected[0]["url"]
+            _log_timing("web_search_scheduled", category="feeds", eligible_count=len(eligible_web_search),
+                        interval_minutes=web_search_interval)
     if web_search_infos and scheduled_web_search_url is None:
         counts["WEB_SEARCH_DEFERRED"] = len(web_search_infos)
+        _log_timing("web_search_deferred", category=queue_category or "cooldown_or_not_due",
+                    eligible_count=len(eligible_web_search), configured_sources=len(web_search_infos),
+                    interval_minutes=web_search_interval)
     for source_cfg, source_type in active_configs:
         host = (urllib.parse.urlsplit(source_cfg["url"]).hostname or "").lower()
         if source_type in {"rss", "web"} and source_cfg.get("reputation") == "reputable_media" and host:
