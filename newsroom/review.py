@@ -385,6 +385,43 @@ def _finish_correction(db, correction_id: int, status: str, code: str,
     db.commit()
 
 
+def _record_agent_edit_learning(db, correction, previous_text: str, corrected_text: str,
+                               summary: str, evidence: list | None, source_url: str) -> None:
+    """Keep a confirmed agent edit as a deduplicated before/after editorial example."""
+    marker = f"[AGENT_CORRECTION_ID:{correction['correction_id']}]"
+    if db.execute("SELECT 1 FROM editorial_feedback WHERE post_id=? AND feedback_type='TELEGRAM_EDIT' AND instr(reason,?)>0 LIMIT 1",
+                  (correction["post_id"], marker)).fetchone():
+        return
+    owner_feedback = db.execute("SELECT reason,item_id,story_id,item_title FROM editorial_feedback WHERE feedback_id=?",
+                                (correction["feedback_id"],)).fetchone()
+    if not owner_feedback:
+        return
+    diff = "\n".join(difflib.unified_diff(
+        previous_text.splitlines(), corrected_text.splitlines(),
+        fromfile="до", tofile="после", lineterm="",
+    ))[:1400]
+    evidence_lines = []
+    for entry in evidence or []:
+        if isinstance(entry, dict) and str(entry.get("quote") or "").strip():
+            evidence_lines.append(f"Подтверждение: {str(entry['quote']).strip()[:350]}")
+    lesson = (
+        "Подтверждённая правка агента по сигналу владельца.\n"
+        f"Замечание владельца: {str(owner_feedback['reason'] or '')[:700]}\n"
+        f"Вывод проверки: {summary[:500]}\n"
+        f"Источник: {source_url}\n"
+        f"Изменение:\n{diff or 'Текст исправлен.'}\n"
+        + "\n".join(evidence_lines)
+        + f"\n{marker}"
+    )
+    db.execute(
+        "INSERT INTO editorial_feedback(created_at,item_id,story_id,post_id,feedback_type,reason,item_title,post_text) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (datetime.now(timezone.utc).isoformat(timespec="seconds"), owner_feedback["item_id"],
+         owner_feedback["story_id"], correction["post_id"], "TELEGRAM_EDIT",
+         lesson[:5000], owner_feedback["item_title"] or "", previous_text[:5000]),
+    )
+
+
 def _normalised_source_quote(value: str) -> str:
     return " ".join(str(value or "").casefold().split())
 
@@ -573,6 +610,18 @@ def recover_feedback_correction_jobs(db) -> None:
                            (local_id, intent["post_id"], intent["channel_id"], intent["telegram_message_id"], "",
                             intent["previous_text"], intent["new_text"], now, "AUTOMATED_CORRECTION_RECOVERED",
                             (re.search(r"(?m)^(?:Источник|Источники): \[[^\]]+\]\((https?://[^)]+)\)$", intent["previous_text"]) or [None, ""])[1]))
+            db.commit()
+            try:
+                evidence = json.loads(row["evidence_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                evidence = []
+            source_match = re.search(r"(?m)^(?:Источник|Источники): \[[^\]]+\]\((https?://[^)]+)\)$", intent["previous_text"])
+            try:
+                _record_agent_edit_learning(db, row, intent["previous_text"], intent["new_text"],
+                                            row["result_summary"] or "Правка подтверждена ответом Telegram.",
+                                            evidence, source_match.group(1) if source_match else "")
+            except Exception:
+                db.rollback()  # Learning failure must not change the recovered delivery result.
             db.execute("UPDATE telegram_feedback_corrections SET status='EDITED',result_code='CORRECTED',result_summary='Правка подтверждена ответом Telegram.',corrected_text=?,notice_status='PENDING',updated_at=? WHERE correction_id=?",
                        (intent["new_text"], now, row["correction_id"]))
         elif intent["status"] == "FAILED":
@@ -675,6 +724,11 @@ def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
             _finish_correction(db, row["correction_id"], "EDITED", "CORRECTED", summary,
                                previous_text=previous_text,
                                corrected_text=revised, evidence=evidence)
+            try:
+                _record_agent_edit_learning(db, row, previous_text, revised, summary, evidence, source_match.group(1))
+                db.commit()
+            except Exception:
+                db.rollback()  # The confirmed edit remains recorded even if its learning example cannot be saved.
             processed += 1
         except Exception as exc:
             db.rollback()
@@ -819,7 +873,7 @@ def _handle_interest_message(config: dict, db, message: dict) -> None:
     command = text.split(maxsplit=1)[0].lower().split("@", 1)[0] if text else ""
     if command in {"/start", "/myid"}:
         telegram_api(config, "sendMessage", {"chat_id": str(chat.get("id")),
-            "text": f"Бот запущен. Ваш Telegram ID: {user_id}.\n\nКоманда владельца для публикации без редакционных проверок:\n/publish Текст поста\n\nТакже можно поставить текст на следующей строке после /publish. Пересылки сохраняются в темник; ссылку на пост канала можно прислать с отзывом для проверяемого исправления."})
+            "text": f"Бот запущен. Ваш Telegram ID: {user_id}.\n\nКоманда владельца для публикации без редакционных проверок:\n/publish Текст поста\n\nОбщее замечание о темах, отборе или стиле:\n/feedback Ваш комментарий\n\nТакже можно поставить текст на следующей строке после /publish. Пересылки сохраняются в темник; ссылку на пост канала можно прислать с отзывом для проверяемого исправления."})
         return
     if user_id not in owners:
         return
@@ -828,6 +882,25 @@ def _handle_interest_message(config: dict, db, message: dict) -> None:
     if _handle_edit_ack_reply(config, db, {"update_id": message.get("_update_id")}, message, user_id):
         return
     if _handle_link_feedback(config, db, message):
+        return
+    if command == "/feedback":
+        match = re.match(r"^/feedback(?:@\w+)?(?:[ \t]+|\r?\n)?", text, re.IGNORECASE)
+        comment = text[match.end():].strip() if match else ""
+        if not 5 <= len(comment) <= 2000:
+            telegram_api(config, "sendMessage", {"chat_id": str(chat.get("id")),
+                "text": "Напишите /feedback и следом комментарий длиной от 5 до 2000 символов."})
+            return
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        db.execute(
+            "INSERT INTO editorial_feedback(created_at,feedback_type,reason,item_title,post_text) "
+            "VALUES(?,?,?,?,?)",
+            (now, "OTHER", "Общий комментарий владельца из редакторского бота:\n" + comment,
+             "Общее редакторское замечание", ""),
+        )
+        db.commit()
+        telegram_api(config, "sendMessage", {"chat_id": str(chat.get("id")),
+            "text": "Комментарий сохранён и будет учитываться в следующих подходящих разборах. "
+                    "Если речь о конкретном посте и нужна проверяемая правка, пришлите его ссылку и замечание."})
         return
     if command in {"/topics", "/темы"}:
         topics = db.execute("SELECT topic,weight FROM monitoring_topics ORDER BY weight DESC,topic").fetchall()

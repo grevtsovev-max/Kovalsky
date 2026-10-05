@@ -1169,6 +1169,9 @@ def is_relevant(text: str, configured_terms: list[str]) -> bool:
         if digital_topic:
             noun = next(stem for stem in ("валют", "актив", "рубл") if digital_topic.group(1).startswith(stem))
             pattern = rf"(?<![а-яёa-z0-9])цифров[а-яё]+\s+{noun}[а-яё]*(?![а-яёa-z0-9])"
+        elif term.startswith("цифровой депозитар"):
+            # Match Russian case forms such as "цифрового депозитария" too.
+            pattern = r"(?<![а-яёa-z0-9])цифров[а-яё]*\s+депозитар[а-яё]*(?![а-яёa-z0-9])"
         elif " " in term or len(term) < 5:
             pattern = rf"(?<![а-яёa-z0-9]){re.escape(term)}(?![а-яёa-z0-9])"
         else:
@@ -1463,7 +1466,7 @@ def require_primary_source_review(ai_result: dict | None, source_status: str, pr
 
 
 def _likely_local(item):
-    return bool(re.search(r"росси|\bрф\b|совфед|минфин|госдум|банк\s+россии|шейкин|аксаков|набиуллин|снг|беларус|казахстан", (item.get("title", "") + " " + item.get("description", "")), re.I))
+    return bool(re.search(r"росси|\bрф\b|совфед|минфин|госдум|банк\s+россии|шейкин|аксаков|набиуллин|сбер(?:банк)?|втб|газпромбанк|мособлбанк|москва|снг|беларус|казахстан", (item.get("title", "") + " " + item.get("description", "")), re.I))
 
 
 class _WebSearchQuota:
@@ -1496,8 +1499,8 @@ class _WebSearchQuota:
         self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_category',?) "
                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (category,))
         if source_url:
-            self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_source_url',?) "
-                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (source_url,))
+        self.db.execute("INSERT INTO app_state(key,value) VALUES('web_search_last_source_url',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (source_url,))
         self.db.commit()
         _log_timing("web_search_slot_reserved", category=category,
                     source_url=source_url, interval_minutes=self.interval_minutes)
@@ -1885,11 +1888,29 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
     if not publisher_report and (not primary_source or source_status != "READ") and ai_settings and _likely_local(item) and (selection is None or selection["decision"] == "KEEP"):
         recovered = _recover_primary(db, item, ai_settings)
         if recovered:
-            item.update({key: value for key, value in recovered.items() if key.startswith("primary_source_")})
-            source_status = item["primary_source_status"]
-            primary_source = _primary_source_from_item(item, source_status)
-            db.execute("UPDATE items SET primary_source_json=? WHERE item_id=?",
-                       (_stored_primary(item, primary_source, source_status), item_id))
+            recovered_status = recovered.get("primary_source_status") or "NOT_CHECKED"
+            if (recovered_status == "READ" and recovered.get("primary_source_url")
+                    and recovered.get("primary_source_content")):
+                item.update({key: value for key, value in recovered.items() if key.startswith("primary_source_")})
+                source_status = recovered_status
+                primary_source = _primary_source_from_item(item, source_status)
+                db.execute("UPDATE items SET primary_source_json=? WHERE item_id=?",
+                           (_stored_primary(item, primary_source, source_status), item_id))
+            elif (recovered.get("material_read") is True
+                  and len(str(recovered.get("content") or "").strip()) >= 100):
+                publisher_report = {
+                    "publisher": recovered.get("publisher_name") or "Издание",
+                    "url": recovered["url"], "title": recovered.get("title", ""),
+                    "content": recovered["content"], "type": "ATTRIBUTED_REPORT",
+                    "material_read": True,
+                    "source_role": source["source_role"] if "source_role" in source.keys() else "aggregator",
+                    "forwarded": False,
+                }
+            _trace_item(item, "Резервный поиск источника",
+                        "Первоисточник прочитан" if primary_source and source_status == "READ" else "Прочитан материал другого СМИ",
+                        "Найденный полный текст передан на обычную проверку с сохранением ссылки и атрибуции.",
+                        recovered_url=recovered.get("primary_source_url") or recovered.get("url"),
+                        recovered_publisher=recovered.get("primary_source_publisher") or recovered.get("publisher_name"))
 
     if publisher_report:
         # Retain the original's actual status in items; use only the read report
@@ -2258,8 +2279,6 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         description = ai_result.get("summary_ru", "")
         if status == "UPDATE_CANDIDATE" and has_previous_publication:
             description = ai_result.get("what_is_new") or description
-        citation_url = primary_source["url"] if primary_source else (publisher_report or {}).get("url", item["url"])
-        citation_name = (primary_source.get("publisher") or "Первоисточник") if primary_source else (publisher_report or {}).get("publisher", publisher_name)
         post = make_post(headline, description, citation_name, citation_url, max_length)
         primary_source_record = None
         if primary_source:

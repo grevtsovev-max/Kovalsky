@@ -182,23 +182,14 @@ def _link_digest_action(headline: str, url: str) -> str:
 
 
 def publish_digest(db_path: str, config: dict, kind: str = "daily") -> tuple[bool, int]:
-    """Publish a daily or Friday weekly digest of posts that actually went to the channel."""
+    """Publish the scheduled daily or Saturday weekly digest of published channel posts."""
     settings = config["newsroom"]
     now = datetime.now(timezone.utc)
     weekly = kind == "weekly"
     if kind not in {"daily", "weekly"}:
         raise ValueError("kind must be daily or weekly")
-    try:
-        local_zone = ZoneInfo(settings.get("digest_timezone", "Europe/Moscow"))
-    except (KeyError, ValueError):
-        local_zone = ZoneInfo("Europe/Moscow")
-    try:
-        time_setting = settings.get("weekly_digest_time", settings.get("digest_time", "19:30")) if weekly else settings.get("digest_time", "19:30")
-        hour, minute = (int(part) for part in time_setting.split(":"))
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError
-    except (TypeError, ValueError):
-        hour, minute = 19, 30
+    local_zone = ZoneInfo("Europe/Moscow")
+    hour, minute = (19, 0) if weekly else (20, 5)
     local_now = now.astimezone(local_zone)
     today_due = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     prefix = "weekly_digest" if weekly else "digest"
@@ -206,11 +197,11 @@ def publish_digest(db_path: str, config: dict, kind: str = "daily") -> tuple[boo
     last_sent_key = f"{prefix}_last_sent_at"
     next_key = f"{prefix}_next_at"
     if weekly:
-        days_to_friday = (4 - local_now.weekday()) % 7
-        next_local = today_due + timedelta(days=days_to_friday)
+        days_to_saturday = (5 - local_now.weekday()) % 7
+        next_local = today_due + timedelta(days=days_to_saturday)
         if next_local <= local_now:
             next_local += timedelta(days=7)
-        due_today = local_now.weekday() == 4 and local_now >= today_due
+        due_today = local_now.weekday() == 5 and local_now >= today_due
     else:
         next_local = today_due if local_now < today_due else today_due + timedelta(days=1)
         due_today = local_now >= today_due
@@ -235,8 +226,7 @@ def publish_digest(db_path: str, config: dict, kind: str = "daily") -> tuple[boo
         if last_sent:
             cutoff = last_sent["value"]
         else:
-            lookback_name = "weekly_digest_lookback_hours" if weekly else "digest_lookback_hours"
-            lookback = max(1, int(settings.get(lookback_name, 168 if weekly else 24)))
+            lookback = 168 if weekly else 24
             cutoff = (now - timedelta(hours=lookback)).isoformat(timespec="seconds")
         rows = db.execute(
             "SELECT p.post_id,p.text,p.external_id,p.published_at, "
@@ -908,20 +898,18 @@ def run_one_cycle(config: dict, db_path: str) -> dict[str, int]:
         counts["AUTO_PUBLISH_ERROR"] = failed
     if rejected:
         counts["AUTO_REJECTED"] = rejected
-    if config["newsroom"].get("digest_enabled", False):
-        try:
-            sent, news_count = publish_digest(db_path, config)
-            if sent:
-                counts["DIGEST_ITEMS"] = news_count
-        except Exception as exc:
-            print(f"Дайджест не отправлен ({type(exc).__name__}); следующая попытка будет в новом цикле.", file=sys.stderr, flush=True)
-    if config["newsroom"].get("weekly_digest_enabled", False):
-        try:
-            sent, news_count = publish_digest(db_path, config, kind="weekly")
-            if sent:
-                counts["WEEKLY_DIGEST_ITEMS"] = news_count
-        except Exception as exc:
-            print(f"Еженедельный дайджест не отправлен ({type(exc).__name__}); следующая попытка будет в новом цикле.", file=sys.stderr, flush=True)
+    try:
+        sent, news_count = publish_digest(db_path, config)
+        if sent:
+            counts["DIGEST_ITEMS"] = news_count
+    except Exception as exc:
+        print(f"Дайджест не отправлен ({type(exc).__name__}); следующая попытка будет в новом цикле.", file=sys.stderr, flush=True)
+    try:
+        sent, news_count = publish_digest(db_path, config, kind="weekly")
+        if sent:
+            counts["WEEKLY_DIGEST_ITEMS"] = news_count
+    except Exception as exc:
+        print(f"Еженедельный дайджест не отправлен ({type(exc).__name__}); следующая попытка будет в новом цикле.", file=sys.stderr, flush=True)
     if config["newsroom"].get("weekly_analysis_enabled", False):
         try:
             from .analysis import generate_weekly_analysis
@@ -933,6 +921,23 @@ def run_one_cycle(config: dict, db_path: str) -> dict[str, int]:
     _log_timing("cycle_timing", total_seconds=round(time.perf_counter() - cycle_started, 3), outcomes=counts)
     print(datetime.now(timezone.utc).isoformat(timespec="seconds"), counts or "Новых материалов нет", flush=True)
     return counts
+
+
+def _seconds_until_digest(config: dict, now: datetime | None = None) -> float | None:
+    """Return time to the next mandatory digest deadline in Moscow time."""
+    now = now or datetime.now(timezone.utc)
+    local_now = now.astimezone(ZoneInfo("Europe/Moscow"))
+    deadlines = []
+    daily_due = local_now.replace(hour=20, minute=5, second=0, microsecond=0)
+    if daily_due <= local_now:
+        daily_due += timedelta(days=1)
+    deadlines.append(daily_due)
+    days_to_saturday = (5 - local_now.weekday()) % 7
+    weekly_due = local_now.replace(hour=19, minute=0, second=0, microsecond=0) + timedelta(days=days_to_saturday)
+    if weekly_due <= local_now:
+        weekly_due += timedelta(days=7)
+    deadlines.append(weekly_due)
+    return max(0.0, (min(deadlines) - local_now).total_seconds()) if deadlines else None
 
 
 def main() -> None:
@@ -992,7 +997,11 @@ def main() -> None:
                 break
             # Keep the cadence start-to-start instead of waiting a full interval
             # after work finishes; an overlong cycle simply starts the next one.
-            time.sleep(max(0.0, interval - (time.monotonic() - cycle_started)))
+            sleep_for = max(0.0, interval - (time.monotonic() - cycle_started))
+            digest_wait = _seconds_until_digest(config)
+            if digest_wait is not None:
+                sleep_for = min(sleep_for, digest_wait)
+            time.sleep(sleep_for)
     else:
         db = connect(db_path)
         try:

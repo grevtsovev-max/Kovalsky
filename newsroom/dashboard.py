@@ -363,13 +363,8 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                     digest_next = digest_state["value"]
                 else:
                     from zoneinfo import ZoneInfo
-                    settings = config.get("newsroom", {})
-                    local = datetime.now(ZoneInfo(settings.get("digest_timezone", "Europe/Moscow")))
-                    try:
-                        hour, minute = (int(part) for part in settings.get("digest_time", "19:30").split(":"))
-                    except (TypeError, ValueError):
-                        hour, minute = 19, 30
-                    due = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    local = datetime.now(ZoneInfo("Europe/Moscow"))
+                    due = local.replace(hour=20, minute=5, second=0, microsecond=0)
                     if local >= due:
                         due += timedelta(days=1)
                     digest_next = due.astimezone(timezone.utc).isoformat(timespec="seconds")
@@ -378,14 +373,9 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                     weekly_digest_next = weekly_state["value"]
                 else:
                     from zoneinfo import ZoneInfo
-                    settings = config.get("newsroom", {})
-                    local = datetime.now(ZoneInfo(settings.get("digest_timezone", "Europe/Moscow")))
-                    try:
-                        hour, minute = (int(part) for part in settings.get("weekly_digest_time", settings.get("digest_time", "19:30")).split(":"))
-                    except (TypeError, ValueError):
-                        hour, minute = 19, 30
-                    days_to_friday = (4 - local.weekday()) % 7
-                    due = local.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=days_to_friday)
+                    local = datetime.now(ZoneInfo("Europe/Moscow"))
+                    days_to_saturday = (5 - local.weekday()) % 7
+                    due = local.replace(hour=19, minute=0, second=0, microsecond=0) + timedelta(days=days_to_saturday)
                     if due <= local:
                         due += timedelta(days=7)
                     weekly_digest_next = due.astimezone(timezone.utc).isoformat(timespec="seconds")

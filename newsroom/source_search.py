@@ -75,14 +75,23 @@ def recover(db,item,settings,news_search,web_search,terms,similarity):
         log(db,item['url'],attempt,strategy,query,'ERROR',[{'error_code':type(exc).__name__}],revision_hash)
         db.commit()
         return None
-    checked=[]; selected=None
+    checked=[]; selected_primary=None; selected_report=None
     for article in found:
-        checked.append({key:article.get(key) for key in ('url','title','content','primary_source_url','primary_source_content','primary_source_status','primary_source_type')})
-        if (selected is None and article.get('primary_source_status')=='READ'
-                and article.get('primary_source_url') and article.get('primary_source_content')
-                and len(terms(item['title']) & terms(article.get('title',''))) >=3
-                and similarity(item['title'],article.get('title',''))>=.2):
-            selected=article
+        checked.append({key:article.get(key) for key in ('url','title','content','publisher_name','published_at','material_read','primary_source_url','primary_source_content','primary_source_status','primary_source_type')})
+        title_matches = (len(terms(item['title']) & terms(article.get('title',''))) >= 3
+                         and similarity(item['title'],article.get('title','')) >= .2)
+        if title_matches:
+            readable_original = (article.get('primary_source_status') == 'READ'
+                                 and article.get('primary_source_url')
+                                 and article.get('primary_source_content'))
+            readable_report = (attempt in {1, 3} and article.get('material_read') is True
+                               and len(str(article.get('content') or '').strip()) >= 100
+                               and str(article.get('url') or '').startswith(('https://', 'http://')))
+            if readable_original and selected_primary is None:
+                selected_primary=article
+            elif readable_report and selected_report is None:
+                selected_report=article
+    selected = selected_primary or selected_report
     log(db,item['url'],attempt,strategy,query,'FOUND_CANDIDATE' if selected else 'NOT_FOUND',checked,revision_hash)
     db.commit()
     return selected
