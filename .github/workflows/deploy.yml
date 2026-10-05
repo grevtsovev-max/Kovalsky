@@ -1,0 +1,45 @@
+name: Deploy Kovalsky to VDS
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kovalsky-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.KOVALSKY_DEPLOY_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' '87.199.208.14 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB5Wg93XCKqxmI45XcOI32LXeL3OH8UvXxT/M1ZyavWl' > ~/.ssh/known_hosts
+
+      - name: Copy code to the server
+        run: |
+          rsync -rltz --delete \
+            --exclude='.git/' \
+            --exclude='__pycache__/' \
+            --exclude='*.py[cod]' \
+            -e "ssh -i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes" \
+            ./ kovalsky-deploy@87.199.208.14:/opt/kovalsky/incoming/
+
+      - name: Activate release and restart services
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes kovalsky-deploy@87.199.208.14 \
+            "sudo /usr/local/sbin/kovalsky-deploy '$COMMIT_SHA'"
