@@ -13,6 +13,64 @@ from .db import connect, connect_readonly
 from .quality import publication_source_ready
 
 
+def _queue_post_correction(db, config: dict, post_id: int, reason: str) -> tuple[dict, int]:
+    """Queue a source-checked edit of an existing published post through the backend."""
+    reason = str(reason or "").strip()
+    if len(reason) < 5 or len(reason) > 2000:
+        return {"error": "Комментарий должен содержать от 5 до 2000 символов"}, 400
+    post = db.execute(
+        "SELECT p.post_id,p.story_id,p.origin_item_id,p.text,p.status,p.external_id,s.headline "
+        "FROM posts p JOIN stories s USING(story_id) WHERE p.post_id=?",
+        (post_id,),
+    ).fetchone()
+    if not post:
+        return {"error": "Пост не найден"}, 404
+    if post["status"] != "PUBLISHED" or not post["external_id"]:
+        return {"error": "Исправлять можно только подтверждённую публикацию"}, 409
+    owners = config.get("telegram", {}).get("interest_owner_user_ids") or []
+    if not owners:
+        return {"error": "Не настроен получатель результата редакторской проверки"}, 503
+    owner_chat_id = str(owners[0])
+    active = db.execute(
+        "SELECT correction_id,status FROM telegram_feedback_corrections "
+        "WHERE post_id=? AND status IN ('QUEUED','PROCESSING') ORDER BY correction_id DESC LIMIT 1",
+        (post_id,),
+    ).fetchone()
+    if active:
+        return {"ok": True, "queued": True, "reused": True,
+                "correction_id": active["correction_id"], "status": active["status"]}, 200
+    unresolved = db.execute(
+        "SELECT status FROM telegram_message_edit_intents WHERE post_id=? "
+        "AND status IN ('SENDING','UNKNOWN') LIMIT 1",
+        (post_id,),
+    ).fetchone()
+    if unresolved:
+        return {"error": "Предыдущая правка не подтверждена; новую не ставил"}, 409
+    latest_edit = db.execute(
+        "SELECT edited_text FROM telegram_post_edits WHERE post_id=? "
+        "ORDER BY captured_at DESC,ABS(update_id) DESC LIMIT 1",
+        (post_id,),
+    ).fetchone()
+    post_text = latest_edit["edited_text"] if latest_edit else post["text"]
+    item = db.execute("SELECT title FROM items WHERE item_id=?",
+                      (post["origin_item_id"],)).fetchone() if post["origin_item_id"] else None
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    feedback = db.execute(
+        "INSERT INTO editorial_feedback(created_at,item_id,story_id,post_id,feedback_type,reason,item_title,post_text) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (now, post["origin_item_id"], post["story_id"], post_id, "TELEGRAM_EDIT",
+         reason, (item["title"] if item else post["headline"] or "")[:1000], post_text[:5000]),
+    )
+    correction = db.execute(
+        "INSERT INTO telegram_feedback_corrections(feedback_id,post_id,owner_chat_id,created_at,updated_at) "
+        "VALUES(?,?,?,?,?)",
+        (feedback.lastrowid, post_id, owner_chat_id, now, now),
+    )
+    db.commit()
+    return {"ok": True, "queued": True, "reused": False,
+            "correction_id": correction.lastrowid, "status": "QUEUED"}, 202
+
+
 PAGE = r'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kovalsky · Newsroom</title><style>
@@ -47,8 +105,8 @@ async function submitManualIntake(event){event.preventDefault();const form=event
 function showCollectionStatus(message,tone=''){const box=document.getElementById('collection-status');box.textContent=message;box.className='queue-reason'+(tone==='ready'?' ready':'');box.style.display='block'}
 async function refreshCollectionStatus(){try{const s=await api('/api/collection'),button=document.getElementById('force-collect-button');if(s.state==='running'){collectionWasRunning=true;button.disabled=true;button.textContent='Сбор идёт…';showCollectionStatus(`Сбор запущен ${date(s.started_at)}. Панель обновится после завершения.`);if(collectionPoll)clearTimeout(collectionPoll);collectionPoll=setTimeout(refreshCollectionStatus,2500);return}button.disabled=false;button.textContent='↻ Собрать сейчас';if(s.state==='error')showCollectionStatus(`Сбор завершился с ошибкой (${s.error||'ошибка цикла'}).`);else if(s.finished_at){const outcomes=Object.entries(s.outcomes||{}).map(([k,v])=>`${k}: ${v}`).join(' · ');showCollectionStatus(`Последний цикл завершён ${date(s.finished_at)}${outcomes?' · '+outcomes:' · новых материалов нет'}`,'ready')}else document.getElementById('collection-status').style.display='none';if(collectionWasRunning){collectionWasRunning=false;await reloadAll()}}catch(e){showCollectionStatus('Не удалось получить состояние сбора.');}}
 async function forceCollect(){if(!confirm('Запустить полный цикл сбора сейчас? Если появятся материалы, подходящие под правила автопубликации, они могут быть отправлены в Telegram.'))return;const button=document.getElementById('force-collect-button');button.disabled=true;button.textContent='Запускаю…';try{await api('/api/collect',{method:'POST',body:'{}'});collectionWasRunning=true;showNotice('Полный цикл сбора запущен');await refreshCollectionStatus()}catch(e){button.disabled=false;button.textContent='↻ Собрать сейчас';showNotice(e.message);await refreshCollectionStatus()}}
-function feedbackBox(itemId,postId=''){return `<details class="editorial-feedback"><summary>💬 Оставить обратную связь агенту</summary><form onsubmit="submitEditorialFeedback(event,this)" data-item-id="${itemId}" data-post-id="${postId}"><label>Тип обратной связи<select name="feedback_type" required><option value="">Выберите тип обратной связи</option><option value="POSITIVE">Понравилось — стоит повторять</option><option value="CORRECTION">Нужно исправить или уточнить</option><option value="NOT_RELEVANT">Не относится к нашей теме</option><option value="NOT_IMPORTANT">Недостаточно важно</option><option value="DUPLICATE">Повтор уже известного сюжета</option><option value="INACCURATE">Фактическая ошибка или слабый источник</option><option value="POOR_STYLE">Не подходит подача или стиль</option><option value="OTHER">Общий комментарий</option></select></label><label>Комментарий, поправка или пожелание<textarea name="reason" required minlength="5" maxlength="2000" rows="2" placeholder="Например: удачно объяснено влияние на рынок; здесь стоит уточнить, что решение пока не вступило в силу"></textarea></label><button class="btn" type="submit">Сохранить обратную связь</button></form></details>`}
-async function submitEditorialFeedback(event,form){event.preventDefault();let button=form.querySelector('button[type=submit]'),data=Object.fromEntries(new FormData(form).entries());data.item_id=Number(form.dataset.itemId)||null;data.post_id=Number(form.dataset.postId)||null;button.disabled=true;try{await api('/api/editorial-feedback',{method:'POST',body:JSON.stringify(data)});showNotice('Отзыв сохранён и будет учтён в следующих разборах');form.reset();form.closest('details').open=false}catch(e){showNotice('Не удалось сохранить отзыв: '+e.message)}finally{button.disabled=false}}
+function feedbackBox(itemId,postId=''){let correctionOption=postId?'<option value="TELEGRAM_EDIT">Проверить и исправить опубликованный пост</option>':'';return `<details class="editorial-feedback"><summary>💬 Оставить обратную связь агенту</summary><form onsubmit="submitEditorialFeedback(event,this)" data-item-id="${itemId}" data-post-id="${postId}"><label>Тип обратной связи<select name="feedback_type" required><option value="">Выберите тип обратной связи</option>${correctionOption}<option value="POSITIVE">Понравилось — стоит повторять</option><option value="CORRECTION">Нужно исправить или уточнить</option><option value="NOT_RELEVANT">Не относится к нашей теме</option><option value="NOT_IMPORTANT">Недостаточно важно</option><option value="DUPLICATE">Повтор уже известного сюжета</option><option value="INACCURATE">Фактическая ошибка или слабый источник</option><option value="POOR_STYLE">Не подходит подача или стиль</option><option value="OTHER">Общий комментарий</option></select></label><label>Комментарий, поправка или пожелание<textarea name="reason" required minlength="5" maxlength="2000" rows="2" placeholder="Например: удачно объяснено влияние на рынок; здесь стоит уточнить, что решение пока не вступило в силу"></textarea></label><button class="btn" type="submit">Сохранить обратную связь</button></form></details>`}
+async function submitEditorialFeedback(event,form){event.preventDefault();let button=form.querySelector('button[type=submit]'),data=Object.fromEntries(new FormData(form).entries());data.item_id=Number(form.dataset.itemId)||null;data.post_id=Number(form.dataset.postId)||null;button.disabled=true;try{let result=await api(data.feedback_type==='TELEGRAM_EDIT'?'/api/post-corrections':'/api/editorial-feedback',{method:'POST',body:JSON.stringify(data)});showNotice(result.queued?'Правка поставлена в очередь проверки':'Отзыв сохранён и будет учтён в следующих разборах');form.reset();form.closest('details').open=false}catch(e){showNotice('Не удалось сохранить отзыв: '+e.message)}finally{button.disabled=false}}
 function newsCard(n){let d=n.description||n.summary||'',status=n.disposition||n.status,relevance=n.is_relevant===true?pill('По теме','green'):n.is_relevant===false?pill('Не по теме','red'):pill('Тема не оценена');let tone=status==='NEW_STORY'?'green':status==='NOISE'?'red':status==='WAITING_CONFIRMATION'?'amber':'',publishedAt=Date.parse(n.published_at||''),futureDate=Number.isFinite(publishedAt)&&publishedAt>Date.now()+300000;return `<article class="row-card"><div><a class="row-title" href="${esc(safeUrl(n.url))}" target="_blank" rel="noopener">${esc(n.title||n.headline)}</a></div><div class="meta"><span>${esc(n.source_name||'Источник не указан')}</span><span>${futureDate?`Дата источника в будущем: ${date(n.published_at)}`:n.published_at?`Выход: ${date(n.published_at)}`:`Выход неизвестен`}</span><span>Обнаружена: ${date(n.discovered_at)}</span>${pill(dispositionLabel(status),tone)}${n.revision_count?pill(`Есть версия (${n.revision_count})`,'amber'):''}${relevance}</div>${n.processing_reason?`<div class="queue-reason">${esc(n.processing_reason)}${n.retry_at?` · Повтор разрешён с ${date(n.retry_at)}; запуск ожидает места в очереди и зависит от бюджета цикла`:''}${n.retry_queue_position?` · Очередь: ${n.retry_queue_position} из ${n.retry_queue_total}, до ${n.retry_queue_batch} за цикл; ориентир ${n.retry_queue_cycles} циклов`:''}</div>`:''}${d?`<div class="excerpt">${esc(d.slice(0,380))}${d.length>380?'…':''}</div>`:''}${n.selection_reason?`<div class="queue-reason">${esc(n.selection_reason)}</div>`:''}<div class="actions"><button class="btn" data-detail="${n.item_id}">Подробнее</button></div>${feedbackBox(n.item_id)}</article>`}
 function inlineText(s){let out='',i=0,re=/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g,m;while((m=re.exec(s))){out+=esc(s.slice(i,m.index));out+=m[1]?`<a href="${esc(safeUrl(m[2]))}" target="_blank" rel="noopener noreferrer">${esc(m[1])}</a>`:`<strong>${esc(m[3])}</strong>`;i=re.lastIndex}return out+esc(s.slice(i))}
 function postText(raw){let groups=String(raw||'').trim().split(/\n\s*\n/).filter(Boolean),html='';for(let i=0;i<groups.length;i++){let g=groups[i].trim(),next=groups[i+1]||'';if(/^\*\*.+?:\*\*$/.test(g)&&next.split(/\n/).every(x=>/^➠\s*/.test(x.trim()))){let label=g.replace(/^\*\*|\*\*$/g,'').replace(/:$/,'');html+=`<details class="post-details"><summary>${inlineText(label)}</summary><div class="post-details-body">${next.split(/\n/).map(x=>`<p>${inlineText(x.trim().replace(/^➠\s*/,''))}</p>`).join('')}</div></details>`;i++;continue}html+=`<p>${g.split(/\n/).map(inlineText).join('<br>')}</p>`}return `<div class="excerpt post-copy">${html}</div>`}
@@ -534,6 +592,19 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                         self._json({"ok":True,"topics":topics,"is_interesting":rating})
                     except ValueError as exc: self._json({"error":str(exc)},404)
                     except Exception as exc: self._json({"error":f"Не удалось сохранить оценку ({type(exc).__name__})"},503)
+                    finally: db.close()
+                    return
+                if parts==["api","post-corrections"]:
+                    payload=json.loads(self.rfile.read(size).decode("utf-8"))
+                    try: post_id=int(payload.get("post_id"))
+                    except (ValueError,TypeError): self._json({"error":"Некорректный пост"},400); return
+                    db=self._db()
+                    try:
+                        result,status=_queue_post_correction(db,config,post_id,str(payload.get("reason") or ""))
+                        self._json(result,status)
+                    except Exception as exc:
+                        db.rollback()
+                        self._json({"error":f"Не удалось поставить правку в очередь ({type(exc).__name__})"},503)
                     finally: db.close()
                     return
                 if parts==["api","editorial-feedback"]:
