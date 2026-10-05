@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 from .ai import AIResponseError, request_response
 
-VERSION = 1
+VERSION = 2
 MAX_AUTOMATIC_RETRIES = 3
 SCHEMA = {
     'type': 'object', 'additionalProperties': False,
@@ -28,7 +28,7 @@ INSTRUCTIONS = '''Ты выполняешь предварительный ре�
 KEEP: есть конкретный потенциально значимый факт о регулировании, инфраструктуре, доступе, продуктах или работе бизнеса; кратко объясни пользу и новизну. Предложения и обсуждения могут быть интересны: не требуй принятого закона или запуска.
 NOISE: из доступного текста ясно, что материал не интересен этой аудитории. Общая криминальная статистика, бытовые схемы мошенничества, котировки иностранных техакций и общетехнологические дайджесты сами по себе не подходят. Но конкретные изменения правил, инфраструктуры или системные последствия в таких темах могут подходить. Одного упоминания России, СНГ или криптовалюты недостаточно.
 UNKNOWN: текст слишком короткий, неоднозначный или нет уверенности. Отсутствие первоисточника НЕ причина NOISE. Не выдумывай влияние на рынок.
-DUPLICATE: центральный факт уже отражён в одном из published_stories, нет существенного нового факта. Сопоставь участников, действие, предмет и стадию. Совпадение темы НЕ дубль. Новое решение, параметры, сроки или изменение стадии могут быть продолжением: KEEP, what_is_new объясняет отличие. При сомнении UNKNOWN. story_id только из переданного списка. Для DUPLICATE what_is_new пустое.
+DUPLICATE: центральный факт уже отражён в одном из published_stories, нет существенного нового факта. Сопоставь участников, действие, предмет, статус, дату и практические условия. Новый источник, подтверждение другого издания или более подробный пересказ уже опубликованного факта сами по себе не являются новым поводом. Например, повторное сообщение, что уже описанные правила вступили в силу в ту же дату и допускают подачу заявок, — DUPLICATE, если не добавлены существенные условия, ограничения или последствия. Совпадение темы НЕ дубль. Новое решение, параметры, сроки или изменение стадии могут быть продолжением: KEEP, what_is_new объясняет отличие. При сомнении UNKNOWN. story_id только из переданного списка. Для DUPLICATE what_is_new пустое.
 editor_feedback — реальные решения редактора о конкретных материалах; учитывай их как примеры вкуса, а не запрет целой темы, страны или источника. Аналогичный новый конкретный факт оцени заново. NOISE/DUPLICATE разрешены только при высокой уверенности. evidence — дословный фрагмент доступного входного материала, на котором основан отбор. Не заявляй проверку оригинала.'''
 
 
@@ -84,11 +84,11 @@ def _grounded_quote(quote, text):
     return any(text_words[i:i+width] == quote_words for i in range(len(text_words)-width+1))
 
 
-def published_candidates(db, item):
+def published_candidates(db, item, limit=16):
     rows = db.execute("SELECT p.story_id,p.text,p.published_at FROM posts p WHERE p.status='PUBLISHED' ORDER BY p.published_at DESC LIMIT 300").fetchall()
     words = _words(item.get('title', '') + ' ' + item.get('description', '') + ' ' + item.get('content', '')[:1500])
     ranked = sorted(rows, key=lambda row: len(words & _words(row['text'])), reverse=True)
-    return [{'story_id': str(row['story_id']), 'text': row['text'][:3500], 'published_at': row['published_at']} for row in ranked[:12]]
+    return [{'story_id': str(row['story_id']), 'text': row['text'][:2400], 'published_at': row['published_at']} for row in ranked[:limit]]
 
 
 def _unknown(reason):
