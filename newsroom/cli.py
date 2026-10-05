@@ -30,7 +30,7 @@ from .core import NOW, _log_timing, _registrable_domain, is_non_news_telegram_fo
 from .core import NOW, _log_timing, _registrable_domain, configure_runtime_log, is_non_news_telegram_format, is_relevant, run_cycle, terms
 from .db import connect
 from .delivery import (DeliveryRejected, DeliveryUncertain, TelegramReceipt,
-                       deliver, confirm, reconcile_posts, channel)
+                       deliver, confirm, reconcile_posts, channel, replace_unsent_digest_batch)
 
 
 def load_config(path: str) -> dict:
@@ -161,28 +161,25 @@ def telegram_send(config: dict, text: str) -> str:
 
 def _link_digest_action(headline: str, url: str) -> str:
     """Link only a short action verb in a digest headline."""
-    verbs = (
-        "определил|определила|определили|утвердил|утвердила|утвердили|ввел|ввела|ввели|ввёл|ввела|ввели|"
-        "установил|установила|установили|разрешил|разрешила|разрешили|запретил|запретила|запретили|"
-        "принял|приняла|приняли|подписал|подписала|подписали|одобрил|одобрила|одобрили|отклонил|отклонила|отклонили|"
-        "выдал|выдала|выдали|назначил|назначила|назначили|выпустил|выпустила|выпустили|объявил|объявила|объявили|"
-        "запустил|запустила|запустили|создал|создала|создали|открыл|открыла|открыли|закрыл|закрыла|закрыли|"
-        "предоставил|предоставила|предоставили|подтвердил|подтвердила|подтвердили|назвал|назвала|назвали|"
-        "готовит|готовят|опубликовал|опубликовала|опубликовали|подготовил|подготовила|подготовили|разрабатывает|разрабатывают|обсуждает|обсуждают|предложил|предложила|предложили|предлагает|предлагают|допускает|допускают|"
-        "повысил|повысила|повысили|снизил|снизила|снизили|привлек|привлекла|привлекли|инвестировал|инвестировали|"
-        "купил|купила|купили|подал|подала|подали|зарегистрировал|зарегистрировала|зарегистрировали|продал|продала|продали|перевел|перевела|перевели|перевёл|перевела|перевели|"
-        "вывел|вывела|вывели|вывели|зафиксировал|зафиксировала|зафиксировали|приостановил|приостановила|приостановили|"
-        "восстановил|восстановила|восстановили|сообщил|сообщила|сообщили|обратился|обратилась|обратились"
-    )
-    match = re.search(r"(?i)\b(" + verbs + r")\b", headline)
-    if match:
-        verb = match.group(1)
-        return headline[:match.start()] + f"[{verb}]({url})" + headline[match.end():]
+    from .digest_language import digest_action_span
+    span = digest_action_span(headline)
+    if span:
+        start, end = span
+        return headline[:start] + f"[{headline[start:end]}]({url})" + headline[end:]
     raise ValueError(f"Для заголовка дайджеста не найден глагол события: {headline}")
 
 
-def publish_digest(db_path: str, config: dict, kind: str = "daily") -> tuple[bool, int]:
+def publish_digest(db_path: str, config: dict, kind: str = "daily", *, rebuild_unsent=False) -> tuple[bool, int]:
     """Publish the scheduled daily or Saturday weekly digest of published channel posts."""
+    db = connect(db_path)
+    try:
+        return _publish_digest(db, config, kind, rebuild_unsent=rebuild_unsent)
+    finally:
+        db.close()
+
+
+def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visibility_attempt=0) -> tuple[bool, int]:
+    from .channel_presence import inspect_channel_posts, inspect_digest_messages, ChannelPresenceUnavailable
     settings = config["newsroom"]
     now = datetime.now(timezone.utc)
     weekly = kind == "weekly"
@@ -206,28 +203,22 @@ def publish_digest(db_path: str, config: dict, kind: str = "daily") -> tuple[boo
         next_local = today_due if local_now < today_due else today_due + timedelta(days=1)
         due_today = local_now >= today_due
     next_at = next_local.astimezone(timezone.utc).isoformat(timespec="seconds")
-    db = connect(db_path)
     last_date_row = db.execute("SELECT value FROM app_state WHERE key=?", (last_date_key,)).fetchone()
     last_date = last_date_row["value"] if last_date_row else ""
     if not due_today or last_date == local_now.date().isoformat():
         db.execute("INSERT OR REPLACE INTO app_state(key,value) VALUES(?,?)", (next_key, next_at))
         db.commit()
-        db.close()
         return False, 0
 
     batch_key = channel(config) + ':' + prefix + ':' + local_now.date().isoformat()
     batch = db.execute('SELECT * FROM digest_batches WHERE batch_key=?', (batch_key,)).fetchone()
-    if batch:
+    if batch and not rebuild_unsent:
         messages = json.loads(batch['messages_json'])
         news_count = batch['news_count']
         period_end = batch['period_end']
     else:
-        last_sent = db.execute("SELECT value FROM app_state WHERE key=?", (last_sent_key,)).fetchone()
-        if last_sent:
-            cutoff = last_sent["value"]
-        else:
-            lookback = 168 if weekly else 24
-            cutoff = (now - timedelta(hours=lookback)).isoformat(timespec="seconds")
+        lookback = 168 if weekly else 24
+        cutoff = (now - timedelta(hours=lookback)).isoformat(timespec="seconds")
         rows = db.execute(
             "SELECT p.post_id,p.text,p.external_id,p.published_at, "
             "COALESCE(json_extract(p.fact_check_result,'$.importance'), "
@@ -284,6 +275,18 @@ def publish_digest(db_path: str, config: dict, kind: str = "daily") -> tuple[boo
                 emoji = "📌"
             selected.append((emoji, headline, row["importance"] or "MEDIUM", post_url))
 
+        if any(not entry[3] for entry in selected):
+            raise ChannelPresenceUnavailable('DIGEST_POST_LINK_MISSING')
+        observed = inspect_channel_posts(config, [entry[3].rsplit('/', 1)[1] for entry in selected], db=db)
+        visible = []
+        for emoji, headline, importance, post_url in selected:
+            observation = observed[post_url.rsplit('/', 1)[1]]
+            if observation['status'] == 'DELETED':
+                continue
+            headline = re.sub(r"\*\*(.*?)\*\*", r"\1", observation['text'].splitlines()[0].strip())
+            visible.append((emoji, _limit_headline(headline), importance, observation['url']))
+        selected = visible
+
         messages = []
         current = title
         if not selected:
@@ -311,22 +314,33 @@ def publish_digest(db_path: str, config: dict, kind: str = "daily") -> tuple[boo
                 raise RuntimeError("Дайджест не прошёл редакционную проверку: " + ", ".join(issues))
         news_count = len(selected)
         period_end = now.isoformat(timespec="seconds")
-        db.execute('INSERT OR IGNORE INTO digest_batches(batch_key,messages_json,news_count,period_end,created_at) VALUES(?,?,?,?,?)',
-                   (batch_key, json.dumps(messages, ensure_ascii=False), news_count, period_end, period_end))
-        db.commit()
+        if batch:
+            replace_unsent_digest_batch(db, batch_key, messages, news_count, period_end)
+        else:
+            db.execute('INSERT OR IGNORE INTO digest_batches(batch_key,messages_json,news_count,period_end,created_at) VALUES(?,?,?,?,?)',
+                       (batch_key, json.dumps(messages, ensure_ascii=False), news_count, period_end, period_end))
+            db.commit()
         batch = db.execute('SELECT * FROM digest_batches WHERE batch_key=?', (batch_key,)).fetchone()
         messages, news_count, period_end = json.loads(batch['messages_json']), batch['news_count'], batch['period_end']
+    if not inspect_digest_messages(config, messages, db=db):
+        if _visibility_attempt >= 2:
+            raise ChannelPresenceUnavailable('DIGEST_CHANNEL_CHANGED_DURING_PREPARATION')
+        # Only a known unsent batch can be amended. A successful/unknown part
+        # causes replace_unsent_digest_batch to block this rebuild.
+        return _publish_digest(db, config, kind, rebuild_unsent=True,
+                               _visibility_attempt=_visibility_attempt + 1)
     try:
         for part, message in enumerate(messages):
             issues = digest_issues(message)
             if issues:
                 raise RuntimeError("Дайджест не прошёл редакционную проверку: " + ", ".join(issues))
+            if part and not inspect_digest_messages(config, [message], db=db):
+                raise ChannelPresenceUnavailable('DIGEST_CHANNEL_CHANGED_BETWEEN_PARTS')
             operation = f"{prefix}:{local_now.date().isoformat()}:{part}"
             deliver(db, config, operation, message, telegram_send)
             confirm(db, config, operation)
             db.commit()
     except Exception:
-        db.close()
         raise
     next_date = local_now.date() + timedelta(days=7 if weekly else 1)
     next_due = datetime.combine(next_date, today_due.timetz().replace(tzinfo=None), tzinfo=local_zone)
@@ -334,7 +348,6 @@ def publish_digest(db_path: str, config: dict, kind: str = "daily") -> tuple[boo
     db.execute("INSERT OR REPLACE INTO app_state(key,value) VALUES(?,?)", (last_sent_key, period_end))
     db.execute("INSERT OR REPLACE INTO app_state(key,value) VALUES(?,?)", (next_key, next_due.astimezone(timezone.utc).isoformat(timespec="seconds")))
     db.commit()
-    db.close()
     print("Опубликован " + ("еженедельный" if weekly else "ежедневный") + f" дайджест опубликованных новостей: {news_count}")
     return True, news_count
 
@@ -1079,6 +1092,58 @@ def _seconds_until_digest(config: dict, now: datetime | None = None) -> float | 
     return max(0.0, (min(deadlines) - local_now).total_seconds()) if deadlines else None
 
 
+def _publish_due_digests(config: dict, db_path: str, *, db=None) -> None:
+    for kind, label in (("daily", "Дайджест"), ("weekly", "Еженедельный дайджест")):
+        try:
+            if db is None:
+                sent, news_count = publish_digest(db_path, config, kind=kind)
+            else:
+                sent, news_count = _publish_digest(db, config, kind)
+            if sent:
+                print(f"{label}: отправлен, публикаций {news_count}.", flush=True)
+            _log_timing("digest_schedule_check", kind=kind, sent=sent, news_count=news_count)
+        except Exception as exc:
+            if db is not None:
+                db.rollback()
+            # The next scheduler tick retries known failures. Delivery's durable
+            # attempt record blocks a blind resend when Telegram's answer is unknown.
+            print(f"{label} не отправлен ({type(exc).__name__}); повторная проверка через 30 секунд.",
+                  file=sys.stderr, flush=True)
+            _log_timing("digest_schedule_error", kind=kind, error_type=type(exc).__name__)
+
+
+def _digest_schedule_loop(config_path: str) -> None:
+    """Dispatch daily and weekly digests independently of the news collection cycle."""
+    db = None
+    database = None
+    try:
+        while True:
+            wait = 30.0
+            try:
+                config = load_config(config_path)
+                db_path = config["newsroom"]["database"]
+                if db is None or db_path != database:
+                    if db is not None:
+                        db.close()
+                        db = None
+                    db = connect(db_path)
+                    database = db_path
+                db.execute("INSERT OR REPLACE INTO app_state(key,value) VALUES(?,?)",
+                           ("digest_scheduler_last_tick_at", NOW()))
+                db.commit()
+                _publish_due_digests(config, db_path, db=db)
+                wait = _seconds_until_digest(config)
+            except Exception as exc:
+                if db is not None:
+                    db.rollback()
+                print(f"Планировщик дайджеста: {type(exc).__name__}; повтор через 30 секунд.",
+                      file=sys.stderr, flush=True)
+            time.sleep(min(30.0, max(1.0, wait or 30.0)))
+    finally:
+        if db is not None:
+            db.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="newsroom", description="Локальный агент мониторинга новостей")
     parser.add_argument("--config", default="config.toml")
@@ -1086,6 +1151,14 @@ def main() -> None:
     sub.add_parser("init", help="Создать/обновить локальную базу")
     sub.add_parser("once", help="Проверить все активные RSS-источники один раз")
     sub.add_parser("run", help="Постоянный цикл мониторинга")
+    sub.add_parser("digest-run", help="Независимый планировщик ежедневного и недельного дайджестов")
+    digest = sub.add_parser("digest", help="Проверить срок и отправить ежедневный или недельный дайджест")
+    digest.add_argument("--kind", choices=["daily", "weekly"], default="daily")
+    digest.add_argument("--rebuild-unsent", action="store_true",
+                        help="Пересобрать только выпуск с заведомо неуспешной доставкой, сохранив историю")
+    repair = sub.add_parser("digest-repair", help="Проверить канал и исправить прежний дайджест тем же message_id")
+    repair.add_argument("--kind", choices=["daily", "weekly"], default="daily")
+    repair.add_argument("--date", help="Дата выпуска в формате ГГГГ-ММ-ДД; по умолчанию сегодня по Москве")
     sub.add_parser("pending", help="Показать посты в автоматической обработке")
     sub.add_parser("health", help="Сводка по источникам, AI, очереди и публикациям")
     sub.add_parser("review-bot", help="Бот сбора редакционных примеров и интересов")
@@ -1117,6 +1190,15 @@ def main() -> None:
         from .admin_publish import publish_from_codex
         result = publish_from_codex(config, args.request_key, sys.stdin.read())
         print(json.dumps(result, ensure_ascii=False))
+    elif args.command == "digest":
+        sent, news_count = publish_digest(db_path, config, kind=args.kind, rebuild_unsent=args.rebuild_unsent)
+        print(("Дайджест отправлен" if sent else "Срок отправки ещё не наступил или выпуск уже отправлен сегодня")
+              + f"; публикаций: {news_count}.")
+    elif args.command == "digest-run":
+        _digest_schedule_loop(args.config)
+    elif args.command == "digest-repair":
+        from .digest_corrections import repair_digest
+        print(json.dumps(repair_digest(db_path, config, args.kind, args.date), ensure_ascii=False))
     elif args.command in {"once", "run"}:
         from .locking import acquire_cycle_lock
         interval = min(180, max(30, int(config["newsroom"].get("poll_interval_seconds", 180))))

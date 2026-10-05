@@ -36,6 +36,28 @@ CREATE TABLE IF NOT EXISTS digest_batches (
  batch_key TEXT PRIMARY KEY, messages_json TEXT NOT NULL, news_count INTEGER NOT NULL,
  period_end TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS digest_batch_revisions (
+ revision_id INTEGER PRIMARY KEY, batch_key TEXT NOT NULL,
+ previous_messages_json TEXT NOT NULL, previous_news_count INTEGER NOT NULL,
+ previous_period_end TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS channel_post_observations (
+ observation_id INTEGER PRIMARY KEY, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('PRESENT','DELETED','UNKNOWN')),
+ source_url TEXT NOT NULL, text TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+ observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS channel_post_observations_latest
+ ON channel_post_observations(channel_id,message_id,observation_id DESC);
+CREATE TRIGGER IF NOT EXISTS channel_post_observations_no_update BEFORE UPDATE ON channel_post_observations
+BEGIN SELECT RAISE(ABORT,'channel observation history is append only'); END;
+CREATE TRIGGER IF NOT EXISTS channel_post_observations_no_delete BEFORE DELETE ON channel_post_observations
+BEGIN SELECT RAISE(ABORT,'channel observation history is append only'); END;
+CREATE TABLE IF NOT EXISTS digest_edits (
+ edit_id INTEGER PRIMARY KEY, batch_key TEXT NOT NULL, part INTEGER NOT NULL,
+ operation TEXT NOT NULL UNIQUE, original_text TEXT NOT NULL, edited_text TEXT NOT NULL,
+ telegram_message_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 """
 
 
@@ -64,6 +86,37 @@ def channel(config):
     if not target:
         raise DeliveryRejected('Telegram destination is missing')
     return str(target)
+
+
+def replace_unsent_digest_batch(db, batch_key, messages, news_count, period_end):
+    """Amend a known unsent draft while preserving its identity and full history."""
+    db.commit()
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        batch = db.execute('SELECT * FROM digest_batches WHERE batch_key=?', (batch_key,)).fetchone()
+        if not batch:
+            raise DeliveryRejected('Digest batch to rebuild is missing')
+        attempts = db.execute('SELECT * FROM publication_attempts WHERE substr(delivery_key,1,?)=?',
+                              (len(batch_key) + 1, batch_key + ':')).fetchall()
+        if any(row['status'] not in {'PREPARED', 'FAILED'} for row in attempts):
+            raise DeliveryUncertain('Digest may already have reached Telegram; rebuild blocked')
+        revision = db.execute('INSERT INTO digest_batch_revisions('
+            'batch_key,previous_messages_json,previous_news_count,previous_period_end,created_at) '
+            'VALUES(?,?,?,?,?)', (batch_key, batch['messages_json'], batch['news_count'],
+                                  batch['period_end'], now())).lastrowid
+        db.execute('UPDATE digest_batches SET messages_json=?,news_count=?,period_end=? WHERE batch_key=?',
+                   (json.dumps(messages, ensure_ascii=False), news_count, period_end, batch_key))
+        for row in attempts:
+            part = int(row['delivery_key'].rsplit(':', 1)[1])
+            if part < len(messages):
+                message = messages[part]
+                db.execute('UPDATE publication_attempts SET text=?,content_hash=?,updated_at=? WHERE attempt_id=?',
+                           (message, hashlib.sha256(message.encode()).hexdigest(), now(), row['attempt_id']))
+                event(db, row['attempt_id'], row['status'], {'digest_batch_revision_id': revision})
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def event(db, attempt_id, status, detail=None):

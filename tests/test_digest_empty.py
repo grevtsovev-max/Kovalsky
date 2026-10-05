@@ -18,7 +18,7 @@ class DigestEmptyTests(unittest.TestCase):
             db.close()
             config = {'newsroom': {'digest_time': '19:30', 'digest_timezone': 'Europe/Moscow'}}
             with patch('newsroom.cli.datetime') as clock, patch('newsroom.cli.telegram_send', return_value='501') as send:
-                clock.now.return_value = datetime(2026,9,26,17,0,tzinfo=timezone.utc)
+                clock.now.return_value = datetime(2026,9,26,17,5,tzinfo=timezone.utc)
                 clock.combine.side_effect = datetime.combine
                 self.assertEqual(publish_digest(path, dict(config, telegram={'chat_id': '@test_channel'})), (True, 0))
                 message = send.call_args.args[1]

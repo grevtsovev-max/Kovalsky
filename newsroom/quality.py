@@ -140,15 +140,20 @@ def editorial_issues(headline, body, facts, *, final_post=False, source_name=Non
 
 def digest_issues(message, selected_count=None):
     """Enforce the channel's compact, linked-headline digest format."""
+    from .digest_language import is_digest_action
     lines = [line.strip() for line in message.splitlines() if line.strip()]
     if not lines or not lines[0].startswith('📣 '):
         return ['DIGEST_TITLE_MISSING']
     entries = lines[1:]
     if entries and all(line.startswith('За период дайджеста ') for line in entries):
-        return []
+        return [] if len(entries) == 1 and selected_count in (None, 0) else ['DIGEST_ENTRY_COUNT']
+    if not entries:
+        return ['DIGEST_ENTRIES_MISSING']
+    if selected_count is not None and len(entries) != selected_count:
+        return ['DIGEST_ENTRY_COUNT']
     for line in entries:
         links = re.findall(r"\[([^\]]+)\]\((https://t\.me/[^)]+)\)", line)
         if (not re.match(r"^(?:🏛|🔐|🧾|⚙️|📈|📌) .+", line)
-                or len(links) != 1 or not ACTION.fullmatch(links[0][0])):
+                or len(links) != 1 or not is_digest_action(links[0][0])):
             return ['DIGEST_ENTRY_FORMAT']
     return []
