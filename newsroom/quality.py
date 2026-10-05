@@ -45,9 +45,47 @@ PROCESS_META = re.compile(
     r"|\b(?:в ходе|по результатам|при)\s+поиск\w*\b"
 )
 ACTION = re.compile(r"(?i)\b(?:зарегистрирова\w*|опубликова\w*|предлож\w*|подготов\w*|приня\w*|утверд\w*|ввел\w*|ввёл\w*|установ\w*|разреш\w*|запрет\w*|объяв\w*|сообщ\w*|заяв\w*|подал\w*|запуст\w*|создал\w*|открыл\w*|закрыл\w*|выпуст\w*|подпис\w*|одобр\w*|выдал\w*|получил\w*|включил\w*|внес\w*|внёс\w*|изменил\w*|повысил\w*|снизил\w*|оценил\w*|указал\w*|вынес\w*|отменил\w*|приостановил\w*|разработал\w*|расширил\w*|согласова\w*|отчит\w*|запросил\w*|открыл доступ|провел\w*|провёл\w*|выступил\w*|столкнул\w*|приобрел\w*|приобрёл\w*|продал\w*|планирует|допуска\w*|рассмотр\w*)\b")
+GENERIC_UPDATE_LABEL = re.compile(r"(?i)(?:^|\s)(?:обновление|дополнение)\s*[:—–-]")
+ATTRIBUTION_TO_OUTLET = re.compile(
+    r"(?iu)\b(?:сообщил\w*|рассказал\w*|заявил\w*|подтвердил\w*|передал\w*)"
+    r"\s+(?:своему\s+|этому\s+)?(?:издани\w*|редакци\w*|газет\w*|журнал\w*|"
+    r"портал\w*|агентств\w*|телеканал\w*|канал\w*|сми)\b"
+)
+OUTLET_REPORTING_VERB = r"(?:сообщил\w*|рассказал\w*|заявил\w*|подтвердил\w*|передал\w*|сообщает|пишет|передаёт|передает|по\s+данным|по\s+сообщению)"
 
 
-def editorial_issues(headline, body, facts, *, final_post=False):
+def _footer_source_name(body):
+    match = re.search(r"(?m)^(?:Источник|Источники):\s*\[([^\]]+)\]\(https?://[^)]+\)\s*$", body)
+    return match.group(1).strip() if match else ""
+
+
+def _source_attribution_is_redundant(body, facts, source_name=None, source_is_report=False):
+    primary = facts.get("primary_source") or {}
+    report = facts.get("publisher_report") or {}
+    footer_source = _footer_source_name(body)
+    has_linked_source = bool(footer_source or source_name or primary.get("url") or report.get("url"))
+    if not has_linked_source:
+        return False
+    if ATTRIBUTION_TO_OUTLET.search(body):
+        return True
+    if "citation_is_report" in facts:
+        source_is_report = source_is_report or facts.get("citation_is_report") is True
+    else:
+        source_is_report = (source_is_report or facts.get("publisher_report_exception") is True
+                            or str(primary.get("type") or "").startswith("ORIGINAL_MEDIA_")
+                            or str(primary.get("type") or "").startswith("ORIGINAL_SOCIAL_"))
+    if not source_is_report:
+        return False
+    name = source_name or _footer_source_name(body) or report.get("publisher") or primary.get("publisher") or ""
+    name = re.sub(r"\s+", " ", str(name)).strip(" \t«»\"'")
+    if not name:
+        return False
+    escaped = re.escape(name)
+    return bool(re.search(rf"(?iu)\b{escaped}\b.{{0,60}}\b{OUTLET_REPORTING_VERB}\b", body)
+                or re.search(rf"(?iu)\b{OUTLET_REPORTING_VERB}\b.{{0,60}}\b{escaped}\b", body))
+
+
+def editorial_issues(headline, body, facts, *, final_post=False, source_name=None, source_is_report=False):
     issues = []
     if facts.get('geographic_scope') == 'RUSSIA' and not headline.startswith('🇷🇺'):
         issues.append('RUSSIA_FLAG_MISSING')
@@ -57,6 +95,10 @@ def editorial_issues(headline, body, facts, *, final_post=False):
         issues.append('RUSSIAN_TEXT_REQUIRED')
     if re.search(r'https?://', headline):
         issues.append('URL_IN_HEADLINE')
+    if GENERIC_UPDATE_LABEL.search(headline):
+        issues.append('GENERIC_UPDATE_LABEL')
+    if _source_attribution_is_redundant(body, facts, source_name, source_is_report):
+        issues.append('REDUNDANT_SOURCE_ATTRIBUTION')
     audit = facts.get('editorial_check') or {}
     for key in ('source_matches_event', 'attribution_preserved', 'stage_preserved',
                 'headline_main_event', 'lead_event_first', 'paragraphs_concise_distinct'):

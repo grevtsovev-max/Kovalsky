@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 from .quality import editorial_issues, digest_issues, attributed_report_supported
 from .ai import FILTER_VERSION
-from .core import NOW, _log_timing, _registrable_domain, is_non_news_telegram_format, is_relevant, run_cycle
+from .core import NOW, _log_timing, _registrable_domain, is_non_news_telegram_format, is_relevant, run_cycle, terms
 from .db import connect
 from .delivery import (DeliveryRejected, DeliveryUncertain, TelegramReceipt,
                        deliver, confirm, reconcile_posts, channel)
@@ -716,12 +716,32 @@ def _with_previous_story_link(text: str, url: str, max_length: int, label: str =
 def _attach_previous_story_link(db, config: dict, post) -> None:
     if int(post["version"]) <= 1:
         return
-    previous = db.execute(
-        "SELECT external_id,text FROM posts WHERE story_id=? AND status='PUBLISHED' "
-        "AND external_id IS NOT NULL ORDER BY published_at,post_id LIMIT 1",
-        (post["story_id"],),
-    ).fetchone()
-    if not previous:
+    rows = db.execute(
+        "SELECT story_id,external_id,text FROM posts WHERE status='PUBLISHED' "
+        "AND external_id IS NOT NULL ORDER BY published_at DESC,post_id DESC LIMIT 600"
+    ).fetchall()
+    if not rows:
+        return
+    current_text = re.sub(r"(?m)^(?:Источник|Источники|Ранее):.*$", "", post["text"])
+    current_terms = terms(current_text)
+    if len(current_terms) < 3:
+        return
+
+    def relevance(previous):
+        earlier_text = re.sub(r"(?m)^(?:Источник|Источники|Ранее):.*$", "", previous["text"])
+        earlier_terms = terms(earlier_text)
+        overlap = current_terms & earlier_terms
+        coverage = len(overlap) / len(current_terms)
+        same_story = str(previous["story_id"]) == str(post["story_id"])
+        if not same_story and (len(overlap) < 3 or coverage < 0.22):
+            return -1.0
+        union = current_terms | earlier_terms
+        similarity = len(overlap) / max(1, len(union))
+        detail = min(1.0, len(earlier_text) / 1000)
+        return coverage * 0.65 + similarity * 0.10 + detail * 0.20 + (0.05 if same_story else 0.0)
+
+    previous = max(rows, key=relevance)
+    if relevance(previous) < 0:
         return
     url = _telegram_message_url(config, previous["external_id"])
     if not url:

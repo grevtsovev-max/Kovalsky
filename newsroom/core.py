@@ -2133,8 +2133,6 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                    (story_id, item_id, item.get("published_at") or now, publisher_name, body[:2000], min(0.99, score + 0.45)))
         status = "UPDATE_CANDIDATE"
         headline = (ai_result.get("headline_ru") or best["headline"]) if ai_result else best["headline"]
-        if has_previous_publication and not headline.casefold().startswith(("обновление:", "дополнение:")):
-            headline = _limit_headline(("🇷🇺 Обновление: " + headline.removeprefix("🇷🇺").strip()) if headline.startswith("🇷🇺") else "Обновление: " + headline)
     else:
         cur = db.execute("INSERT INTO stories(canonical_topic,headline,first_seen_at,last_updated_at,last_source_published_at,latest_information,keywords) VALUES(?,?,?,?,?,?,?)",
                          (item["title"], item["title"], now, now, item.get("published_at"), body[:2000], json.dumps(sorted(terms(candidate)), ensure_ascii=False)))
@@ -2208,7 +2206,12 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             db.commit()
             return disposition
         quality_body = ai_result.get("what_is_new") if status == "UPDATE_CANDIDATE" and has_previous_publication else ai_result.get("summary_ru", "")
-        issues = editorial_issues(headline, quality_body or "", ai_result)
+        citation_url = primary_source["url"] if primary_source else (publisher_report or {}).get("url", item["url"])
+        citation_name = (primary_source.get("publisher") or "Первоисточник") if primary_source else (publisher_report or {}).get("publisher", publisher_name)
+        source_is_report = (bool(primary_source and str(primary_source.get("type") or "").startswith(("ORIGINAL_MEDIA_", "ORIGINAL_SOCIAL_")))
+                            if primary_source else bool(publisher_report))
+        issues = editorial_issues(headline, quality_body or "", ai_result,
+                                 source_name=citation_name, source_is_report=source_is_report)
         if issues:
             ai_result["editorial_issues"] = issues
             _trace_item(item, "Автоматическая проверка текста", "Нужна повторная проверка",
@@ -2234,6 +2237,7 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                                  "memory_mode": memory_mode, "story_diff": memory_diff,
                                  "primary_source": primary_source_record,
                                  "primary_source_status": source_status,
+                                 "citation_is_report": source_is_report,
                                  "publisher_report_exception": bool(publisher_report),
                                  "publisher_report": (dict(publisher_report) | {"content_sha256": digest(publisher_report["content"]), "evidence": (ai_result.get("original_reporting_check") or {}).get("evidence", "")}) if publisher_report else None,
                                  "source_review_required": bool(ai_result.get("source_review_required")),
