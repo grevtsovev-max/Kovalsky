@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'newsroom/**'
+      - 'KANBAN.json'
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -61,7 +61,7 @@ class StageTimingTests(unittest.TestCase):
             self.assertTrue(all(fields[k]>=0 for k in stages))
             now=datetime.now(timezone.utc)
             event=dict(fields,event='collection_stage_timing',timestamp=now.isoformat())
-            (Path(tmp)/'newsroom-launchd.log').write_text(json.dumps(event)+'\n')
+            (Path(tmp)/'newsroom-runtime.log').write_text(json.dumps(event)+'\n')
             report='\n'.join(_performance_summary(cfg,now))
             self.assertIn('Разбивка сбора: 1 циклов',report)
             self.assertIn('Подбор независимых источников:',report)
