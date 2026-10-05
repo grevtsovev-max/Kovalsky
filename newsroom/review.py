@@ -425,6 +425,16 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
         return "REJECTED", "REPORT_NOT_READ", "Не исправлял пост: прочитанный текст источника не подтверждён в истории публикации.", current_text, []
     feedback = db.execute("SELECT reason FROM editorial_feedback WHERE feedback_id=?", (row["feedback_id"],)).fetchone()
     feedback_text = feedback["reason"] if feedback else ""
+    reference_match = re.search(r"\n\[BACKEND_REFERENCE_MESSAGE_ID:(\d+)\]$", feedback_text)
+    reference_post = None
+    if reference_match:
+        reference_post = db.execute(
+            "SELECT post_id,external_id,text FROM posts WHERE external_id=? AND status='PUBLISHED' LIMIT 1",
+            (reference_match.group(1),),
+        ).fetchone()
+        if not reference_post or str(reference_post["external_id"]) == str(post["external_id"]):
+            return "REJECTED", "REFERENCE_POST_UNAVAILABLE", "Не менял пост: подробная публикация для ссылки не подтверждена.", current_text, []
+        feedback_text = feedback_text[:reference_match.start()].strip()
     from .ai import correct_published_post
     from .quality import editorial_issues, publication_source_ready
     from .cli import telegram_format_text
@@ -472,13 +482,19 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
             spans.append((start, start + len(old)))
             kind = change.get("edit_type")
             quote = str(change.get("evidence_quote") or "").strip()
-            if kind == "FACTUAL":
+            if kind in {"FACTUAL", "STRUCTURAL"}:
                 if (len(quote) < 16 or _normalised_source_quote(quote) not in
                         _normalised_source_quote(source["content"])):
                     valid = False
                     last_summary = "Не нашёл точную цитату из прочитанного источника для фактологической правки."
                     break
                 evidence_used.append({"claim": new, "quote": quote, "source_url": source["url"]})
+                if kind == "STRUCTURAL" and not any(
+                        _normalised_source_quote(fragment) in _normalised_source_quote(source["content"])
+                        for fragment in re.split(r"(?<=[.!?])\s+", new) if len(fragment.strip()) >= 16):
+                    valid = False
+                    last_summary = "Структурная правка добавляет формулировку без подтверждения в источнике."
+                    break
             elif kind != "COPYEDIT" or quote:
                 valid = False
                 last_summary = "Тип одной из правок не подтверждён."
@@ -490,6 +506,24 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
             last_summary = "Замены пересекаются и не могут быть безопасно применены."
         if not valid:
             continue
+        if reference_post:
+            from .cli import _previous_story_label, _telegram_message_url
+            reference_url = _telegram_message_url(config, str(reference_post["external_id"]))
+            if not reference_url:
+                last_summary = "Не удалось сформировать проверенную ссылку на подробную публикацию."
+                continue
+            reference_line = f"Ранее: [{_previous_story_label(reference_post['text'])}]({reference_url})"
+            lines = revised.splitlines()
+            prior_lines = [index for index, line in enumerate(lines) if line.startswith("Ранее:")]
+            source_lines = [index for index, line in enumerate(lines) if line.startswith(("Источник:", "Источники:"))]
+            if len(prior_lines) > 1 or len(source_lines) != 1:
+                last_summary = "Не удалось однозначно заменить ссылку на предыдущий разбор."
+                continue
+            if prior_lines:
+                lines[prior_lines[0]] = reference_line
+            else:
+                lines.insert(source_lines[0], reference_line)
+            revised = "\n".join(lines)
         checks = proposal.get("editorial_check") or {}
         audit_fields = ("source_matches_event", "attribution_preserved", "stage_preserved",
                         "headline_main_event", "lead_event_first", "paragraphs_concise_distinct",
@@ -648,6 +682,94 @@ def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
                                f"Пост не изменён: обработка прервалась ({type(exc).__name__}).")
             processed += 1
     return processed
+
+
+_DEPLOY_CORRECTION_REQUESTS = (
+    {
+        "key": "editorial-feedback-case-61-v1",
+        "message_id": "61",
+        "reference_message_id": "5",
+        "reason": (
+            "Этот пост повторяет уже опубликованное сообщение о тех же правилах. "
+            "Оставь короткое сообщение только о том, что правила вступили в силу, "
+            "без повторения подробностей. Добавь строку «Ранее» со ссылкой на подробный "
+            "разбор, публикация канала №5. Сохрани ссылку на источник внизу."
+        ),
+    },
+    {
+        "key": "editorial-feedback-case-62-v1",
+        "message_id": "62",
+        "reference_message_id": None,
+        "reason": (
+            "Убери вводное «Обновление:» из заголовка: это дополнение к новости, "
+            "а не обновление инфоповода. Удали из текста дублирующую атрибуцию "
+            "«сообщает Коммерсантъ», поскольку ссылка на издание уже стоит внизу. "
+            "Сохрани главный факт, проверенные детали и ссылку на источник."
+        ),
+    },
+)
+
+
+def enqueue_deployed_correction_requests(config: dict, db) -> int:
+    """Seed explicit editorial corrections once; the normal review worker handles them."""
+    owner_ids = config.get("telegram", {}).get("interest_owner_user_ids") or []
+    if not owner_ids:
+        return 0
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    created = 0
+    state_changed = False
+    for request in _DEPLOY_CORRECTION_REQUESTS:
+        if db.execute("SELECT 1 FROM app_state WHERE key=?", (request["key"],)).fetchone():
+            continue
+        post = db.execute(
+            "SELECT p.post_id,p.origin_item_id,p.story_id,p.text,p.status,p.external_id,s.headline "
+            "FROM posts p JOIN stories s USING(story_id) "
+            "WHERE p.external_id=? ORDER BY p.post_id DESC LIMIT 1",
+            (request["message_id"],),
+        ).fetchone()
+        if not post or post["status"] != "PUBLISHED" or not post["external_id"]:
+            continue
+        if request["reference_message_id"]:
+            reference = db.execute(
+                "SELECT 1 FROM posts WHERE external_id=? AND status='PUBLISHED' LIMIT 1",
+                (request["reference_message_id"],),
+            ).fetchone()
+            if not reference:
+                continue
+        existing = db.execute(
+            "SELECT 1 FROM telegram_feedback_corrections c "
+            "JOIN editorial_feedback f USING(feedback_id) "
+            "WHERE c.post_id=? AND f.reason=? LIMIT 1",
+            (post["post_id"], request["reason"]),
+        ).fetchone()
+        if existing:
+            db.execute("INSERT INTO app_state(key,value) VALUES(?,?)", (request["key"], "already_queued"))
+            state_changed = True
+            continue
+        latest = db.execute(
+            "SELECT edited_text FROM telegram_post_edits WHERE post_id=? "
+            "ORDER BY captured_at DESC,ABS(update_id) DESC LIMIT 1", (post["post_id"],)
+        ).fetchone()
+        feedback_reason = request["reason"]
+        if request["reference_message_id"]:
+            feedback_reason += f"\n[BACKEND_REFERENCE_MESSAGE_ID:{request['reference_message_id']}]"
+        feedback = db.execute(
+            "INSERT INTO editorial_feedback(created_at,item_id,story_id,post_id,feedback_type,reason,item_title,post_text) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (now, post["origin_item_id"], post["story_id"], post["post_id"], "TELEGRAM_EDIT",
+             feedback_reason, post["headline"] or "", (latest["edited_text"] if latest else post["text"])[:5000]),
+        )
+        db.execute(
+            "INSERT INTO telegram_feedback_corrections(feedback_id,post_id,owner_chat_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?)",
+            (feedback.lastrowid, post["post_id"], str(owner_ids[0]), now, now),
+        )
+        db.execute("INSERT INTO app_state(key,value) VALUES(?,?)", (request["key"], "queued"))
+        state_changed = True
+        created += 1
+    if state_changed:
+        db.commit()
+    return created
 
 
 def flush_feedback_correction_notices(config: dict, db) -> None:
@@ -875,6 +997,9 @@ def run_review_bot(config: dict) -> None:
         if offset is not None:
             payload["offset"] = offset
         try:
+            seeded = enqueue_deployed_correction_requests(config, db)
+            if seeded:
+                print(f"Поставлено серверных редакторских правок в очередь: {seeded}.", flush=True)
             recover_feedback_correction_jobs(db)
             flush_feedback_correction_notices(config, db)
             process_feedback_corrections(config, db, limit=1)
