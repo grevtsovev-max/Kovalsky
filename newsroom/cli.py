@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 try:
     import tomllib
@@ -1150,6 +1151,14 @@ def _digest_schedule_loop(config_path: str) -> None:
             db.close()
 
 
+def _start_digest_scheduler(config_path: str):
+    """Start the digest task inside the existing server process."""
+    worker = threading.Thread(target=_digest_schedule_loop, args=(config_path,),
+                              name="digest-scheduler", daemon=True)
+    worker.start()
+    return worker
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="newsroom", description="Локальный агент мониторинга новостей")
     parser.add_argument("--config", default="config.toml")
@@ -1208,6 +1217,8 @@ def main() -> None:
     elif args.command in {"once", "run"}:
         from .locking import acquire_cycle_lock
         interval = min(180, max(30, int(config["newsroom"].get("poll_interval_seconds", 180))))
+        if args.command == "run":
+            _start_digest_scheduler(args.config)
         while True:
             cycle_started = time.monotonic()
             config = load_config(args.config)
