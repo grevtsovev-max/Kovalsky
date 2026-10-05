@@ -88,11 +88,7 @@ def telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) ->
     return result.get("result")
 
 
-def telegram_send(config: dict, text: str) -> str:
-    settings = config.get("telegram", {})
-    chat_id = os.getenv(settings.get("chat_id_env", "TELEGRAM_CHAT_ID")) or settings.get("chat_id")
-    if not chat_id:
-        raise RuntimeError("Telegram destination is missing.")
+def telegram_format_text(text: str) -> str:
     lines = text.splitlines()
     formatted_lines = []
     link_pattern = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
@@ -147,9 +143,16 @@ def telegram_send(config: dict, text: str) -> str:
                 continue
         formatted_lines.append(format_regular_line(index, line))
         index += 1
-    formatted = "\n".join(formatted_lines)
+    return "\n".join(formatted_lines)
+
+
+def telegram_send(config: dict, text: str) -> str:
+    settings = config.get("telegram", {})
+    chat_id = os.getenv(settings.get("chat_id_env", "TELEGRAM_CHAT_ID")) or settings.get("chat_id")
+    if not chat_id:
+        raise RuntimeError("Telegram destination is missing.")
     result = telegram_api(config, "sendMessage", {
-        "chat_id": chat_id, "text": formatted, "parse_mode": "HTML",
+        "chat_id": chat_id, "text": telegram_format_text(text), "parse_mode": "HTML",
         "disable_web_page_preview": True,
     })
     return TelegramReceipt(result)
@@ -164,9 +167,9 @@ def _link_digest_action(headline: str, url: str) -> str:
         "выдал|выдала|выдали|назначил|назначила|назначили|выпустил|выпустила|выпустили|объявил|объявила|объявили|"
         "запустил|запустила|запустили|создал|создала|создали|открыл|открыла|открыли|закрыл|закрыла|закрыли|"
         "предоставил|предоставила|предоставили|подтвердил|подтвердила|подтвердили|назвал|назвала|назвали|"
-        "готовит|готовят|опубликовал|опубликовала|опубликовали|подготовил|подготовила|подготовили|разрабатывает|разрабатывают|обсуждает|обсуждают|предложил|предложила|предложили|предлагает|предлагают|"
+        "готовит|готовят|опубликовал|опубликовала|опубликовали|подготовил|подготовила|подготовили|разрабатывает|разрабатывают|обсуждает|обсуждают|предложил|предложила|предложили|предлагает|предлагают|допускает|допускают|"
         "повысил|повысила|повысили|снизил|снизила|снизили|привлек|привлекла|привлекли|инвестировал|инвестировали|"
-        "купил|купила|купили|зарегистрировал|зарегистрировала|зарегистрировали|продал|продала|продали|перевел|перевела|перевели|перевёл|перевела|перевели|"
+        "купил|купила|купили|подал|подала|подали|зарегистрировал|зарегистрировала|зарегистрировали|продал|продала|продали|перевел|перевела|перевели|перевёл|перевела|перевели|"
         "вывел|вывела|вывели|вывели|зафиксировал|зафиксировала|зафиксировали|приостановил|приостановила|приостановили|"
         "восстановил|восстановила|восстановили|сообщил|сообщила|сообщили|обратился|обратилась|обратились"
     )
@@ -568,10 +571,16 @@ def build_health_report(db, config: dict, now: datetime | None = None) -> str:
         eligible += int(is_eligible_for_auto_publish(row, cutoff))
     held_items = Counter({row["disposition"]: row["n"] for row in db.execute(
         "SELECT disposition,COUNT(*) AS n FROM items WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION') GROUP BY disposition")})
-    baseline_missed = db.execute(
+    baseline_missed_at_discovery = db.execute(
         "SELECT COUNT(*) FROM items WHERE disposition='BASELINE_SKIPPED' "
         "AND julianday(discovered_at)-julianday(published_at) BETWEEN 0 AND ?",
-        (config.get("newsroom", {}).get("freshness_window_hours", 48) / 24,),
+        (config.get("newsroom", {}).get("freshness_window_hours", 24) / 24,),
+    ).fetchone()[0]
+    baseline_still_fresh = db.execute(
+        "SELECT COUNT(*) FROM items WHERE disposition='BASELINE_SKIPPED' "
+        "AND julianday(?) - julianday(published_at) BETWEEN 0 AND ?",
+        (now.astimezone(timezone.utc).isoformat(),
+         config.get("newsroom", {}).get("freshness_window_hours", 24) / 24),
     ).fetchone()[0]
     fallback24 = sum(row["n"] for row in raw_errors24 if "AI editor unavailable" in row["message"])
     latest = max((row["last_checked_at"] for row in sources if row["last_checked_at"]), default="нет данных")
@@ -583,7 +592,7 @@ def build_health_report(db, config: dict, now: datetime | None = None) -> str:
         f"Здоровье Kovalsky Newsroom · {now.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         f"Источники: {healthy} работают · {len(failing)} с ошибками · {len(stale)} давно не проверялись (порог 10 минут).",
         f"Цикл источников последний раз отмечен: {latest}.",
-        f"Пропущено при подключении, хотя было в окне свежести: {baseline_missed} записей; требуется редакционный разбор архива.",
+        f"Пропущено при подключении в окне свежести: {baseline_missed_at_discovery}; сейчас в этом окне остаются {baseline_still_fresh} записей.",
         f"Очередь: {sum(modes.values())} · AI {modes['AI']} · резервный режим {modes['RULE_BASED']} · без метки {modes['OTHER']}.",
         f"Задержанные материалы: AI {held_items['AI_RETRY']} · чтение первоисточника {held_items['PRIMARY_RETRY']} · автоматическая перепроверка {held_items['WAITING_CONFIRMATION']}.",
         f"Ожидают автопубликации по всем защитам: {eligible} (автопубликация включена).",
@@ -863,6 +872,9 @@ def main() -> None:
     dashboard.add_argument("--host", choices=["127.0.0.1", "localhost"], default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8765)
     sub.add_parser("recheck", help="Предварительно проверить очередь по текущему фильтру")
+    admin_publish = sub.add_parser("admin-publish", help="Опубликовать точный текст по прямой команде владельца из Codex-чата")
+    admin_publish.add_argument("--request-key", required=True,
+                               help="Устойчивый ключ одной команды; повторное использование защищает от дубля")
     args = parser.parse_args()
     _log_timing("runtime_loaded", build="kovalsky-v2-20260929-r1", command=args.command, pid=os.getpid())
     config = load_config(args.config)
@@ -876,6 +888,10 @@ def main() -> None:
     elif args.command == "review-bot":
         from .review import run_review_bot
         run_review_bot(config)
+    elif args.command == "admin-publish":
+        from .admin_publish import publish_from_codex
+        result = publish_from_codex(config, args.request_key, sys.stdin.read())
+        print(json.dumps(result, ensure_ascii=False))
     elif args.command in {"once", "run"}:
         from .locking import acquire_cycle_lock
         interval = max(30, int(config["newsroom"].get("poll_interval_seconds", 180)))

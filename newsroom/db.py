@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS story_timeline (
 );
 CREATE TABLE IF NOT EXISTS posts (
   post_id INTEGER PRIMARY KEY, story_id INTEGER NOT NULL REFERENCES stories(story_id),
+  origin_item_id INTEGER REFERENCES items(item_id),
   text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT NOT NULL,
   published_at TEXT, external_id TEXT, version INTEGER NOT NULL,
   source_ids TEXT NOT NULL DEFAULT '[]', post_hash TEXT NOT NULL,
@@ -110,6 +111,45 @@ CREATE TABLE IF NOT EXISTS editorial_feedback (
   post_text TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS editorial_feedback_recent_idx ON editorial_feedback(created_at DESC);
+CREATE TABLE IF NOT EXISTS telegram_link_feedback (
+  update_id INTEGER PRIMARY KEY,
+  feedback_id INTEGER NOT NULL REFERENCES editorial_feedback(feedback_id),
+  telegram_user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_feedback_corrections (
+  correction_id INTEGER PRIMARY KEY,
+  feedback_id INTEGER NOT NULL UNIQUE REFERENCES editorial_feedback(feedback_id),
+  post_id INTEGER NOT NULL REFERENCES posts(post_id),
+  owner_chat_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'QUEUED',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  result_code TEXT,
+  result_summary TEXT,
+  previous_text TEXT,
+  corrected_text TEXT,
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  notice_status TEXT NOT NULL DEFAULT 'PENDING',
+  notice_attempts INTEGER NOT NULL DEFAULT 0,
+  notice_error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS telegram_feedback_corrections_queue_idx
+  ON telegram_feedback_corrections(status,created_at);
+CREATE TABLE IF NOT EXISTS telegram_message_edit_intents (
+  correction_id INTEGER PRIMARY KEY REFERENCES telegram_feedback_corrections(correction_id),
+  channel_id TEXT NOT NULL,
+  post_id INTEGER NOT NULL REFERENCES posts(post_id),
+  telegram_message_id TEXT NOT NULL,
+  previous_text TEXT NOT NULL,
+  new_text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PREPARED',
+  response_json TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS telegram_post_edits (
   update_id INTEGER PRIMARY KEY,
   post_id INTEGER NOT NULL REFERENCES posts(post_id),
@@ -128,6 +168,32 @@ CREATE TABLE IF NOT EXISTS telegram_review_inbox (
   processed_at TEXT,
   outcome TEXT
 );
+CREATE TABLE IF NOT EXISTS admin_publication_requests (
+  update_id INTEGER PRIMARY KEY,
+  owner_user_id TEXT NOT NULL,
+  owner_chat_id TEXT NOT NULL,
+  request_message_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'RECEIVED',
+  telegram_message_id TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admin_publication_status_idx
+  ON admin_publication_requests(status,created_at);
+CREATE TABLE IF NOT EXISTS codex_publication_requests (
+  request_id INTEGER PRIMARY KEY,
+  request_key TEXT NOT NULL UNIQUE,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'RECEIVED',
+  telegram_message_id TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS codex_publication_status_idx
+  ON codex_publication_requests(status,created_at);
 CREATE TABLE IF NOT EXISTS telegram_public_snapshots (
   post_id INTEGER PRIMARY KEY REFERENCES posts(post_id),
   text TEXT NOT NULL,
@@ -192,9 +258,13 @@ def connect(path: str) -> sqlite3.Connection:
     if "primary_source_json" not in item_columns:
         db.execute("ALTER TABLE items ADD COLUMN primary_source_json TEXT NOT NULL DEFAULT '{}' ")
     post_columns = {row[1] for row in db.execute("PRAGMA table_info(posts)")}
-    for name, declaration in (("auto_attempts", "INTEGER NOT NULL DEFAULT 0"), ("auto_last_error", "TEXT")):
+    for name, declaration in (("origin_item_id", "INTEGER REFERENCES items(item_id)"),
+                              ("auto_attempts", "INTEGER NOT NULL DEFAULT 0"), ("auto_last_error", "TEXT")):
         if name not in post_columns:
             db.execute(f"ALTER TABLE posts ADD COLUMN {name} {declaration}")
+    db.execute("CREATE INDEX IF NOT EXISTS posts_origin_item_idx ON posts(origin_item_id)")
+    db.execute("UPDATE posts SET origin_item_id=(SELECT item_id FROM post_memory WHERE post_memory.post_id=posts.post_id) "
+               "WHERE origin_item_id IS NULL AND EXISTS(SELECT 1 FROM post_memory WHERE post_memory.post_id=posts.post_id)")
     source_columns = {row[1] for row in db.execute("PRAGMA table_info(sources)")}
     for name, declaration in (
         ("source_role", "TEXT NOT NULL DEFAULT 'aggregator'"),

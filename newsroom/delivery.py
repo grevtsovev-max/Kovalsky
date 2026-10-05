@@ -197,4 +197,10 @@ def observe_channel_post(db, message, comparable_text):
     db.execute("UPDATE publication_attempts SET status='SENT',telegram_message_id=?,telegram_response_json=?,updated_at=? WHERE attempt_id=? AND status IN ('SENDING','UNKNOWN')",
                (str(message_id), json.dumps(message, ensure_ascii=False), now(), row['attempt_id']))
     event(db, row['attempt_id'], 'SENT', {'confirmation': 'channel_post', 'message_id': str(message_id)})
+    marker = ':codex-admin:'
+    if marker in row['delivery_key']:
+        request_key = row['delivery_key'].rsplit(marker, 1)[1]
+        db.execute("UPDATE codex_publication_requests SET status='PUBLISHED',telegram_message_id=?,error_code=NULL,updated_at=? "
+                   "WHERE request_key=? AND status IN ('SENDING','UNKNOWN')",
+                   (str(message_id), now(), request_key))
     return True

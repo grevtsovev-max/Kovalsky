@@ -110,7 +110,7 @@ def run(db,config,search,process,now=None):
             for article in articles[:max(1,min(10,int(settings.get('story_watch_items_per_job',3))))]:
                 # A search target is context, never proof that a result belongs to this story.
                 outcome=process(db,source,article,settings.get('similarity_threshold',.35),
-                    settings.get('max_post_length',3500),settings.get('freshness_window_hours',48),None,
+                    settings.get('max_post_length',3500),settings.get('freshness_window_hours',24),None,
                     settings.get('relevance_terms',[]),ai)
                 outcomes.append({'url':article.get('url'),'outcome':outcome})
                 counts[outcome]=counts.get(outcome,0)+1

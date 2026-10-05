@@ -22,7 +22,7 @@ digest_lookback_hours = 48
 digest_title = "Главное за последние два дня"
 max_post_length = 3500
 similarity_threshold = 0.35
-freshness_window_hours = 48
+freshness_window_hours = 24
 # При подключении источника проверять последние 48 часов.
 initial_backfill_minutes = 2880
 auto_publish_since = "ЗАДАЙТЕ_ДАТУ_СТАРТА_ISO8601"

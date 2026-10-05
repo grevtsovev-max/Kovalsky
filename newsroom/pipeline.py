@@ -36,6 +36,11 @@ DECISION_LABELS = {
 PRIMARY_LABELS = {'READ': 'Прочитан', 'NO_LINK': 'Ссылка не найдена',
                   'ARTICLE_UNREADABLE': 'Статья не прочитана', 'UNREADABLE': 'Не удалось прочитать',
                   'NOT_FOUND': 'Не найден', 'OCR_REVIEW': 'Текст извлечён через OCR; нужна сверка'}
+DELIVERY_LABELS = {
+    'PREPARED': 'Отправка подготовлена', 'SENDING': 'Telegram обрабатывает отправку',
+    'SENT': 'Ответ Telegram получен', 'CONFIRMED': 'Публикация подтверждена',
+    'FAILED': 'Telegram отклонил отправку', 'UNKNOWN': 'Ответ Telegram пока не подтверждён',
+}
 
 
 def obj(raw):
@@ -106,7 +111,7 @@ def retry_queue_positions(db, config, now):
         reserve = min(3, analysis_budget, triage_budget)
         analysis_budget -= reserve
         triage_budget -= reserve
-    batch = max(1, int(newsroom.get('retry_items_per_cycle', 8)))
+    batch = max(0, int(newsroom.get('retry_items_per_cycle', 2)))
     if ai.get('triage_enabled'):
         batch = min(batch, triage_budget)
     batch = min(batch, analysis_budget)
@@ -144,6 +149,37 @@ def same_processing_run(item, post):
         except ValueError: return False
     if item['source_id'] not in ids or not item['processed_at']:
         return False
+
+
+def publication_trace(db, post_id, tables):
+    """Expose the saved delivery receipt without returning raw Telegram payloads."""
+    if 'publication_attempts' not in tables:
+        return None
+    attempt = db.execute(
+        'SELECT attempt_id,status,attempt_count,telegram_message_id,error_code,created_at,updated_at '
+        'FROM publication_attempts WHERE post_id=? ORDER BY attempt_id DESC LIMIT 1', (post_id,)
+    ).fetchone()
+    if not attempt:
+        return None
+    events = []
+    if 'delivery_events' in tables:
+        events = [
+            {'status': DELIVERY_LABELS.get(row['status'], row['status']), 'at': row['created_at']}
+            for row in db.execute(
+                'SELECT status,created_at FROM delivery_events WHERE attempt_id=? ORDER BY event_id',
+                (attempt['attempt_id'],)
+            ).fetchall()
+        ]
+    return {
+        'status': attempt['status'],
+        'status_label': DELIVERY_LABELS.get(attempt['status'], 'Статус отправки не определён'),
+        'attempt_count': attempt['attempt_count'],
+        'telegram_message_id': attempt['telegram_message_id'],
+        'error_code': attempt['error_code'],
+        'created_at': attempt['created_at'],
+        'updated_at': attempt['updated_at'],
+        'events': events,
+    }
     try:
         delta = datetime.fromisoformat(post['created_at']) - datetime.fromisoformat(item['processed_at'])
         return abs(delta.total_seconds()) <= 2
@@ -196,13 +232,30 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         retry = obj(item.pop('retry_json'))
         triage = obj(item.pop('triage_json'))
         disposition = item['disposition']
-        # The legacy schema has no post.item_id. Only associate accepted items with
-        # a post with matching primary URL or legacy processing metadata; never promote duplicate/held items.
-        urls = {u for u in [item['url'], item['canonical_url'], primary.get('url')] if u}
-        candidates = [p for p in by_story.get(item['story_id'], [])
-                      if ((p['facts'].get('primary_source') or {}).get('url') in urls or same_processing_run(item, p))
-                      and p['created_at'] >= item['discovered_at']]
-        post = min(candidates, key=lambda p: p['created_at']) if candidates and disposition in {'NEW_STORY','UPDATE_CANDIDATE'} else None
+        # A saved origin link is stronger evidence than the item's current
+        # disposition, which may have changed during later story reconciliation.
+        # Only inferred legacy matches remain limited to accepted dispositions.
+        post = None
+        post_link_method = None
+        story_posts = by_story.get(item['story_id'], [])
+        exact = [p for p in story_posts if p.get('origin_item_id') == item['item_id']]
+        if exact:
+            post = min(exact, key=lambda p: p['created_at'])
+            post_link_method = 'EXPLICIT'
+        elif disposition in {'NEW_STORY','UPDATE_CANDIDATE'}:
+            urls = {u for u in [item['url'], item['canonical_url'], primary.get('url')] if u}
+            legacy_posts = [p for p in story_posts
+                            if p.get('origin_item_id') is None
+                            and p['created_at'] >= item['discovered_at']]
+            url_matches = [p for p in legacy_posts
+                           if ((p.get('facts') or {}).get('primary_source') or {}).get('url') in urls]
+            time_matches = [p for p in legacy_posts if same_processing_run(item, p)]
+            if url_matches:
+                post = min(url_matches, key=lambda p: p['created_at'])
+                post_link_method = 'LEGACY_SOURCE_URL'
+            elif time_matches:
+                post = min(time_matches, key=lambda p: p['created_at'])
+                post_link_method = 'LEGACY_PROCESSING_TIME'
         category = {'PRIMARY_RETRY':'primary', 'AI_RETRY':'ai',
                     'WAITING_CONFIRMATION':'confirmation', 'PENDING':'received'}.get(disposition, 'processed')
         reason = retry.get('reason') or REASONS.get(disposition, 'Обработка завершена; связанный пост не найден.')
@@ -218,6 +271,8 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         if disposition in {'NOISE','DUPLICATE','STALE','BASELINE_SKIPPED','UNDATED','EDITOR_REJECTED','REJECTED'}:
             category = 'filtered'
         if post:
+            post['publication_trace'] = publication_trace(db, post['post_id'], tables)
+            post['link_method'] = post_link_method
             if post['status'] == 'PUBLISHED':
                 category, reason = 'published', 'Связанный пост по этому сюжету опубликован в канале.'
             elif post['status'] == 'PENDING':
@@ -244,7 +299,9 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             what_is_new=analysis.get('what_is_new'), issues=analysis.get('editorial_issues') or [],
             independent_note=analysis.get('independent_check_note'),
             interest_vote=item.get('interest_vote'),
-            post=({k:post.get(k) for k in ('post_id','status','created_at','published_at','telegram_url','text','auto_reason','auto_attempts','auto_last_error')} if post else None))
+            post=({k:post.get(k) for k in ('post_id','status','created_at','published_at','telegram_url','external_id',
+                                            'text','auto_reason','auto_attempts','auto_last_error',
+                                            'publication_trace','link_method')} if post else None))
         if stage == 'all' or stage == category:
             output.append(item)
     visible = output[offset:offset+30]

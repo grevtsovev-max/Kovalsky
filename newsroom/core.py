@@ -5,7 +5,9 @@ import gzip
 import io
 import html
 import json
+import ipaddress
 import re
+import socket
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -30,6 +32,51 @@ NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 def _log_timing(event: str, **fields) -> None:
     print(json.dumps({"timestamp": NOW(), "event": event, **fields}, ensure_ascii=False), flush=True)
+
+
+def _development_date_issue(result: dict, source: dict | None, freshness_hours: int) -> tuple[str, str] | None:
+    """Require a dated, source-grounded event before treating a fresh article as fresh news."""
+    if result.get("publication_recommendation") != "AUTO_PUBLISH":
+        return None
+    raw_date = str(result.get("development_date") or "").strip()
+    evidence = str(result.get("development_date_evidence") or "").strip()
+    content = str((source or {}).get("content") or "")
+    if not raw_date or not evidence or not content:
+        return ("unverified", "Не установлена подтверждённая дата самого события; дата свежей статьи не заменяет её.")
+    try:
+        event_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+    except ValueError:
+        return ("unverified", "Дата события указана не в формате YYYY-MM-DD.")
+    normalize = lambda value: re.sub(r"\s+", " ", value).strip().casefold().replace("ё", "е")
+    if normalize(evidence) not in normalize(content):
+        return ("unverified", "Цитата для даты события отсутствует в прочитанном первичном источнике.")
+    date_tokens = {
+        event_date.isoformat(),
+        f"{event_date.day}.{event_date.month}.{event_date.year}",
+        event_date.strftime("%d.%m.%Y"),
+        f"{event_date.day}/{event_date.month}/{event_date.year}",
+        event_date.strftime("%d/%m/%Y"),
+        event_date.strftime("%B %d, %Y"),
+        event_date.strftime("%B %d %Y"),
+        event_date.strftime("%b %d, %Y"),
+        event_date.strftime("%b %d %Y"),
+    }
+    russian_months = (
+        ("января", "янв."), ("февраля", "фев."), ("марта", "мар."),
+        ("апреля", "апр."), ("мая",), ("июня", "июн."),
+        ("июля", "июл."), ("августа", "авг."), ("сентября", "сен."),
+        ("октября", "окт."), ("ноября", "нояб."), ("декабря", "дек."),
+    )[event_date.month - 1]
+    date_tokens.update(f"{event_date.day} {month} {event_date.year}" for month in russian_months)
+    evidence_norm = normalize(evidence)
+    if not any(normalize(token) in evidence_norm for token in date_tokens):
+        return ("unverified", "Цитата источника не подтверждает указанную календарную дату события.")
+    today = datetime.now(timezone.utc).date()
+    if event_date > today:
+        return ("unverified", "Дата события находится в будущем.")
+    if (today - event_date).total_seconds() > max(1, freshness_hours) * 3600:
+        return ("stale", f"Последнее подтверждённое изменение датировано {event_date.isoformat()} и старше окна свежести; новой стадии или более позднего изменения источник не подтверждает.")
+    return None
 
 
 def _trusted_tls_context():
@@ -75,7 +122,40 @@ def parse_date(value: str | None) -> str | None:
             return None
 
 
-def _request_with_url(url: str, timeout: int = 20) -> tuple[bytes, str, str]:
+def _validate_public_http_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.port not in (None, 443)):
+        raise ValueError("URL_NOT_ALLOWED")
+    host = parsed.hostname.rstrip(".").encode("idna").decode("ascii")
+    try:
+        addresses = {str(ipaddress.ip_address(host))}
+    except ValueError:
+        try:
+            addresses = {result[4][0].split("%", 1)[0]
+                         for result in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
+        except OSError as exc:
+            raise ValueError("URL_HOST_UNRESOLVABLE") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("URL_NOT_PUBLIC")
+
+
+class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        _validate_public_http_url(target)
+        if urllib.parse.urlsplit(req.full_url).scheme.lower() == "https" and urllib.parse.urlsplit(target).scheme.lower() != "https":
+            raise ValueError("HTTPS_REDIRECT_DOWNGRADE")
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
+def _request_with_url(url: str, timeout: int = 20, public_only: bool = False) -> tuple[bytes, str, str]:
+    if public_only:
+        _validate_public_http_url(url)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=TLS_CONTEXT), _PublicHttpsRedirectHandler())
+    else:
+        opener = None
     request_headers = [
         {"User-Agent": "KovalskyNewsroom/0.1 (+RSS reader)", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*"},
         {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -85,7 +165,9 @@ def _request_with_url(url: str, timeout: int = 20) -> tuple[bytes, str, str]:
     for attempt, headers in enumerate(request_headers):
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=TLS_CONTEXT) as response:
+            response_context = (opener.open(req, timeout=timeout) if opener else
+                                urllib.request.urlopen(req, timeout=timeout, context=TLS_CONTEXT))
+            with response_context as response:
                 payload = response.read(10_000_001)
                 if len(payload) > 10_000_000:
                     raise ValueError("RESPONSE_TOO_LARGE")
@@ -106,8 +188,12 @@ def _request_with_url(url: str, timeout: int = 20) -> tuple[bytes, str, str]:
             raise
         except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
             reason = str(getattr(exc, "reason", exc)).lower()
-            transient = "timed out" in reason or "timeout" in reason or "handshake" in reason or "connection reset" in reason
-            if attempt == 0 and transient:
+            timed_out = "timed out" in reason or "timeout" in reason
+            transient_connection_error = "handshake" in reason or "connection reset" in reason
+            # A timeout has already spent the full request budget. Retrying it
+            # immediately doubles the wait during a broad outage; the source is
+            # retried in a later collection cycle instead.
+            if attempt == 0 and not timed_out and transient_connection_error:
                 time.sleep(0.4)
                 continue
             raise
@@ -255,7 +341,7 @@ def decode_google_news_url(url: str) -> str:
 
 class PublisherArticleParser(HTMLParser):
     SKIP = {"script", "style", "nav", "header", "footer", "aside", "noscript", "svg", "form"}
-    TEXT_TAGS = {"h1", "h2", "h3", "p", "blockquote", "li"}
+    TEXT_TAGS = {"h1", "h2", "h3", "p", "blockquote", "li", "time"}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -264,6 +350,7 @@ class PublisherArticleParser(HTMLParser):
         self.canonical_url = ""
         self.title_parts = []
         self.blocks = []
+        self.headings = []
         self.skip_stack = []
         self.title_open = False
         self.block_tag = None
@@ -282,6 +369,13 @@ class PublisherArticleParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
+        if tag == "time" and values.get("datetime"):
+            date_value = parse_date(values.get("datetime"))
+            class_names = (values.get("class") or "").lower().split()
+            if date_value and any(token in " ".join(class_names) for token in ("updated", "modified")):
+                self.updated_at = self.updated_at or date_value
+            elif date_value:
+                self.published_at = self.published_at or date_value
         if tag == "script":
             self.script_open = True
             if values.get("type", "").split(";", 1)[0].strip().lower() == "application/ld+json":
@@ -368,6 +462,8 @@ class PublisherArticleParser(HTMLParser):
             value = re.sub(r"\s+", " ", " ".join(self.block_data)).strip()
             if value:
                 self.blocks.append(value)
+                if tag == "h1":
+                    self.headings.append(value)
             self.block_tag = None
             self.block_data = []
 
@@ -556,13 +652,14 @@ def _fetch_bybit_restricted_counterparty_pdf(url: str, publisher_name: str,
 
 
 def fetch_publisher_article(url: str, publisher_name: str, published_at: str | None,
-                            discover_primary: bool = True, timeout: int = 20) -> dict:
+                            discover_primary: bool = True, timeout: int = 20,
+                            public_only: bool = False) -> dict:
     parsed_url = urllib.parse.urlsplit(url)
-    if ((parsed_url.hostname or "").lower().removeprefix("www.") == "bybit.com"
+    if (not public_only and (parsed_url.hostname or "").lower().removeprefix("www.") == "bybit.com"
             and parsed_url.path.rstrip("/").lower() ==
             "/en/legal/additional-terms-and-disclosures/restricted-counterparty-list"):
         return _fetch_bybit_restricted_counterparty_pdf(url, publisher_name, published_at, timeout)
-    payload, final_url, content_type = _request_with_url(url, timeout=timeout)
+    payload, final_url, content_type = _request_with_url(url, timeout=timeout, public_only=public_only)
     final_host = urllib.parse.urlsplit(final_url).hostname or ""
     if final_host.endswith("google.com") or "news.google" in final_host:
         raise ValueError("Publisher link still points to Google News")
@@ -600,7 +697,11 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
         content = description
     if len(content) < 100 and not embedded_candidates:
         raise ValueError("Publisher page has no readable article text")
-    title = (parser.meta_title or " ".join(parser.title_parts) or (blocks[0] if blocks else "")).strip()
+    meta_title = parser.meta_title.strip()
+    heading = parser.headings[0] if parser.headings else ""
+    generic_meta_title = meta_title.casefold() in {"fincen.gov", "home", "news"}
+    title = (heading if heading and (not meta_title or generic_meta_title)
+             else meta_title or " ".join(parser.title_parts) or heading or (blocks[0] if blocks else "")).strip()
     canonical_url = urllib.parse.urljoin(final_url, parser.canonical_url) if parser.canonical_url else final_url
     canonical_host = urllib.parse.urlsplit(canonical_url).hostname or ""
     if canonical_host.endswith("google.com") or "news.google" in canonical_host:
@@ -631,6 +732,7 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
                     published_at,
                     discover_primary=False,
                     timeout=8,
+                    public_only=public_only,
                 )
             except Exception:
                 # Do not substitute an unrelated official link when the article's cited source is unavailable.
@@ -1135,6 +1237,8 @@ def _primary_source_from_item(item: dict, status: str) -> dict | None:
         "title": item.get("primary_source_title") or "",
         "content": item["primary_source_content"][:12000],
         "status": status,
+        **({"document_url": item["primary_source_document_url"]}
+           if item.get("primary_source_document_url") else {}),
     }
 
 
@@ -1423,7 +1527,7 @@ def _web_search_recovery_due(db, config: dict) -> bool:
           AND COALESCE((SELECT julianday(json_extract(value,'$.next_at')) FROM app_state
                WHERE key='selection_retry:'||i.item_id),0)<=julianday('now')
         ORDER BY COALESCE(i.processed_at,i.discovered_at),i.item_id LIMIT 100""",
-                       ("-" + str(int(config.get("newsroom", {}).get("freshness_window_hours", 48))) + " hours",
+                       ("-" + str(int(config.get("newsroom", {}).get("freshness_window_hours", 24))) + " hours",
                         MAX_AUTOMATIC_RETRIES, MAX_AUTOMATIC_RETRIES)).fetchall()
     from .source_search import STRATEGIES
     for row in rows:
@@ -1650,9 +1754,16 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                                  (f"selection_retry:{item_id}",), (f"editor_retry:{item_id}",)])
         else:
             item_id = existing_item_id
-            db.execute("""UPDATE items SET title=?,description=?,content=?,content_hash=?,title_hash=?,primary_source_json=?
+            prior = db.execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
+            if prior and (prior["content_hash"] != content_hash or prior["title_hash"] != title_hash
+                          or prior["published_at"] != item.get("published_at")
+                          or prior["updated_at"] != item.get("updated_at")):
+                _archive_item_revision(db, item_id, prior)
+            db.execute("""UPDATE items SET title=?,description=?,content=?,author=?,published_at=?,updated_at=?,
+                          content_hash=?,title_hash=?,primary_source_json=?
                           WHERE item_id=?""",
-                       (item['title'], item.get('description', ''), body, content_hash, title_hash,
+                       (item['title'], item.get('description', ''), body, item.get('author'),
+                        item.get('published_at'), item.get('updated_at'), content_hash, title_hash,
                         _stored_primary(item, primary_source, source_status), item_id))
     except Exception as exc:
         if "UNIQUE" in str(exc):
@@ -1685,6 +1796,11 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
         return "STALE"
     # Use the headline and publisher's summary for topic screening; long article bodies can mention unrelated keywords.
     relevance_text = f"{item['title']} {item.get('description', '')}"
+    if source["type"] == "manual" and item.get("material_read") is True:
+        # A manually submitted page has no RSS summary. Use only its opening excerpt
+        # for the cheap topic prefilter; the normal AI triage and full checks still decide relevance.
+        excerpt_limit = 12000 if item.get("screening_primary_source") is True else 2200
+        relevance_text += " " + str(item.get("screening_excerpt") or "")[:excerpt_limit]
     if relevance_terms and not is_relevant(relevance_text, relevance_terms):
         _trace_item(item, "Тематический фильтр", "Отсеян",
                     "В заголовке и описании не найдено совпадений с темами мониторинга.")
@@ -1812,7 +1928,7 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                     if exc.code != "OUTPUT_TOKEN_LIMIT":
                         raise
                     retry_options = dict(ai_options)
-                    retry_options["max_output_tokens"] = max(3200, int(ai_options.get("max_output_tokens", 1800)) * 2)
+                    retry_options["max_output_tokens"] = max(8000, int(ai_options.get("max_output_tokens", 1800)) * 3)
                     ai_result = analyze_with_ai(ai_input, editor_source, ai_candidates, retry_options)
             finally:
                 timings["ai_seconds"] += time.perf_counter() - stage_started
@@ -1878,6 +1994,27 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                        (item_id, ai_options.get("model", "gpt-6-luna"), now,
                         json.dumps({**ai_result, "_filter_version": FILTER_VERSION,
                                     "_independent_sources": independent_audit}, ensure_ascii=False)))
+            date_issue = _development_date_issue(ai_result, primary_source or publisher_report,
+                                                 freshness_hours)
+            if date_issue:
+                severity, reason = date_issue
+                ai_result["development_date_check"] = {"status": severity.upper(), "reason": reason}
+                if severity == "stale":
+                    ai_result["publication_recommendation"] = "DO_NOT_PUBLISH"
+                    disposition = "REJECTED"
+                else:
+                    ai_result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
+                    ai_result["source_review_required"] = True
+                    disposition = "WAITING_CONFIRMATION"
+                _trace_item(item, "Проверка даты события", disposition, reason,
+                            development_date=ai_result.get("development_date"))
+                db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
+                           (json.dumps({**ai_result, "_filter_version": FILTER_VERSION,
+                                        "_independent_sources": independent_audit}, ensure_ascii=False), item_id))
+                db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?",
+                           (disposition, now, item_id))
+                db.commit()
+                return disposition
 
     if ai_result is None:
         held = "AI_RETRY" if (source_status == "READ" and primary_source) or publisher_report else "PRIMARY_RETRY"
@@ -2127,8 +2264,8 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                                  "source_review_required": not bool(primary_source and source_status == "READ")}, ensure_ascii=False)
     post_hash = digest(post)
     db.execute('SAVEPOINT memory_post')
-    cur = db.execute("INSERT OR IGNORE INTO posts(story_id,text,status,created_at,version,source_ids,post_hash,fact_check_result) VALUES(?,?, 'PENDING', ?,?,?,?,?)",
-               (story_id, post, now, (best["version"] + 1 if best else 1), json.dumps([source["source_id"]]), post_hash, facts_json))
+    cur = db.execute("INSERT OR IGNORE INTO posts(story_id,origin_item_id,text,status,created_at,version,source_ids,post_hash,fact_check_result) VALUES(?,?,?, 'PENDING', ?,?,?,?,?)",
+               (story_id, item_id, post, now, (best["version"] + 1 if best else 1), json.dumps([source["source_id"]]), post_hash, facts_json))
     if memory_diff and memory_enforced:
         from .knowledge import bind_post, MemoryInvalid
         try:
@@ -2153,7 +2290,7 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
         return counts
     # Retries share model budgets with fresh stories. Keep a small retry slice so
     # held items cannot consume the entire cycle before current feeds arrive.
-    limit = min(limit, max(1, int(config.get("newsroom", {}).get("retry_items_per_cycle", 4))))
+    limit = min(limit, max(0, int(config.get("newsroom", {}).get("retry_items_per_cycle", 2))))
     ai_settings = config.get("ai", {})
     if ai_settings.get("triage_enabled"):
         limit = min(limit, max(0, int(ai_settings.get("_triage_budget", 0))))
@@ -2188,6 +2325,8 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
         item["material_url"] = primary.get("_material_url", row["url"])
         if primary.get("_material_publisher"):
             item["publisher_name"] = primary["_material_publisher"]
+        if source["type"] == "manual" and item["material_read"]:
+            item["screening_excerpt"] = str(item.get("content") or "")[:2200]
         if "_discovery_links" in primary:
             item["discovery_links"] = primary["_discovery_links"]
             item["telegram_forwarded"] = primary.get("_telegram_forwarded", False)
@@ -2205,7 +2344,7 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
         try:
             outcome = process_item(db, source, item, config["newsroom"].get("similarity_threshold", 0.35),
                                    config["newsroom"].get("max_post_length", 3500),
-                                   config["newsroom"].get("freshness_window_hours", 48), None,
+                                   config["newsroom"].get("freshness_window_hours", 24), None,
                                    config["newsroom"].get("relevance_terms", []), config.get("ai", {}),
                                    existing_item_id=row["item_id"])
             counts[outcome] = counts.get(outcome, 0) + 1
@@ -2383,6 +2522,15 @@ def run_cycle(config: dict) -> dict[str, int]:
     watch_reserve = min(3, max(0, config['ai']['_analysis_budget']), max(0, config['ai']['_triage_budget'])) if config['newsroom'].get('story_watch_enabled') else 0
     config['ai']['_analysis_budget'] -= watch_reserve
     config['ai']['_triage_budget'] -= watch_reserve
+    retry_reserve = min(
+        max(0, int(config["newsroom"].get("retry_items_per_cycle", 2))),
+        max(0, config["ai"]["_analysis_budget"]),
+        max(0, config["ai"]["_triage_budget"])
+        if config["ai"].get("triage_enabled") else max(0, config["ai"]["_analysis_budget"]),
+    )
+    config["ai"]["_analysis_budget"] -= retry_reserve
+    if config["ai"].get("triage_enabled"):
+        config["ai"]["_triage_budget"] -= retry_reserve
     run_started = time.perf_counter()
     stage_times = {"retry_seconds": 0.0, "fetch_wait_seconds": 0.0,
                    "matching_seconds": 0.0, "processing_seconds": 0.0}
@@ -2419,6 +2567,11 @@ def run_cycle(config: dict) -> dict[str, int]:
         sources.append((source_cfg, source, first_check, source_type))
     db.commit()
     source_by_id = {source["source_id"]: source for _, source, _, _ in sources}
+    manual_retry_sources = db.execute(
+        "SELECT DISTINCT s.* FROM sources s JOIN items i USING(source_id) "
+        "WHERE s.type='manual' AND i.disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION')"
+    ).fetchall()
+    source_by_id.update({source["source_id"]: source for source in manual_retry_sources})
     if config.get('newsroom',{}).get('story_watch_enabled'):
         source_by_id.update({r['source_id']:r for r in db.execute("SELECT * FROM sources WHERE url LIKE 'story-watch://%'")})
     web_search_interval = int(config.get("web_search", {}).get("min_interval_minutes", 15))
@@ -2465,18 +2618,13 @@ def run_cycle(config: dict) -> dict[str, int]:
             ORIGINAL_REPORTING_PUBLISHERS.setdefault(_registrable_domain(host), re.escape(source_cfg["name"]))
 
     db.execute("UPDATE items SET disposition='STALE',processed_at=? WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION') AND julianday(COALESCE(updated_at,published_at))<julianday('now',?)",
-               (NOW(), "-"+str(int(config["newsroom"].get("freshness_window_hours",48)))+" hours"))
+               (NOW(), "-"+str(int(config["newsroom"].get("freshness_window_hours",24)))+" hours"))
     db.commit()
     requeued = _requeue_social_quote_repairs(
-        db, config.get("ai", {}), int(config["newsroom"].get("freshness_window_hours", 48)))
+        db, config.get("ai", {}), int(config["newsroom"].get("freshness_window_hours", 24)))
     if requeued:
         counts["FILTER_REPROCESS_QUEUED"] = requeued
     _close_exhausted_retries(db)
-    retry_started = time.perf_counter()
-    for outcome, count in _retry_ai_held_items(db, source_by_id, config).items():
-        counts[outcome] = counts.get(outcome, 0) + count
-    stage_times["retry_seconds"] = time.perf_counter() - retry_started
-
     def fetch_one(source_info):
         source_cfg, source, first_check, source_type = source_info
         if source_type == "web_search":
@@ -2499,7 +2647,7 @@ def run_cycle(config: dict) -> dict[str, int]:
         if source_type == "x":
             return fetch_x_recent(source_cfg.get("query", ""), config.get("x", {}))
         since = source["recovery_since"] or source["last_seen_published_at"] or (
-            datetime.now(timezone.utc) - timedelta(hours=config["newsroom"].get("freshness_window_hours", 48))
+            datetime.now(timezone.utc) - timedelta(hours=config["newsroom"].get("freshness_window_hours", 24))
         ).isoformat(timespec="seconds")
         return fetch_telegram(source["url"], since=since, before=source["recovery_before"],
                               max_pages=config["newsroom"].get("telegram_recovery_pages", 5))
@@ -2558,8 +2706,8 @@ def run_cycle(config: dict) -> dict[str, int]:
                     try:
                         outcome = process_item(db, source, item, config["newsroom"].get("similarity_threshold", 0.35),
                                                config["newsroom"].get("max_post_length", 3500),
-                                               config["newsroom"].get("freshness_window_hours", 48),
-                                               config["newsroom"].get("initial_backfill_minutes", config["newsroom"].get("freshness_window_hours", 48) * 60) if first_check else None,
+                                               config["newsroom"].get("freshness_window_hours", 24),
+                                               config["newsroom"].get("initial_backfill_minutes", config["newsroom"].get("freshness_window_hours", 24) * 60) if first_check else None,
                                                config["newsroom"].get("relevance_terms", []), config.get("ai", {}))
                         counts[outcome] = counts.get(outcome, 0) + 1
                     except Exception as exc:
@@ -2577,7 +2725,7 @@ def run_cycle(config: dict) -> dict[str, int]:
                 recovery_error = getattr(items, "recovery_error", None)
                 if recovery_before is not None:
                     since = source["recovery_since"] or source["last_seen_published_at"] or (
-                        datetime.now(timezone.utc) - timedelta(hours=config["newsroom"].get("freshness_window_hours", 48))
+                        datetime.now(timezone.utc) - timedelta(hours=config["newsroom"].get("freshness_window_hours", 24))
                     ).isoformat(timespec="seconds")
                     latest = None  # Do not advance the coverage checkpoint past a gap.
                     counts["RECOVERY_PENDING"] = counts.get("RECOVERY_PENDING", 0) + 1
@@ -2612,6 +2760,16 @@ def run_cycle(config: dict) -> dict[str, int]:
     story_watch_started = time.perf_counter()
     counts.update(run_story_watch(db, config, web_search_quota, process_item))
     stage_times["story_watch_seconds"] = time.perf_counter() - story_watch_started
+    # Give newly fetched material and due story watches first access to the
+    # shared model budgets. Held-item retries are bounded and run afterward;
+    # their reserved slots remain available even when fresh work is heavy.
+    config['ai']['_analysis_budget'] += retry_reserve
+    if config['ai'].get("triage_enabled"):
+        config['ai']['_triage_budget'] += retry_reserve
+    retry_started = time.perf_counter()
+    for outcome, count in _retry_ai_held_items(db, source_by_id, config).items():
+        counts[outcome] = counts.get(outcome, 0) + count
+    stage_times["retry_seconds"] = time.perf_counter() - retry_started
     db.close()
     total_seconds = time.perf_counter() - run_started
     stage_times["other_seconds"] = max(0.0, total_seconds - sum(stage_times.values()))
