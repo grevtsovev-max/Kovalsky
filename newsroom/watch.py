@@ -101,7 +101,7 @@ def run(db,config,search,process,now=None):
         log(db,job['story_id'],job['job_id'],'SEARCH_STARTED',{'query':query},now)
         db.commit()
         try:
-            articles=search(query,ai)
+            articles=search(query,{**ai, '_work_category': 'watch', '_work_role': 'collector'})
             source_url='story-watch://'+str(job['story_id'])
             db.execute("INSERT INTO sources(name,type,url,source_role,priority,reputation,active) VALUES(?,'web_search',?,'discovery',1,'unknown',0) ON CONFLICT(url) DO NOTHING",('Наблюдение за сюжетом '+str(job['story_id']),source_url))
             source=db.execute('SELECT * FROM sources WHERE url=?',(source_url,)).fetchone()
@@ -117,6 +117,14 @@ def run(db,config,search,process,now=None):
             log(db,job['story_id'],job['job_id'],'SEARCH_FINISHED',{'query':query,'results':outcomes,'found':len(articles)},now)
         except Exception as exc:
             db.rollback()
+            from .runtime import BudgetDeferred
+            if isinstance(exc, BudgetDeferred):
+                db.execute('UPDATE story_monitoring_jobs SET next_check_at=?,last_checked_at=? WHERE job_id=?',
+                           (stamp(now+timedelta(seconds=exc.delay_seconds)),job['last_checked_at'],job['job_id']))
+                log(db,job['story_id'],job['job_id'],'SEARCH_DEFERRED',{'reason':exc.reason},now)
+                db.commit()
+                counts['DEFERRED']=counts.get('DEFERRED',0)+1
+                break
             log(db,job['story_id'],job['job_id'],'SEARCH_ERROR',{'error_code':type(exc).__name__},now)
             counts['ERROR']=counts.get('ERROR',0)+1
         db.commit()

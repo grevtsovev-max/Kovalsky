@@ -22,6 +22,8 @@ class IntakeBusyError(IntakeError):
 
 def submit_article_url(config: dict, url: str, *, retry_after_credits_restored: bool = False,
                        retry_after_validation_fix: bool = False) -> dict:
+    from .runtime import attach
+    attach(config)
     url = str(url or "").strip()
     if not url or len(url) > 2000:
         raise IntakeError("Вставьте ссылку на статью длиной до 2000 символов.")

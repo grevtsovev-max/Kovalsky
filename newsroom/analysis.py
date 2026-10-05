@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from .ai import get_api_key
+from .ai import get_api_key, request_response, AIResponseError
+from .runtime import BudgetDeferred
 from .db import connect
 
 SCHEMA = {
@@ -106,6 +107,8 @@ def generate_weekly_analysis(db_path: str, config: dict, now: datetime | None = 
         return None
     local_day = local_now.date().isoformat()
     db = connect(db_path)
+    from .runtime import attach
+    attach(config)
     attempt = db.execute("SELECT value FROM app_state WHERE key='weekly_analysis_last_attempt'").fetchone()
     if attempt and attempt["value"] == local_day:
         db.close()
@@ -155,12 +158,16 @@ def generate_weekly_analysis(db_path: str, config: dict, now: datetime | None = 
         ),
         "input": json.dumps({"published_stories": published_context, "read_primary_sources": evidence}, ensure_ascii=False),
         "text": {"format": {"type": "json_schema", "name": "weekly_analysis_draft", "strict": True, "schema": SCHEMA}}}
-    req = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(request, ensure_ascii=False).encode(),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=int(config.get("ai", {}).get("timeout_seconds", 45))) as response:
-            result = _response_text(json.loads(response.read()))
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError):
+        db.commit()
+        response = request_response(request, {**config.get('ai', {}), '_work_role': 'editor', '_work_category': 'background'})
+        result = _response_text(response)
+    except BudgetDeferred:
+        db.execute("DELETE FROM app_state WHERE key='weekly_analysis_last_attempt'")
+        db.execute("INSERT OR REPLACE INTO app_state(key,value) VALUES('weekly_analysis_last_status','BUDGET_DEFERRED')")
+        db.commit(); db.close()
+        return None
+    except (AIResponseError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError):
         db.execute("INSERT OR REPLACE INTO app_state(key,value) VALUES('weekly_analysis_last_status',?)", ("GENERATION_FAILED",))
         db.commit(); db.close()
         return None

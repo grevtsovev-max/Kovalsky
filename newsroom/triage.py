@@ -105,7 +105,7 @@ def classify(item, candidates, feedback, settings):
             'editor_feedback': [{**entry, 'content': entry['content'][:1000]} for entry in feedback[:24]]}, ensure_ascii=False)}],
         'text': {'format': {'type': 'json_schema', 'name': 'newsroom_preflight', 'strict': True, 'schema': SCHEMA}},
     }
-    result = request_response(payload, {**settings, 'timeout_seconds': min(20, int(settings.get('timeout_seconds', 45)))})
+    result = request_response(payload, {**settings, '_work_role': 'filter', 'timeout_seconds': min(20, int(settings.get('timeout_seconds', 45)))})
     if result.get('status') == 'incomplete':
         raise AIResponseError('TRIAGE_INCOMPLETE')
     decision = None
@@ -136,7 +136,18 @@ def classify(item, candidates, feedback, settings):
     return decision
 
 
-def screen(db, item_id, item, settings):
+def screen(db, item_id, item, settings, *, steps=False):
+    from .workflow import drive
+    generator = screen_steps(db, item_id, item, settings)
+    if steps:
+        return generator
+    return drive(generator, settings.get('_runtime'),
+                 {'item_id': item_id, 'category': settings.get('_work_category', 'fresh')})
+
+
+def screen_steps(db, item_id, item, settings):
+    from .workflow import Work
+    from .runtime import BudgetDeferred
     feedback = feedback_examples(db)
     # Exact editorial decisions are durable; changed text requires a fresh assessment.
     for example in feedback:
@@ -158,17 +169,27 @@ def screen(db, item_id, item, settings):
                 'retry_without_count': True}
     if settings.get('_triage_budget', 1) <= 0:
         return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен: исчерпан лимит проверок текущего цикла',
-                'retry_without_count': True}
+                'retry_without_count': True, 'budget_deferred': True}
     if '_triage_budget' in settings:
         settings['_triage_budget'] -= 1
     try:
-        result = classify(item, candidates, feedback, settings)
+        db.commit()
+        result = yield Work('filter', classify, (dict(item), candidates, feedback, dict(settings)))
+    except BudgetDeferred as exc:
+        return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен: исчерпан общий бюджет запросов',
+                'retry_without_count': True, 'budget_deferred': exc.reason != 'concurrency',
+                'retry_delay_seconds': exc.delay_seconds}
     except Exception as exc:
         settings['_triage_disabled'] = True
         code = exc.code if isinstance(exc, AIResponseError) else type(exc).__name__
         db.execute('INSERT INTO errors(timestamp,message) VALUES(?,?)', (datetime.now(timezone.utc).isoformat(), 'TRIAGE:'+code))
         return {'decision': 'DEFER', 'reason': f'Ранний отбор не завершён: {code}',
                 'retry_without_count': False}
+    current = _hash([VERSION, {key:item.get(key) for key in ('title','description','content')},
+                     published_candidates(db, item), feedback_examples(db)])
+    if current != fingerprint:
+        return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен: изменилась история публикаций',
+                'retry_without_count': True, 'history_changed': True}
     result = {**result, 'fingerprint': fingerprint, 'origin': 'ai'}
     save_state(db, 'triage:'+str(item_id), result)
     return result

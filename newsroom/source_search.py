@@ -45,10 +45,18 @@ def log(db,item_url,attempt,strategy,query,outcome,checked,revision_hash=''):
                (item_url,attempt,strategy,query,outcome,revision_hash,json.dumps(checked,ensure_ascii=False),datetime.now(timezone.utc).isoformat(timespec='seconds')))
 
 
-def recover(db,item,settings,news_search,web_search,terms,similarity):
+def recover(db,item,settings,news_search,web_search,terms,similarity, *, steps=False):
+    from .workflow import drive
+    generator = recover_steps(db,item,settings,news_search,web_search,terms,similarity)
+    return generator if steps else drive(generator, settings.get('_runtime'))
+
+
+def recover_steps(db,item,settings,news_search,web_search,terms,similarity):
+    from .workflow import Work
+    from .runtime import BudgetDeferred
     item.pop('_source_search_deferred',None)
     revision_hash=hashlib.sha256((str(item.get('title',''))+'\n'+str(item.get('content',''))).encode()).hexdigest()
-    prior=db.execute('SELECT MAX(attempt) FROM source_search_log WHERE item_url=? AND revision_hash=?',(item['url'],revision_hash)).fetchone()[0] or 0
+    prior=db.execute("SELECT MAX(attempt) FROM source_search_log WHERE item_url=? AND revision_hash=? AND outcome NOT IN ('STARTED','DEFERRED')",(item['url'],revision_hash)).fetchone()[0] or 0
     if prior>=3:
         return None
     if settings.get('_recovery_search_budget',0)<=0:
@@ -68,9 +76,15 @@ def recover(db,item,settings,news_search,web_search,terms,similarity):
     try:
         if attempt==1:
             url='https://news.google.com/rss/search?'+urllib.parse.urlencode({'q':query,'hl':'ru','gl':'RU','ceid':'RU:ru'})
-            found=news_search(url)
+            found=yield Work('collector', news_search, (url,))
         else:
-            found=web_search(query,settings)
+            found=yield Work('collector', web_search, (query,settings))
+    except BudgetDeferred:
+        item['_source_search_deferred']=True
+        item['_budget_deferred']=True
+        log(db,item['url'],attempt,strategy,query,'DEFERRED',[],revision_hash)
+        db.commit()
+        return None
     except Exception as exc:
         log(db,item['url'],attempt,strategy,query,'ERROR',[{'error_code':type(exc).__name__}],revision_hash)
         db.commit()

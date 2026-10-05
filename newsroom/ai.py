@@ -142,30 +142,66 @@ def request_response(payload, settings):
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     for attempt in range(2):
+        runtime = settings.get("_runtime")
+        call_id = runtime.reserve(payload, settings) if runtime else None
+        call_started = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=int(settings.get("timeout_seconds", 45)), context=ssl.create_default_context()) as response:
                 raw = response.read()
             try:
-                return json.loads(raw)
+                parsed = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise AIResponseError("INVALID_RESPONSE_JSON") from exc
+            if not isinstance(parsed, dict):
+                raise AIResponseError('INVALID_RESPONSE_JSON')
+            if runtime:
+                runtime.finish(call_id, parsed, time.perf_counter() - call_started)
+            return parsed
         except urllib.error.HTTPError as exc:
             code = safe_api_error(exc)
             status = exc.code
             if exc.fp is not None:
                 exc.close()
+            if runtime:
+                runtime.finish(call_id, None, time.perf_counter() - call_started, AIResponseError(code))
             if attempt == 0 and (status == 429 or 500 <= status <= 599):
                 time.sleep(0.5)
                 continue
             raise AIResponseError(code) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected, http.client.IncompleteRead) as exc:
             reason = getattr(exc, "reason", exc)
+            code = "TLS_CERTIFICATE_ERROR" if isinstance(reason, ssl.SSLCertVerificationError) else (
+                "NETWORK_TIMEOUT" if isinstance(reason, TimeoutError) else "NETWORK_CONNECTION_ERROR")
+            if runtime:
+                runtime.finish(call_id, None, time.perf_counter() - call_started, AIResponseError(code))
             if isinstance(reason, ssl.SSLCertVerificationError):
                 raise AIResponseError("TLS_CERTIFICATE_ERROR") from exc
             if attempt == 0:
                 time.sleep(0.5)
                 continue
             raise AIResponseError("NETWORK_TIMEOUT" if isinstance(reason, TimeoutError) else "NETWORK_CONNECTION_ERROR") from None
+        except Exception as exc:
+            if runtime:
+                runtime.finish(call_id, None, time.perf_counter() - call_started, exc)
+            raise
+
+
+def analysis_input(item, source, candidates, settings):
+    """Canonical model context, shared by the request and its validated cache."""
+    body = item.get("content") or item.get("description") or item.get("title", "")
+    return {
+        "source": {"name": source["name"], "reputation": source["reputation"], "priority": source["priority"],
+                   "source_role": source["source_role"] if "source_role" in source.keys() else "aggregator"},
+        "item": {"title": item.get("title"), "description": item.get("description"), "content": body[:12000],
+                 "url": item.get("url"), "published_at": item.get("published_at"), "updated_at": item.get("updated_at"),
+                 "primary_source": item.get("primary_source"), "primary_source_status": item.get("primary_source_status"),
+                 "publisher_report_exception": item.get("publisher_report_exception", False),
+                 "publisher_report": item.get("publisher_report"), "independent_sources": item.get("independent_sources", [])},
+        "editorial_examples": item.get("editorial_examples", []), "interest_profile": item.get("interest_profile", {}),
+        "editorial_feedback": item.get("editorial_feedback", []), "history_context": item.get("history_context", []),
+        "candidate_stories": candidates, "knowledge_context": item.get("knowledge_context", []),
+        "max_post_length": int(settings.get("max_post_length", 3500)),
+    }
 
 
 def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) -> dict | None:
@@ -173,7 +209,6 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
     if not api_key:
         return None
     model = settings.get("model", "gpt-6-luna")
-    body = item.get("content") or item.get("description") or item.get("title", "")
     request_data = {
         "model": model,
         "store": False,
@@ -323,24 +358,7 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
         ) + "\n\n" + _load_editorial_rules(),
         "input": [{
             "role": "user",
-            "content": json.dumps({
-                "source": {"name": source["name"], "reputation": source["reputation"], "priority": source["priority"],
-                           "source_role": source["source_role"] if "source_role" in source.keys() else "aggregator"},
-                "item": {"title": item.get("title"), "description": item.get("description"), "content": body[:12000],
-                         "url": item.get("url"), "published_at": item.get("published_at"), "updated_at": item.get("updated_at"),
-                         "primary_source": item.get("primary_source"),
-                         "primary_source_status": item.get("primary_source_status"),
-                         "publisher_report_exception": item.get("publisher_report_exception", False),
-                         "publisher_report": item.get("publisher_report"),
-                         "independent_sources": item.get("independent_sources", [])},
-                "editorial_examples": item.get("editorial_examples", []),
-                "interest_profile": item.get("interest_profile", {}),
-                "editorial_feedback": item.get("editorial_feedback", []),
-                "history_context": item.get("history_context", []),
-                "candidate_stories": candidates,
-                "knowledge_context": item.get("knowledge_context", []),
-                "max_post_length": int(settings.get("max_post_length", 3500))
-            }, ensure_ascii=False)
+            "content": json.dumps(analysis_input(item, source, candidates, settings), ensure_ascii=False)
         }],
         "text": {"format": {"type": "json_schema", "name": "newsroom_editor_decision", "strict": True, "schema": SCHEMA}}
     }
@@ -353,7 +371,7 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
         request_data['text']['format']['schema'] = schema
         request_data['instructions'] += '\n\n' + INSTRUCTIONS
         request_data['max_output_tokens'] = max(5000, request_data['max_output_tokens'])
-    result = request_response(request_data, settings)
+    result = request_response(request_data, {**settings, '_work_role': 'editor'})
 
     if result.get("status") == "incomplete":
         details = result.get("incomplete_details") or {}
@@ -470,7 +488,7 @@ def correct_published_post(current_text: str, feedback: str, item: dict,
         "text": {"format": {"type": "json_schema", "name": "published_post_correction",
                              "strict": True, "schema": FEEDBACK_CORRECTION_SCHEMA}},
     }
-    result = request_response(payload, settings)
+    result = request_response(payload, {**settings, '_work_role': 'editor', '_work_category': 'correction'})
     if result.get("status") == "incomplete":
         raise AIResponseError("CORRECTION_OUTPUT_INCOMPLETE")
     for output in result.get("output", []):

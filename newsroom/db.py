@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS items (
   published_at TEXT, updated_at TEXT, discovered_at TEXT NOT NULL, processed_at TEXT,
   content_hash TEXT NOT NULL, title_hash TEXT NOT NULL,
   feed_content_hash TEXT NOT NULL DEFAULT '',
+  ingest_revision TEXT NOT NULL DEFAULT '',
   disposition TEXT NOT NULL DEFAULT 'PENDING', story_id INTEGER,
   primary_source_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE(source_id, canonical_url), UNIQUE(source_id, content_hash)
@@ -124,6 +125,7 @@ CREATE TABLE IF NOT EXISTS telegram_feedback_corrections (
   owner_chat_id TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'QUEUED',
   attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
   result_code TEXT,
   result_summary TEXT,
   previous_text TEXT,
@@ -233,6 +235,17 @@ def connect(path: str) -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    from .runtime import SCHEMA as RUNTIME_SCHEMA
+    from .workflow import SCHEMA as WORKFLOW_SCHEMA
+    db.executescript(RUNTIME_SCHEMA)
+    runtime_columns = {row[1] for row in db.execute('PRAGMA table_info(api_usage)')}
+    for name, declaration in (('lease_until', 'TEXT'), ('search_requested', 'INTEGER NOT NULL DEFAULT 0')):
+        if name not in runtime_columns:
+            db.execute(f'ALTER TABLE api_usage ADD COLUMN {name} {declaration}')
+    db.executescript(WORKFLOW_SCHEMA)
+    correction_columns = {row[1] for row in db.execute('PRAGMA table_info(telegram_feedback_corrections)')}
+    if 'next_attempt_at' not in correction_columns:
+        db.execute('ALTER TABLE telegram_feedback_corrections ADD COLUMN next_attempt_at TEXT')
     from .delivery import SCHEMA as DELIVERY_SCHEMA
     db.executescript(DELIVERY_SCHEMA)
     from .decisions import SCHEMA as DECISION_SCHEMA
@@ -251,6 +264,8 @@ def connect(path: str) -> sqlite3.Connection:
     item_columns = {row[1] for row in db.execute("PRAGMA table_info(items)")}
     if "feed_content_hash" not in item_columns:
         db.execute("ALTER TABLE items ADD COLUMN feed_content_hash TEXT NOT NULL DEFAULT ''")
+    if 'ingest_revision' not in item_columns:
+        db.execute("ALTER TABLE items ADD COLUMN ingest_revision TEXT NOT NULL DEFAULT ''")
     edit_columns = {row[1] for row in db.execute("PRAGMA table_info(telegram_post_edits)")}
     for name, declaration in (("capture_source", "TEXT NOT NULL DEFAULT 'TELEGRAM_UPDATE'"), ("source_url", "TEXT")):
         if name not in edit_columns:

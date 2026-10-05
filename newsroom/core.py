@@ -1616,14 +1616,20 @@ class _WebSearchQuota:
         return fetch_web_search(query, ai_settings)
 
 
-def _recover_primary(db, item, settings):
+def _recover_primary(db, item, settings, *, steps=False):
     """Source recovery candidates still pass the normal factual/editorial gates."""
     from .source_search import recover
     return recover(db, item, settings, fetch_google_news,
-                   settings.get("_web_search_quota") or fetch_web_search, terms, similarity)
+                   settings.get("_web_search_quota") or fetch_web_search, terms, similarity, steps=steps)
 
 
-def _agent_recover_primary(db, item, settings, source, item_id=None):
+def _agent_recover_primary(db, item, settings, source, item_id=None, *, steps=False):
+    from .workflow import drive
+    generator = _agent_recover_steps(db, item, settings, source, item_id)
+    return generator if steps else drive(generator, settings.get('_runtime'))
+
+
+def _agent_recover_steps(db, item, settings, source, item_id=None):
     """Let the bounded research agent choose a recovery step for unreadable news.
 
     Search results are not evidence until their publisher page is read. The
@@ -1631,6 +1637,8 @@ def _agent_recover_primary(db, item, settings, source, item_id=None):
     ordinary editor and publication gates remain authoritative.
     """
     from .agent import run_research_agent
+    from .workflow import Work, resolve_steps
+    from .runtime import BudgetDeferred
 
     quota = settings.get("_web_search_quota")
     searched: dict[str, dict] = {}
@@ -1639,7 +1647,7 @@ def _agent_recover_primary(db, item, settings, source, item_id=None):
 
     def search(args):
         revision_hash = digest(str(item.get("title", "")) + "\n" + str(item.get("content", "")))
-        prior = db.execute("SELECT MAX(attempt) FROM source_search_log WHERE item_url=? AND revision_hash=?",
+        prior = db.execute("SELECT MAX(attempt) FROM source_search_log WHERE item_url=? AND revision_hash=? AND outcome NOT IN ('STARTED','DEFERRED')",
                            (item["url"], revision_hash)).fetchone()[0] or 0
         if prior >= 3:
             return {"status": "BUDGET_LIMIT", "results": []}
@@ -1652,9 +1660,16 @@ def _agent_recover_primary(db, item, settings, source, item_id=None):
         attempt = prior + 1
         from .source_search import log as log_source_search
         try:
-            results = fetch_web_search(
-                args["query"], {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))},
-                max_results=3, page_timeout=8)
+            db.commit()
+            results = yield Work('collector', fetch_web_search,
+                (args["query"], {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))}),
+                {"max_results": 3, "page_timeout": 8})
+        except BudgetDeferred:
+            item['_source_search_deferred'] = True
+            item['_budget_deferred'] = True
+            log_source_search(db, item['url'], attempt, 'AGENT_SEARCH_WEB', args['query'], 'DEFERRED', [], revision_hash)
+            db.commit()
+            raise
         except Exception as exc:
             log_source_search(db, item["url"], attempt, "AGENT_SEARCH_WEB", args["query"],
                               "ERROR", [{"error_code": type(exc).__name__}], revision_hash)
@@ -1688,11 +1703,10 @@ def _agent_recover_primary(db, item, settings, source, item_id=None):
         if result.get("material_read") is not True or len(content.strip()) < 100:
             parsed = urllib.parse.urlsplit(url)
             try:
-                article = fetch_publisher_article(
-                    url, result.get("publisher_name") or parsed.hostname or "Издание",
-                    result.get("published_at"), discover_primary=True,
-                    timeout=8, public_only=True,
-                )
+                db.commit()
+                article = yield Work('collector', fetch_publisher_article,
+                    (url, result.get("publisher_name") or parsed.hostname or "Издание", result.get("published_at")),
+                    {'discover_primary': True, 'timeout': 8, 'public_only': True})
                 content = str(article.get("content") or "")
             except Exception as exc:
                 code = _safe_source_error(exc)
@@ -1778,7 +1792,7 @@ def _agent_recover_primary(db, item, settings, source, item_id=None):
                     tool_seconds=event.get("tool_seconds"))
 
     try:
-        result = run_research_agent(
+        result = yield from resolve_steps(run_research_agent(
             {"title": item.get("title", ""), "description": item.get("description", "")[:1500],
              "source": source["name"], "source_url": item.get("url", ""),
              "published_at": item.get("published_at"), "read_text": str(item.get("content") or "")[:3000],
@@ -1786,7 +1800,11 @@ def _agent_recover_primary(db, item, settings, source, item_id=None):
             {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))},
             {"search_web": search, "read_url": read_url, "check_story_history": check_history},
             max_steps=int(settings.get("research_agent_max_steps", 4)), execute_tools=True,
-            on_event=record_agent_event)
+            on_event=record_agent_event, steps=True))
+    except BudgetDeferred:
+        item['_source_search_deferred'] = True
+        item['_budget_deferred'] = True
+        return None
     except Exception as exc:
         _trace_item(item, "Исследователь", "Ошибка", type(exc).__name__)
         return None
@@ -1819,11 +1837,18 @@ def _agent_recover_primary(db, item, settings, source, item_id=None):
             "published_at": material.get("published_at")}
 
 
-def _shadow_research_agent(item, settings, source):
+def _shadow_research_agent(item, settings, source, *, steps=False):
+    from .workflow import drive
+    generator = _shadow_research_steps(item, settings, source)
+    return generator if steps else drive(generator, settings.get('_runtime'))
+
+
+def _shadow_research_steps(item, settings, source):
     """Record one proposed recovery action without invoking its tool."""
     from .agent import run_research_agent
+    from .workflow import resolve_steps
     try:
-        return run_research_agent(
+        return (yield from resolve_steps(run_research_agent(
             {"title": item.get("title", ""), "description": item.get("description", "")[:1500],
              "source": source["name"], "source_url": item.get("url", ""),
              "published_at": item.get("published_at"), "read_text": str(item.get("content") or "")[:3000],
@@ -1832,7 +1857,7 @@ def _shadow_research_agent(item, settings, source):
             {}, max_steps=1, execute_tools=False,
             on_event=lambda event: _trace_item(item, "Исследователь · тень", event.get("status", "ШАГ"),
                                                 event.get("tool", ""), tool=event.get("tool"),
-                                                step=event.get("step")))
+                                                step=event.get("step")), steps=True)))
     except Exception as exc:
         _trace_item(item, "Исследователь · тень", "Ошибка", type(exc).__name__)
         return None
@@ -1945,7 +1970,125 @@ def _trace_item(item: dict, stage: str, outcome: str, reason: str, **details) ->
     trace.append(event)
 
 
+def _read_material_work(item, source, publisher_name):
+    import copy
+    local = copy.deepcopy(item)
+    body = (_read_telegram_primary(local, source) if source["type"] == "telegram"
+            else _read_feed_article(local, publisher_name))
+    return {"body": body, "item": local}
+
+
+def _editor_history_revision(db, item):
+    from .runtime import cache_key
+    # Include feedback and publication changes, including edits, which can
+    # invalidate a decision even when no new story has appeared.
+    candidate = " ".join(str(item.get(key) or "") for key in ("title", "description", "content"))
+    related = [dict(row) for row in db.execute("SELECT * FROM stories")
+               if similarity(candidate, row['canonical_topic'] + ' ' + row['headline'] + ' ' + row['latest_information']) >= .12]
+    ids = [row['story_id'] for row in related]
+    snapshots = {"stories": related,
+                 'story_registry': [tuple(row) for row in db.execute(
+                     'SELECT story_id,version,publication_count,last_updated_at,last_published_at FROM stories ORDER BY story_id')],
+                 'publication_registry': [tuple(row) for row in db.execute(
+                     'SELECT post_id,status,post_hash FROM posts ORDER BY post_id')]}
+    for table in ("posts", "story_facts", "publication_coverage"):
+        marks = ','.join('?' for _ in ids) or 'NULL'
+        snapshots[table] = [tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE story_id IN ({marks})", ids)]
+    snapshots['feedback'] = [tuple(row) for row in db.execute(
+        "SELECT feedback_id,feedback_type,reason,item_title,post_text,item_id,story_id FROM editorial_feedback ORDER BY feedback_id DESC LIMIT 400")]
+    return cache_key("editor-history", snapshots)
+
+
+def _save_item(db, source, item, existing_item_id=None):
+    """Persist discovery before any costly work; keep feed and read text distinct."""
+    now = NOW()
+    from .runtime import cache_key
+    ingest_revision = cache_key('material-version', {key: item.get(key) for key in (
+        'url', 'title', 'description', 'content', 'author', 'published_at', 'updated_at')})
+    canonical = canonicalize(item["url"])
+    body = item.get("content") or item.get("description") or item["title"]
+    content_hash, title_hash = digest(body), digest(item["title"].lower().strip())
+    feed_content_hash = digest(" ".join(str(body).split()))
+    try:
+        source_status = item.get("primary_source_status") or "NOT_CHECKED"
+        primary_source = _primary_source_from_item(item, source_status)
+        if existing_item_id is None:
+            try:
+                cur = db.execute("""INSERT INTO items(source_id,url,canonical_url,title,description,content,author,published_at,updated_at,
+                  discovered_at,content_hash,title_hash,feed_content_hash,primary_source_json,ingest_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (source["source_id"], item["url"], canonical, item["title"], item.get("description", ""),
+                   item.get("content", ""), item.get("author"), item.get("published_at"), item.get("updated_at"),
+                   now, content_hash, title_hash, feed_content_hash,
+                   _stored_primary(item, primary_source, source_status), ingest_revision))
+                item_id = cur.lastrowid
+            except Exception as exc:
+                if "UNIQUE" not in str(exc):
+                    raise
+                prior = db.execute("SELECT * FROM items WHERE source_id=? AND canonical_url=?",
+                                   (source["source_id"], canonical)).fetchone()
+                if prior is None:
+                    return None
+                if db.execute("SELECT 1 FROM items WHERE source_id=? AND content_hash=? AND item_id<>?",
+                              (source["source_id"], content_hash, prior["item_id"])).fetchone():
+                    return None
+                same_metadata = (prior["title_hash"] == title_hash
+                                 and prior["description"] == item.get("description", "")
+                                 and prior["author"] == item.get("author")
+                                 and prior["published_at"] == item.get("published_at")
+                                 and prior["updated_at"] == item.get("updated_at"))
+                stored_feed_hash = prior["feed_content_hash"] if "feed_content_hash" in prior.keys() else ""
+                # `items.content` is enriched with fetched article text. Compare a
+                # feed poll to its own last-seen body so enrichment cannot reset retries.
+                unchanged = same_metadata and (not stored_feed_hash or stored_feed_hash == feed_content_hash)
+                if unchanged:
+                    if not stored_feed_hash:
+                        db.execute("UPDATE items SET feed_content_hash=? WHERE item_id=?",
+                                   (feed_content_hash, prior["item_id"]))
+                        db.commit()
+                    return None
+                item_id = prior["item_id"]
+                _archive_item_revision(db, item_id, prior)
+                db.execute("""UPDATE items SET url=?,title=?,description=?,content=?,author=?,published_at=?,updated_at=?,
+                              content_hash=?,title_hash=?,feed_content_hash=?,primary_source_json=?,disposition='PENDING',processed_at=NULL
+                              ,ingest_revision=? WHERE item_id=?""",
+                           (item["url"], item["title"], item.get("description", ""), body, item.get("author"),
+                            item.get("published_at"), item.get("updated_at"), content_hash, title_hash,
+                            feed_content_hash, _stored_primary(item, primary_source, source_status), ingest_revision, item_id))
+                db.execute("DELETE FROM item_analysis WHERE item_id=?", (item_id,))
+                db.executemany("DELETE FROM app_state WHERE key=?", [(f"triage:{item_id}",),
+                                 (f"selection_retry:{item_id}",), (f"editor_retry:{item_id}",)])
+        else:
+            item_id = existing_item_id
+            prior = db.execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
+            if prior and (prior["content_hash"] != content_hash or prior["title_hash"] != title_hash
+                          or prior["published_at"] != item.get("published_at")
+                          or prior["updated_at"] != item.get("updated_at")):
+                _archive_item_revision(db, item_id, prior)
+            db.execute("""UPDATE items SET title=?,description=?,content=?,author=?,published_at=?,updated_at=?,
+                          content_hash=?,title_hash=?,primary_source_json=?
+                          WHERE item_id=?""",
+                       (item['title'], item.get('description', ''), body, item.get('author'),
+                        item.get('published_at'), item.get('updated_at'), content_hash, title_hash,
+                        _stored_primary(item, primary_source, source_status), item_id))
+    except Exception as exc:
+        if "UNIQUE" in str(exc):
+            return None
+        raise
+    return item_id
+
+
 def process_item(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
+                 initial_backfill_minutes: int | None = None, relevance_terms: list[str] | None = None,
+                 ai_settings: dict | None = None, existing_item_id: int | None = None,
+                 post_ready_callback=None) -> str:
+    from .workflow import drive
+    return drive(process_item_steps(db, source, item, threshold, max_length, freshness_hours,
+        initial_backfill_minutes, relevance_terms, ai_settings, existing_item_id, post_ready_callback),
+        (ai_settings or {}).get("_runtime"), {"item_id": existing_item_id,
+        "category": (ai_settings or {}).get("_work_category", "fresh")})
+
+
+def process_item_steps(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
                  initial_backfill_minutes: int | None = None, relevance_terms: list[str] | None = None,
                  ai_settings: dict | None = None, existing_item_id: int | None = None,
                  post_ready_callback=None) -> str:
@@ -1954,8 +2097,9 @@ def process_item(db, source, item: dict, threshold: float, max_length: int, fres
     started = time.perf_counter()
     post_ids_ready = []
     post_ready_item_id = None
+    outcome = "INTERRUPTED"
     try:
-        outcome = _process_item(db, source, item, threshold, max_length, freshness_hours,
+        outcome = yield from _process_item_steps(db, source, item, threshold, max_length, freshness_hours,
                                 initial_backfill_minutes, relevance_terms, ai_settings, timings, existing_item_id)
         row = db.execute("SELECT item_id,disposition FROM items WHERE source_id=? AND canonical_url=?",
                          (source["source_id"], canonicalize(item["url"]))).fetchone()
@@ -1964,9 +2108,9 @@ def process_item(db, source, item: dict, threshold: float, max_length: int, fres
                 retry_without_count = bool(item.get("_retry_without_count") or item.get("_source_search_deferred"))
                 attempts = schedule_retry(
                     db, row["item_id"], outcome,
-                    retry=existing_item_id is not None and not retry_without_count,
+                    retry=existing_item_id is not None and not item.get('_workflow_first_attempt') and not retry_without_count,
                     reason=item.get("_retry_reason"),
-                    delay_seconds=(ai_settings or {}).get("_retry_cycle_delay_seconds") if retry_without_count else None,
+                    delay_seconds=item.get('_retry_delay_seconds', (ai_settings or {}).get("_retry_cycle_delay_seconds")) if retry_without_count else None,
                 )
                 if attempts >= MAX_AUTOMATIC_RETRIES:
                     exhausted_reason = (f"Исчерпан лимит: {attempts} автоматических повторных проверок; "
@@ -2076,10 +2220,12 @@ def _read_material_report(source, item: dict, body: str) -> dict | None:
             "priority": int(source["priority"]), "reputation": source["reputation"]}
 
 
-def _process_item(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
+def _process_item_steps(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
                   initial_backfill_minutes: int | None, relevance_terms: list[str] | None,
                   ai_settings: dict | None, timings: dict[str, float], existing_item_id: int | None = None) -> str:
     now = NOW()
+    from .workflow import Work, resolve_steps
+    from .runtime import BudgetDeferred, cache_key
     memory_mode = (ai_settings or {}).get("memory_mode", "off")
     memory_enforced = memory_mode == "enforce"
     publisher_name = item.get("publisher_name") or source["name"]
@@ -2089,75 +2235,14 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             and source["reputation"] == "reputable_media"
             and (source["source_role"] if "source_role" in source.keys() else "aggregator") == "publisher"):
         editor_source["reputation"] = "unknown"
-    canonical = canonicalize(item["url"])
     body = item.get("content") or item.get("description") or item["title"]
     content_hash, title_hash = digest(body), digest(item["title"].lower().strip())
-    feed_content_hash = digest(" ".join(str(body).split()))
-    try:
-        source_status = item.get("primary_source_status") or "NOT_CHECKED"
-        primary_source = _primary_source_from_item(item, source_status)
-        if existing_item_id is None:
-            try:
-                cur = db.execute("""INSERT INTO items(source_id,url,canonical_url,title,description,content,author,published_at,updated_at,
-                  discovered_at,content_hash,title_hash,feed_content_hash,primary_source_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (source["source_id"], item["url"], canonical, item["title"], item.get("description", ""),
-                   item.get("content", ""), item.get("author"), item.get("published_at"), item.get("updated_at"),
-                   now, content_hash, title_hash, feed_content_hash,
-                   _stored_primary(item, primary_source, source_status)))
-                item_id = cur.lastrowid
-            except Exception as exc:
-                if "UNIQUE" not in str(exc):
-                    raise
-                prior = db.execute("SELECT * FROM items WHERE source_id=? AND canonical_url=?",
-                                   (source["source_id"], canonical)).fetchone()
-                if prior is None:
-                    return "DUPLICATE"
-                if db.execute("SELECT 1 FROM items WHERE source_id=? AND content_hash=? AND item_id<>?",
-                              (source["source_id"], content_hash, prior["item_id"])).fetchone():
-                    return "DUPLICATE"
-                same_metadata = (prior["title_hash"] == title_hash
-                                 and prior["description"] == item.get("description", "")
-                                 and prior["author"] == item.get("author")
-                                 and prior["published_at"] == item.get("published_at")
-                                 and prior["updated_at"] == item.get("updated_at"))
-                stored_feed_hash = prior["feed_content_hash"] if "feed_content_hash" in prior.keys() else ""
-                # `items.content` is enriched with fetched article text. Compare a
-                # feed poll to its own last-seen body so enrichment cannot reset retries.
-                unchanged = same_metadata and (not stored_feed_hash or stored_feed_hash == feed_content_hash)
-                if unchanged:
-                    if not stored_feed_hash:
-                        db.execute("UPDATE items SET feed_content_hash=? WHERE item_id=?",
-                                   (feed_content_hash, prior["item_id"]))
-                        db.commit()
-                    return "DUPLICATE"
-                item_id = prior["item_id"]
-                _archive_item_revision(db, item_id, prior)
-                db.execute("""UPDATE items SET url=?,title=?,description=?,content=?,author=?,published_at=?,updated_at=?,
-                              content_hash=?,title_hash=?,feed_content_hash=?,primary_source_json=?,disposition='PENDING',processed_at=NULL
-                              WHERE item_id=?""",
-                           (item["url"], item["title"], item.get("description", ""), body, item.get("author"),
-                            item.get("published_at"), item.get("updated_at"), content_hash, title_hash,
-                            feed_content_hash, _stored_primary(item, primary_source, source_status), item_id))
-                db.execute("DELETE FROM item_analysis WHERE item_id=?", (item_id,))
-                db.executemany("DELETE FROM app_state WHERE key=?", [(f"triage:{item_id}",),
-                                 (f"selection_retry:{item_id}",), (f"editor_retry:{item_id}",)])
-        else:
-            item_id = existing_item_id
-            prior = db.execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
-            if prior and (prior["content_hash"] != content_hash or prior["title_hash"] != title_hash
-                          or prior["published_at"] != item.get("published_at")
-                          or prior["updated_at"] != item.get("updated_at")):
-                _archive_item_revision(db, item_id, prior)
-            db.execute("""UPDATE items SET title=?,description=?,content=?,author=?,published_at=?,updated_at=?,
-                          content_hash=?,title_hash=?,primary_source_json=?
-                          WHERE item_id=?""",
-                       (item['title'], item.get('description', ''), body, item.get('author'),
-                        item.get('published_at'), item.get('updated_at'), content_hash, title_hash,
-                        _stored_primary(item, primary_source, source_status), item_id))
-    except Exception as exc:
-        if "UNIQUE" in str(exc):
-            return "DUPLICATE"
-        raise
+    source_status = item.get("primary_source_status") or "NOT_CHECKED"
+    primary_source = _primary_source_from_item(item, source_status)
+    item_id = _save_item(db, source, item, existing_item_id)
+    if item_id is None:
+        return "DUPLICATE"
+    db.commit()
     if is_non_news_telegram_format(source, item):
         _trace_item(item, "Формат материала", "Отсеян", "Сообщение не является новостной публикацией.")
         db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
@@ -2199,7 +2284,7 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
     selection = None
     if ai_settings and ai_settings.get("triage_enabled"):
         stage_started = time.perf_counter()
-        selection = screen_item(db, item_id, item, ai_settings)
+        selection = yield from resolve_steps(screen_item(db, item_id, item, ai_settings, steps=True))
         timings["ai_seconds"] += time.perf_counter() - stage_started
         decision = selection["decision"]
         item["_audit_triage"] = {key: selection.get(key) for key in
@@ -2211,6 +2296,10 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             outcome = "AI_RETRY" if decision == "DEFER" else decision
             if decision == "DEFER":
                 item["_retry_without_count"] = bool(selection.get("retry_without_count"))
+                item['_budget_deferred'] = bool(selection.get('budget_deferred'))
+                item['_history_changed'] = bool(selection.get('history_changed'))
+                if selection.get('retry_delay_seconds'):
+                    item['_retry_delay_seconds'] = selection['retry_delay_seconds']
                 item["_retry_reason"] = selection.get("reason")
             story_id = int(selection["story_id"]) if decision == "DUPLICATE" else None
             db.execute("UPDATE items SET disposition=?,story_id=?,processed_at=? WHERE item_id=?",
@@ -2219,8 +2308,14 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             return outcome
     if source["type"] in {"rss", "web", "google_news", "web_search", "x", "telegram"} and item.get("primary_source_status") is None:
         stage_started = time.perf_counter()
-        body = (_read_telegram_primary(item, source) if source["type"] == "telegram"
-                else _read_feed_article(item, publisher_name))
+        db.commit()
+        read_key = cache_key("read", {"item": {key: value for key, value in item.items() if not key.startswith('_')},
+                                     "source": {key: dict(source).get(key) for key in ('name','type','source_role','priority','reputation')},
+                                     "reader_version": 1})
+        read = yield Work("collector", _read_material_work, (dict(item), dict(source), publisher_name),
+                          key=read_key, ttl=180)
+        body = read["body"]
+        item.update(read["item"])
         timings["primary_source_read_seconds"] += time.perf_counter() - stage_started
         source_status = item.get("primary_source_status", "ARTICLE_UNREADABLE")
         primary_source = _primary_source_from_item(item, source_status)
@@ -2246,13 +2341,13 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             ai_settings["_research_agent_budget"] -= 1
             agent_started = time.perf_counter()
             if agent_mode == "active":
-                recovered = _agent_recover_primary(db, item, ai_settings, source, item_id)
+                recovered = yield from resolve_steps(_agent_recover_primary(db, item, ai_settings, source, item_id, steps=True))
             else:
-                _shadow_research_agent(item, ai_settings, source)
-                recovered = _recover_primary(db, item, ai_settings)
+                yield from resolve_steps(_shadow_research_agent(item, ai_settings, source, steps=True))
+                recovered = yield from resolve_steps(_recover_primary(db, item, ai_settings, steps=True))
             timings["research_agent_seconds"] += time.perf_counter() - agent_started
         else:
-            recovered = _recover_primary(db, item, ai_settings)
+            recovered = yield from resolve_steps(_recover_primary(db, item, ai_settings, steps=True))
         if recovered:
             recovered_status = recovered.get("primary_source_status") or "NOT_CHECKED"
             if (recovered_status == "READ" and recovered.get("primary_source_url")
@@ -2273,6 +2368,13 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
                     "source_role": source["source_role"] if "source_role" in source.keys() else "aggregator",
                     "forwarded": False,
                 }
+                # Preserve the actual recovered account for a resumed editor;
+                # another retry must not discard already-read evidence.
+                body = recovered['content']
+                item.update(content=body, material_read=True, material_url=recovered['url'],
+                            publisher_name=publisher_report['publisher'])
+                db.execute('UPDATE items SET content=?,content_hash=?,primary_source_json=? WHERE item_id=?',
+                           (body, digest(body), _stored_primary(item, primary_source, source_status), item_id))
             _trace_item(item, "Резервный поиск источника",
                         "Первоисточник прочитан" if primary_source and source_status == "READ" else "Прочитан материал другого СМИ",
                         "Найденный полный текст передан на обычную проверку с сохранением ссылки и атрибуции.",
@@ -2336,21 +2438,51 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             ai_input["editorial_examples"] = _editorial_examples(
                 db, item, item_id, story_id=best["story_id"] if best else None)
             previous_analysis = db.execute("SELECT result_json FROM item_analysis WHERE item_id=?", (item_id,)).fetchone()
+            ai_input['editorial_feedback'] = []
             if previous_analysis:
                 previous_result = json.loads(previous_analysis["result_json"])
                 ai_input["editorial_feedback"] = previous_result.get("editorial_issues", []) + previous_result.get("memory_issues", [])
             stage_started = time.perf_counter()
+            history_revision = _editor_history_revision(db, item)
+            rules = (Path(__file__).resolve().parent.parent / "EDITORIAL_RULES.md").read_text()
+            logic = (Path(__file__).resolve().parent.parent / "AGENT_LOGIC.md").read_text()
+            semantic_settings = {key: value for key, value in ai_options.items()
+                                 if key in {"model", "max_output_tokens", "max_post_length", "memory_mode"}}
+            from .ai import analysis_input
+            analysis_key = cache_key("editor", {"input": analysis_input(ai_input, editor_source, ai_candidates, ai_options),
+                "settings": semantic_settings,
+                "rules": digest(rules), "logic": digest(logic), "filter_version": FILTER_VERSION,
+                "prompt_code": digest((Path(__file__).resolve().parent / 'ai.py').read_text()
+                                      + (Path(__file__).resolve().parent / 'knowledge.py').read_text()),
+                "date": now[:10]})
+            db.commit()
             try:
                 try:
-                    ai_result = analyze_with_ai(ai_input, editor_source, ai_candidates, ai_options)
+                    ai_result = yield Work("editor", analyze_with_ai, (ai_input, editor_source, ai_candidates, ai_options),
+                                           key=analysis_key, ttl=21600)
                 except AIResponseError as exc:
                     if exc.code != "OUTPUT_TOKEN_LIMIT":
                         raise
                     retry_options = dict(ai_options)
                     retry_options["max_output_tokens"] = max(8000, int(ai_options.get("max_output_tokens", 1800)) * 3)
-                    ai_result = analyze_with_ai(ai_input, editor_source, ai_candidates, retry_options)
+                    ai_result = yield Work("editor", analyze_with_ai, (ai_input, editor_source, ai_candidates, retry_options),
+                                           key=analysis_key, ttl=21600)
             finally:
                 timings["ai_seconds"] += time.perf_counter() - stage_started
+            if (ai_result is not None and ai_result.get('action') != 'NOISE'
+                    and _editor_history_revision(db, item) != history_revision):
+                item["_retry_without_count"] = True
+                item['_history_changed'] = True
+                item["_retry_reason"] = "Разбор отложен: история сюжета или публикаций изменилась во время анализа"
+                db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
+                db.commit()
+                return "AI_RETRY"
+        except BudgetDeferred as exc:
+            item["_retry_without_count"] = True
+            item['_budget_deferred'] = exc.reason != 'concurrency'
+            item['_retry_delay_seconds'] = exc.delay_seconds
+            item["_retry_reason"] = "ИИ-разбор отложен: исчерпан общий бюджет запросов"
+            ai_result = None
         except Exception as exc:
             http_status = re.search(r"HTTP (\d{3})", str(exc))
             if http_status:
@@ -2444,6 +2576,7 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
             elif ai_settings.get("_analysis_budget", 1) <= 0:
                 item["_retry_reason"] = "ИИ-разбор отложен: исчерпан лимит проверок текущего цикла"
                 item["_retry_without_count"] = True
+                item['_budget_deferred'] = True
             else:
                 item["_retry_reason"] = "ИИ-разбор отложен: проверьте настройки доступа модели"
                 item["_retry_without_count"] = True
@@ -2774,7 +2907,34 @@ def _process_item(db, source, item: dict, threshold: float, max_length: int, fre
     return status
 
 
-def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limit: int = 20) -> dict[str, int]:
+def _saved_material(row, source):
+    try:
+        primary = json.loads(row["primary_source_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        primary = {}
+    item = {key: row[key] for key in ("url", "title", "description", "content", "author", "published_at", "updated_at")}
+    item["material_read"] = primary.get("_material_read") is True
+    item["material_url"] = primary.get("_material_url", row["url"])
+    if primary.get("_material_publisher"):
+        item["publisher_name"] = primary["_material_publisher"]
+    if source["type"] == "manual" and item["material_read"]:
+        item["screening_excerpt"] = str(item.get("content") or "")[:2200]
+    if "_discovery_links" in primary:
+        item["discovery_links"] = primary["_discovery_links"]
+        item["telegram_forwarded"] = primary.get("_telegram_forwarded", False)
+    retry_primary = primary.get("status") != "READ" and not item["material_read"]
+    item.update({
+        "primary_source_url": None if retry_primary else primary.get("url"),
+        "primary_source_title": None if retry_primary else primary.get("title"),
+        "primary_source_content": "" if retry_primary else primary.get("content", ""),
+        "primary_source_type": None if retry_primary else primary.get("type"),
+        "primary_source_publisher": None if retry_primary else primary.get("publisher"),
+        "primary_source_status": None if retry_primary else primary.get("status", "NOT_CHECKED"),
+    })
+    return item
+
+
+def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limit: int = 20, coordinator=None) -> dict[str, int]:
     counts: dict[str, int] = {}
     if not source_by_id or limit <= 0:
         return counts
@@ -2799,6 +2959,7 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
         "AND julianday(processed_at)<julianday('now','-5 minutes') "
         "AND COALESCE((SELECT CAST(value AS INTEGER) FROM app_state WHERE key='editor_retry:'||items.item_id),0)<3)) "
         f"AND source_id IN ({placeholders}) {due_filter} "
+        "AND NOT EXISTS(SELECT 1 FROM processing_jobs j WHERE j.item_id=items.item_id AND j.status IN ('PENDING','WAITING','RUNNING')) "
         "ORDER BY COALESCE(processed_at, discovered_at), discovered_at, item_id LIMIT ?",
         (*source_by_id, limit),
     ).fetchall()
@@ -2806,31 +2967,18 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
         source = source_by_id.get(row["source_id"])
         if not source:
             continue
-        try:
-            primary = json.loads(row["primary_source_json"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            primary = {}
-        item = {key: row[key] for key in ("url", "title", "description", "content", "author", "published_at", "updated_at")}
-        item["material_read"] = primary.get("_material_read") is True
-        item["material_url"] = primary.get("_material_url", row["url"])
-        if primary.get("_material_publisher"):
-            item["publisher_name"] = primary["_material_publisher"]
-        if source["type"] == "manual" and item["material_read"]:
-            item["screening_excerpt"] = str(item.get("content") or "")[:2200]
-        if "_discovery_links" in primary:
-            item["discovery_links"] = primary["_discovery_links"]
-            item["telegram_forwarded"] = primary.get("_telegram_forwarded", False)
-        if row["disposition"] == "WAITING_CONFIRMATION":
+        item = _saved_material(row, source)
+        if row["disposition"] == "WAITING_CONFIRMATION" and coordinator is None:
             db.execute("INSERT INTO app_state(key,value) VALUES(?, '1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", ("editor_retry:"+str(row["item_id"]),))
-        retry_primary = primary.get("status") != "READ" and not item["material_read"]
-        item.update({
-            "primary_source_url": None if retry_primary else primary.get("url"),
-            "primary_source_title": None if retry_primary else primary.get("title"),
-            "primary_source_content": "" if retry_primary else primary.get("content", ""),
-            "primary_source_type": None if retry_primary else primary.get("type"),
-            "primary_source_publisher": None if retry_primary else primary.get("publisher"),
-            "primary_source_status": None if retry_primary else primary.get("status", "NOT_CHECKED"),
-        })
+        if coordinator is not None:
+            from .workflow import enqueue
+            enqueue(db, row['item_id'], item, source, {
+                'threshold': config['newsroom'].get('similarity_threshold', .35),
+                'max_length': config['newsroom'].get('max_post_length', 3500),
+                'freshness_hours': config['newsroom'].get('freshness_window_hours', 24),
+                'initial_backfill_minutes': None, 'relevance_terms': config['newsroom'].get('relevance_terms', []),
+            }, category='retry')
+            continue
         try:
             outcome = process_item(db, source, item, config["newsroom"].get("similarity_threshold", 0.35),
                                    config["newsroom"].get("max_post_length", 3500),
@@ -3005,6 +3153,14 @@ def _requeue_social_quote_repairs(db, ai_settings, freshness_hours: int) -> int:
 
 
 def run_cycle(config: dict) -> dict[str, int]:
+    from contextlib import ExitStack
+    with ExitStack() as cleanup:
+        db = connect(config["newsroom"]["database"])
+        cleanup.callback(db.close)
+        return _run_cycle(config, db, cleanup)
+
+
+def _run_cycle(config, db, cleanup):
     config = {**config, "ai": {k: v for k, v in config.get("ai", {}).items() if k not in {"_disabled_for_cycle", "_triage_disabled"}}}
     owner_ids = config.get("telegram", {}).get("interest_owner_user_ids") or []
     if owner_ids:
@@ -3031,7 +3187,8 @@ def run_cycle(config: dict) -> dict[str, int]:
     run_started = time.perf_counter()
     stage_times = {"retry_seconds": 0.0, "fetch_wait_seconds": 0.0,
                    "matching_seconds": 0.0, "processing_seconds": 0.0}
-    db = connect(config["newsroom"]["database"])
+    from .runtime import attach
+    attach(config)
     counts: dict[str, int] = {}
     reconciled = _reconcile_legacy_retry_loops(db)
     if reconciled:
@@ -3117,7 +3274,7 @@ def run_cycle(config: dict) -> dict[str, int]:
         if source_type in {"rss", "web"} and source_cfg.get("reputation") == "reputable_media" and host:
             ORIGINAL_REPORTING_PUBLISHERS.setdefault(_registrable_domain(host), re.escape(source_cfg["name"]))
 
-    db.execute("UPDATE items SET disposition='STALE',processed_at=? WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION') AND julianday(COALESCE(updated_at,published_at))<julianday('now',?)",
+    db.execute("UPDATE items SET disposition='STALE',processed_at=? WHERE disposition IN ('PENDING','AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION') AND julianday(COALESCE(updated_at,published_at))<julianday('now',?)",
                (NOW(), "-"+str(int(config["newsroom"].get("freshness_window_hours",24)))+" hours"))
     db.commit()
     requeued = _requeue_social_quote_repairs(
@@ -3171,10 +3328,23 @@ def run_cycle(config: dict) -> dict[str, int]:
     # Fetch concurrently and begin processing each source as soon as it returns;
     # waiting in configuration order would let one slow publisher hold up every
     # already available news item and consume the source-to-publication budget.
+    from .workflow import Coordinator, enqueue
+    coordinator = Coordinator(db, config, counts)
+    cleanup.callback(coordinator.abort)
+    def completed_sources(pending):
+        from concurrent.futures import wait, FIRST_COMPLETED
+        while pending:
+            coordinator.tick()
+            done, _ = wait(list(pending) + list(coordinator.running), timeout=1, return_when=FIRST_COMPLETED)
+            for future in done:
+                if future in pending:
+                    yield future
+            coordinator.tick()
+
     with ThreadPoolExecutor(max_workers=min(12, max(1, len(sources)))) as pool:
         pending = {pool.submit(timed_fetch, info): info for info in sources}
-        for future in as_completed(pending):
-            info = pending[future]
+        for future in completed_sources(pending):
+            info = pending.pop(future)
             source_cfg, source, first_check, source_type = info
             items, fetch_seconds, fetch_error = future.result()
             # Futures are already complete when as_completed yields them; time
@@ -3209,22 +3379,23 @@ def run_cycle(config: dict) -> dict[str, int]:
                     peers = [candidate for candidate in independent_reference_items if candidate is not item]
                     item["independent_sources"] = _independent_candidates(item, peers, trusted_independent_domains)
                     stage_times["matching_seconds"] += time.perf_counter() - matching_started
-                    processing_started = time.perf_counter()
                     try:
-                        outcome = process_item(db, source, item, config["newsroom"].get("similarity_threshold", 0.35),
-                                               config["newsroom"].get("max_post_length", 3500),
-                                               config["newsroom"].get("freshness_window_hours", 24),
-                                               config["newsroom"].get("initial_backfill_minutes", config["newsroom"].get("freshness_window_hours", 24) * 60) if first_check else None,
-                                               config["newsroom"].get("relevance_terms", []), config.get("ai", {}),
-                                               post_ready_callback=config.get("_publish_ready_callback"))
-                        counts[outcome] = counts.get(outcome, 0) + 1
+                        queued = enqueue(db, None, item, source, {
+                            "threshold": config["newsroom"].get("similarity_threshold", .35),
+                            "max_length": config["newsroom"].get("max_post_length", 3500),
+                            "freshness_hours": config["newsroom"].get("freshness_window_hours", 24),
+                            "initial_backfill_minutes": config["newsroom"].get("initial_backfill_minutes",
+                                config["newsroom"].get("freshness_window_hours", 24) * 60) if first_check else None,
+                            "relevance_terms": config["newsroom"].get("relevance_terms", []),
+                        })
+                        if queued is None:
+                            counts["DUPLICATE"] = counts.get("DUPLICATE", 0) + 1
                     except Exception as exc:
                         db.rollback()
                         counts["ERROR"] = counts.get("ERROR", 0) + 1
-                        db.execute("INSERT INTO errors(source_id,timestamp,message) VALUES(?,?,?)", (source["source_id"], NOW(), _safe_source_error(exc)))
+                        db.execute("INSERT INTO errors(source_id,timestamp,message) VALUES(?,?,?)",
+                                   (source["source_id"], NOW(), _safe_source_error(exc)))
                         db.commit()
-                    finally:
-                        stage_times["processing_seconds"] += time.perf_counter() - processing_started
                 latest = next((x["published_at"] for x in items if x.get("published_at")), None)
                 recovery_latest = source["recovery_latest"] or latest
                 if source["recovery_before"] is not None:
@@ -3258,10 +3429,20 @@ def run_cycle(config: dict) -> dict[str, int]:
                     _log_timing("source_recovered", source=source["name"])
                 db.commit()
             except Exception as exc:
+                from .runtime import BudgetDeferred
+                if isinstance(exc, BudgetDeferred):
+                    scheduled_web_search_url = None
+                    counts["WEB_SEARCH_DEFERRED"] = counts.get("WEB_SEARCH_DEFERRED", 0) + 1
+                    _log_timing("web_search_deferred", category=exc.reason,
+                                delay_seconds=exc.delay_seconds)
+                    continue
                 counts["SOURCE_ERROR"] = counts.get("SOURCE_ERROR", 0) + 1
                 db.execute("UPDATE sources SET last_checked_at=?,last_error=?,consecutive_failures=consecutive_failures+1 WHERE source_id=?", (NOW(), _safe_source_error(exc), source["source_id"]))
                 db.execute("INSERT INTO errors(source_id,timestamp,message) VALUES(?,?,?)", (source["source_id"], NOW(), _safe_source_error(exc)))
                 db.commit()
+    processing_started = time.perf_counter()
+    coordinator.close()
+    stage_times["processing_seconds"] = time.perf_counter() - processing_started
     if scheduled_web_search_url:
         # One request contains every active configured search scope, so they
         # share the same freshness timestamp even though results use one source
@@ -3273,10 +3454,15 @@ def run_cycle(config: dict) -> dict[str, int]:
     config['ai']['_analysis_budget'] += watch_reserve
     config['ai']['_triage_budget'] += watch_reserve
     story_watch_started = time.perf_counter()
-    def process_story_watch_item(*args, **kwargs):
-        kwargs["post_ready_callback"] = config.get("_publish_ready_callback")
-        return process_item(*args, **kwargs)
+    def process_story_watch_item(db_, source_, item_, threshold_, max_length_, freshness_hours_, baseline_, relevance_, ai_):
+        queued = enqueue(db_, None, item_, source_, {'threshold': threshold_, 'max_length': max_length_,
+            'freshness_hours': freshness_hours_, 'initial_backfill_minutes': baseline_, 'relevance_terms': relevance_},
+            category='watch')
+        return 'QUEUED' if queued else 'DUPLICATE'
     counts.update(run_story_watch(db, config, web_search_quota, process_story_watch_item))
+    watch_coordinator = Coordinator(db, config, counts, categories=('watch',), max_jobs=watch_reserve)
+    cleanup.callback(watch_coordinator.abort)
+    watch_coordinator.close()
     stage_times["story_watch_seconds"] = time.perf_counter() - story_watch_started
     # Give newly fetched material and due story watches first access to the
     # shared model budgets. Held-item retries are bounded and run afterward;
@@ -3285,10 +3471,15 @@ def run_cycle(config: dict) -> dict[str, int]:
     if config['ai'].get("triage_enabled"):
         config['ai']['_triage_budget'] += retry_reserve
     retry_started = time.perf_counter()
-    for outcome, count in _retry_ai_held_items(db, source_by_id, config).items():
+    retry_counts = {}
+    retry_coordinator = Coordinator(db, config, retry_counts, categories=('retry',), max_jobs=retry_reserve)
+    cleanup.callback(retry_coordinator.abort)
+    for outcome, count in _retry_ai_held_items(db, source_by_id, config, coordinator=retry_coordinator).items():
+        counts[outcome] = counts.get(outcome, 0) + count
+    retry_coordinator.close()
+    for outcome, count in retry_counts.items():
         counts[outcome] = counts.get(outcome, 0) + count
     stage_times["retry_seconds"] = time.perf_counter() - retry_started
-    db.close()
     total_seconds = time.perf_counter() - run_started
     stage_times["other_seconds"] = max(0.0, total_seconds - sum(stage_times.values()))
     _log_timing("collection_stage_timing", total_seconds=round(total_seconds, 3),

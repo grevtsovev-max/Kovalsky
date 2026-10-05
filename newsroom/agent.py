@@ -121,7 +121,14 @@ def _safe_result(value: Any) -> str:
 def run_research_agent(context: dict, settings: dict,
                        handlers: dict[str, Callable[[dict], dict]], *,
                        max_steps: int = 4, execute_tools: bool = True,
-                       on_event: Callable[[dict], None] | None = None) -> dict:
+                       on_event: Callable[[dict], None] | None = None, steps=False) -> dict:
+    from .workflow import drive
+    generator = _research_steps(context, settings, handlers, max_steps=max_steps,
+                                execute_tools=execute_tools, on_event=on_event)
+    return generator if steps else drive(generator, settings.get('_runtime'))
+
+
+def _research_steps(context, settings, handlers, *, max_steps, execute_tools, on_event):
     """Run a bounded model-selected research loop through application functions.
 
     In shadow mode, one proposed non-terminal tool call is recorded but not run.
@@ -129,6 +136,8 @@ def run_research_agent(context: dict, settings: dict,
     measuring the agent's first action choice.
     """
     remaining = max(1, min(8, int(max_steps)))
+    from .workflow import Work, resolve_steps
+    from .runtime import BudgetDeferred
     model = settings.get("agent_model") or settings.get("model", "gpt-6-luna")
     input_items: list[dict] = [{
         "role": "user",
@@ -155,7 +164,7 @@ def run_research_agent(context: dict, settings: dict,
         }
         model_started = time.perf_counter()
         try:
-            response = request_response(payload, settings)
+            response = yield Work('collector', request_response, (payload, settings))
         except Exception:
             emit({"step": step, "tool": "model_request", "status": "ERROR",
                   "model_seconds": round(time.perf_counter() - model_started, 3),
@@ -226,9 +235,11 @@ def run_research_agent(context: dict, settings: dict,
             raise AIResponseError("AGENT_TOOL_UNAVAILABLE")
         tool_started = time.perf_counter()
         try:
-            result = handlers[name](arguments)
+            result = yield from resolve_steps(handlers[name](arguments))
             if not isinstance(result, dict):
                 raise TypeError("tool result must be a dict")
+        except BudgetDeferred:
+            raise
         except Exception as exc:
             result = {"status": "ERROR", "code": type(exc).__name__}
         emit({"step": step, "tool": name, "arguments": arguments,

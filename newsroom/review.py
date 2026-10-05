@@ -6,10 +6,11 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .db import connect
 from .cli import telegram_api
+from .runtime import BudgetDeferred
 
 
 def _handle_callback(config: dict, db, update: dict) -> None:
@@ -654,7 +655,7 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
     if not publication_source_ready(facts, source_gate_text):
         return "REJECTED", "ORIGINAL_SOURCE_GATE_FAILED", "Не исправлял пост: исходная публикация не проходит проверку сохранённого источника.", current_text, []
     last_summary = ""
-    for attempt in range(1, 4):
+    for attempt in range(max(0, int(row['attempt_count'])) + 1, 4):
         db.execute("UPDATE telegram_feedback_corrections SET attempt_count=?,updated_at=? WHERE correction_id=?",
                    (attempt, datetime.now(timezone.utc).isoformat(timespec="seconds"), row["correction_id"]))
         db.commit()
@@ -665,6 +666,11 @@ def _make_feedback_correction(config: dict, db, row) -> tuple[str, str, str | No
                 source, config.get("ai", {}), autonomous=agent_update,
                 allow_supplement=story_supplement,
             )
+        except BudgetDeferred:
+            db.execute('UPDATE telegram_feedback_corrections SET attempt_count=? WHERE correction_id=?',
+                       (attempt - 1, row['correction_id']))
+            db.commit()
+            raise
         except Exception as exc:
             last_summary = f"Проверка временно не завершилась ({type(exc).__name__})."
             continue
@@ -852,7 +858,11 @@ def recover_feedback_correction_jobs(db) -> None:
 
 
 def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
-    rows = db.execute("SELECT * FROM telegram_feedback_corrections WHERE status='QUEUED' ORDER BY created_at,correction_id LIMIT ?", (limit,)).fetchall()
+    from .runtime import attach
+    attach(config)
+    rows = db.execute("SELECT * FROM telegram_feedback_corrections WHERE status='QUEUED' "
+                      "AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY created_at,correction_id LIMIT ?",
+                      (datetime.now(timezone.utc).isoformat(), limit)).fetchall()
     processed = 0
     for row in rows:
         db.execute("UPDATE telegram_feedback_corrections SET status='PROCESSING',updated_at=? WHERE correction_id=? AND status='QUEUED'",
@@ -959,6 +969,11 @@ def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
             except Exception:
                 db.rollback()  # The confirmed edit remains recorded even if its learning example cannot be saved.
             processed += 1
+        except BudgetDeferred as exc:
+            db.rollback()
+            db.execute("UPDATE telegram_feedback_corrections SET status='QUEUED',result_code='BUDGET_DEFERRED',next_attempt_at=? WHERE correction_id=?",
+                       ((datetime.now(timezone.utc) + timedelta(seconds=exc.delay_seconds)).isoformat(), row['correction_id']))
+            db.commit()
         except Exception as exc:
             db.rollback()
             _finish_correction(db, row["correction_id"], "REJECTED", "CORRECTION_PROCESSING_ERROR",
@@ -1197,6 +1212,8 @@ def handle_update(config: dict, db, update: dict) -> None:
 def run_review_bot(config: dict) -> None:
     db_path = config["newsroom"]["database"]
     db = connect(db_path)
+    from .runtime import attach
+    attach(config)
     offset_row = db.execute("SELECT value FROM app_state WHERE key='review_bot_offset'").fetchone()
     offset = int(offset_row["value"]) if offset_row else None
     telegram_api(config, "getMe", {})

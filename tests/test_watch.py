@@ -50,3 +50,14 @@ class StoryWatchTests(unittest.TestCase):
         self.cfg['ai']['_analysis_budget']=0
         run(self.db,self.cfg,search,Mock(),self.now+timedelta(hours=7))
         search.assert_not_called()
+
+    def test_shared_capacity_deferral_reschedules_without_recording_search_failure(self):
+        from newsroom.runtime import BudgetDeferred
+        now = self.now+timedelta(hours=7)
+        result=run(self.db,self.cfg,Mock(side_effect=BudgetDeferred(delay_seconds=180)),Mock(),now)
+        self.assertEqual(result,{'STORY_WATCH_DEFERRED':1})
+        job=self.db.execute('SELECT * FROM story_monitoring_jobs').fetchone()
+        self.assertEqual(job['next_check_at'],(now+timedelta(seconds=180)).isoformat(timespec='seconds'))
+        self.assertIsNone(job['last_checked_at'])
+        self.assertTrue(self.db.execute("SELECT 1 FROM story_watch_log WHERE action='SEARCH_DEFERRED'").fetchone())
+        self.assertFalse(self.db.execute("SELECT 1 FROM story_watch_log WHERE action='SEARCH_ERROR'").fetchone())

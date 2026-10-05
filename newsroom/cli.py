@@ -37,6 +37,8 @@ def load_config(path: str) -> dict:
     with open(path, "rb") as f:
         config = tomllib.load(f)
     config.setdefault("newsroom", {})["auto_publish"] = True
+    from .runtime import attach
+    attach(config)
     return config
 
 
@@ -777,6 +779,8 @@ def build_health_report(db, config: dict, now: datetime | None = None) -> str:
         if source["last_error"]:
             lines.append(f"{source['name']}: подряд сбоев {source['consecutive_failures']}; последнее успешное чтение {source['last_success_at'] or 'ещё не зафиксировано'}; источник включён, повтор в следующем цикле.")
     lines.extend(_performance_summary(config, now))
+    from .runtime import health_lines
+    lines.extend(health_lines(db, now))
     for name, error in failing[:8]:
         lines.append(f"Источник «{name}»: {_safe_error_label(error)}")
     for label, count in errors24.most_common(8):
@@ -1024,6 +1028,8 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
 def run_one_cycle(config: dict, db_path: str) -> dict[str, int]:
     """Run the same complete work cycle used by scheduled and manual collection."""
     cycle_started = time.perf_counter()
+    from .runtime import attach
+    attach(config)
     from .interests import expand_search_queries
     expand_search_queries(config)
     inline_attempted_posts: set[int] = set()
