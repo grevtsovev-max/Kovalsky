@@ -42,6 +42,11 @@ def stamp():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
+def account_unavailable(code):
+    return code in {'HTTP_429:credit_balance_exhausted', 'HTTP_429:insufficient_quota',
+                    'HTTP_429:billing_hard_limit_reached', 'HTTP_401:invalid_api_key'}
+
+
 class BudgetDeferred(RuntimeError):
     code = "SHARED_BUDGET_DEFERRED"
 
@@ -55,6 +60,7 @@ class Runtime:
     def __init__(self, database, settings):
         self.database = database
         self.settings = dict(settings)
+        self.account_cooldown_seconds = max(60, min(3600, int(settings.get('api_account_cooldown_seconds', 900))))
         self.max_calls = max(1, int(settings.get("api_requests_per_window", 50)))
         self.window = max(30, int(settings.get("api_budget_window_seconds", 180)))
         self.max_active = max(1, min(8, int(settings.get("api_concurrency", 2))))
@@ -87,6 +93,11 @@ class Runtime:
                         for tool in payload.get("tools", []) if isinstance(tool, dict))
         with self._lock, self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            blocked = db.execute("SELECT value FROM app_state WHERE key='api_account_blocked_until'").fetchone()
+            if blocked:
+                delay = (datetime.fromisoformat(blocked[0]) - datetime.now(timezone.utc)).total_seconds()
+                if delay > 0:
+                    raise BudgetDeferred('account', max(1, int(delay) + 1))
             db.execute("UPDATE api_usage SET status='UNKNOWN',error_code='PROCESS_INTERRUPTED' "
                        "WHERE status='RESERVED' AND lease_until<?", (stamp(),))
             total = db.execute("SELECT COUNT(*) FROM api_usage WHERE created_at>=?", (cutoff,)).fetchone()[0]
@@ -139,6 +150,13 @@ class Runtime:
                         search_price = self.settings.get("search_price_per_call")
                         estimate = estimate + searches * search_price if isinstance(search_price, (int, float)) and search_price >= 0 else None
             code = getattr(error, "code", type(error).__name__) if error else None
+            if account_unavailable(code):
+                until = (datetime.now(timezone.utc) + timedelta(seconds=self.account_cooldown_seconds)).isoformat(timespec='microseconds')
+                db.execute("INSERT INTO app_state(key,value) VALUES('api_account_blocked_until',?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (until,))
+                db.execute("INSERT INTO app_state(key,value) VALUES('ai_last_error',?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (json.dumps({'at': stamp(), 'code': code}),))
             status = "ERROR" if error else "SUCCEEDED"
             if error and (str(code).startswith("NETWORK_") or code in {"INVALID_RESPONSE_JSON", "PROCESS_INTERRUPTED"}):
                 status = "UNKNOWN"
