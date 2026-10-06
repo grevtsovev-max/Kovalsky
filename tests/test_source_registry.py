@@ -56,18 +56,44 @@ class RegistryTests(unittest.TestCase):
                                                    self.row('ПМЭФ', 'https://t.me/roscongress')]})
         self.assertEqual(config['sources'][0]['name'], 'Канал @roscongress')
 
-    def test_merge_preserves_disabled_trust_and_other_sources(self):
+    def test_registry_membership_replaces_legacy_sources_but_preserves_trust(self):
         original = dict(name='Old', url='https://t.me/example', type='telegram',
                         active=False, reputation='unknown', source_role='aggregator')
         config = {'sources': [original, dict(name='Other', url='https://other.test/feed')]}
-        snapshot = {'rows': [self.row('New'), self.row('Duplicate')]}
+        disabled = self.row('New')
+        disabled['enabled'] = False
+        snapshot = {'rows': [disabled]}
         rows = registry.apply_snapshot(config, snapshot)
-        self.assertEqual(len(config['sources']), 2)
+        self.assertEqual(len(config['sources']), 1)
         source = config['sources'][0]
         self.assertFalse(source['active'])
         self.assertEqual(source['reputation'], 'unknown')
         self.assertEqual(source['source_role'], 'aggregator')
-        self.assertEqual(rows[0]['status'], 'Выключен в текущих настройках')
+        self.assertEqual(rows[0]['status'], 'Выключен в таблице')
+
+    def test_removal_and_url_change_stop_old_collection(self):
+        config = {'sources': [dict(name='Old', url='https://t.me/old', type='telegram')]}
+        registry.apply_snapshot(config, {'rows': [self.row(url='https://t.me/new')]})
+        self.assertEqual([s['url'] for s in config['sources']], ['https://t.me/new'])
+        registry.apply_snapshot(config, {'rows': []})
+        self.assertEqual(config['sources'], [])
+
+    def test_checkbox_controls_direct_feed_and_entity_search(self):
+        rows = registry.parse_tab('Название,Ссылка,Мониторинг\nOff,https://t.me/off,FALSE\nOn,https://t.me/on,TRUE\nNew,,\n'.encode(), 'Бренды')
+        self.assertEqual([r['enabled'] for r in rows], [False, True, False])
+        names = [n for s in registry.entity_sources(rows) for n in s['registry_entities']]
+        self.assertEqual(names, ['On'])
+        cleared = registry.parse_tab('Название,Ссылка,Мониторинг\n,,TRUE\n'.encode(), 'СМИ')
+        self.assertEqual(cleared, [])
+        with self.assertRaises(ValueError):
+            registry.parse_tab('Название,Ссылка,Мониторинг\nOops,,непонятно\n'.encode(), 'СМИ')
+
+    def test_regulatory_adapters_obey_registry_membership(self):
+        from newsroom import regulatory
+        snapshot = {'rows': [dict(url='https://www.cbr.ru/', enabled=True, url_allowed=True),
+                             dict(url='https://nalog.gov.ru/', enabled=False, url_allowed=True)]}
+        with patch.object(registry, 'cached_authority', return_value=snapshot):
+            self.assertEqual([s[0] for s in regulatory.monitoring_sources({})], ['cbr'])
 
     def test_unapproved_url_and_site_are_not_connected(self):
         row = self.row(url='https://127.0.0.1/feed')

@@ -5,7 +5,9 @@ import csv
 import io
 import json
 import re
+import sqlite3
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit, urlencode
 
@@ -14,12 +16,15 @@ SNAPSHOT = 'source_registry_snapshot'
 ATTEMPT = 'source_registry_attempt'
 ERROR = 'source_registry_error'
 CURSOR = 'source_registry_entity_cursor'
+SCHEMA_ATTEMPT = 'source_registry_schema_attempt'
 
 
 def entity_sources(rows):
     """Every row is also an observation target, including publishers."""
     names = {}
     for row in rows:
+        if not row.get('enabled', True):
+            continue
         name = re.sub(r'\s*\((?:RSS|Telegram)\)\s*$', '', row['name'], flags=re.I)
         # Search syntax comes from code; cells supply literal words only.
         for alias in re.split(r'\s+/\s+', name):
@@ -100,17 +105,25 @@ def parse_tab(body, name):
         raise ValueError('REGISTRY_HEADER')
     link_index = headers.index('ссылка')
     task_index = headers.index('что отслеживать') if 'что отслеживать' in headers else None
+    enabled_index = headers.index('мониторинг') if 'мониторинг' in headers else None
     result = []
     for number, row in enumerate(rows[1:], 2):
         if not any(v.strip() for v in row):
             continue
         title = row[0].strip()
+        link = row[link_index].strip() if len(row) > link_index else ''
+        # Clearing name and link removes an entry even if a checkbox remains.
+        if not title and not link:
+            continue
         if not title or len(title) > 250:
             raise ValueError('REGISTRY_NAME')
-        link = row[link_index].strip() if len(row) > link_index else ''
         task = row[task_index].strip() if task_index is not None and len(row) > task_index else ''
+        flag = row[enabled_index].strip().casefold() if enabled_index is not None and len(row) > enabled_index else ''
+        if flag not in {'', 'true', 'false', 'истина', 'ложь', 'да', 'нет', '1', '0'}:
+            raise ValueError('REGISTRY_MONITORING_FLAG')
         result.append({'section': name, 'row': number, 'name': title,
-                       'url': link, 'task': task[:1000]})
+                       'url': link, 'task': task[:1000],
+                       'enabled': enabled_index is None or flag in {'true', 'истина', 'да', '1'}})
     return result
 
 
@@ -135,7 +148,7 @@ def read_registry(settings):
             else:
                 allowed[url] = True
         row['url_allowed'] = allowed.get(url, False)
-    return {'rows': rows, 'checked_at': time.time()}
+    return {'rows': rows, 'checked_at': time.time(), 'schema_version': 2}
 
 
 def source_for(row, existing):
@@ -169,15 +182,17 @@ def source_for(row, existing):
         label = 'Канал @' + parsed.path.strip('/')
     source = {**old, 'name': label[:100],
               'url': url, 'type': kind}
-    source.setdefault('active', True)
+    source['active'] = row.get('enabled', True)
     source.setdefault('priority', 1)
     source.setdefault('reputation', 'unknown')
     source.setdefault('source_role', 'aggregator')
-    return source, 'В мониторинге' if source['active'] else 'Выключен в текущих настройках'
+    return source, 'В мониторинге' if source['active'] else 'Выключен в таблице'
 
 
 def apply_snapshot(config, snapshot):
+    # Legacy settings supply adapter/trust metadata only, never membership.
     existing = {s['url']: dict(s) for s in config.get('sources', [])}
+    selected = {}
     rows = []
     linked_names = {}
     for row in snapshot.get('rows', []):
@@ -185,17 +200,40 @@ def apply_snapshot(config, snapshot):
             linked_names.setdefault(row['url'], set()).add(row['name'])
     for original in snapshot.get('rows', []):
         row = dict(original)
-        row['entity_monitored'] = True
+        if snapshot.get('schema_version') != 2:
+            # Preserve disabled flags during the one-time old-cache migration.
+            row.setdefault('enabled', existing.get(row['url'], {}).get('active', True))
+        row['entity_monitored'] = row.get('enabled', True)
         source_row = dict(row)
         if len(linked_names.get(row['url'], set())) > 1 and row['url'].startswith('https://t.me/'):
             source_row['name'] = 'Канал @' + urlsplit(row['url']).path.strip('/')
         source, row['status'] = source_for(source_row, existing)
         if source:
-            existing[source['url']] = source
+            previous = selected.get(source['url'])
+            if previous:
+                source['active'] = source['active'] or previous['active']
+            selected[source['url']] = source
+        if not row.get('enabled', True):
+            row['status'] = 'Выключен в таблице'
         rows.append(row)
-    config['sources'] = list(existing.values())
+    config['sources'] = list(selected.values())
+    config['_registry_authoritative'] = True
     config['_registry_rows'] = rows
     return rows
+
+
+def cached_authority(config):
+    """Share collection authority with independent monitors without advancing it."""
+    value = config.get('newsroom', {}).get('database')
+    if not value:
+        return None
+    path = Path(value).expanduser().resolve()
+    if not path.exists():
+        return None
+    with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=5) as db:
+        if not state(db, SETTINGS):
+            return None
+        return state(db, SNAPSHOT, {})
 
 
 def sync(db, config, force=False):
@@ -205,7 +243,9 @@ def sync(db, config, force=False):
     now = time.time()
     snapshot = state(db, SNAPSHOT, {})
     attempt = state(db, ATTEMPT, 0)
-    if force or now - attempt >= 180:
+    migrating = snapshot.get('schema_version') != 2 and state(db, SCHEMA_ATTEMPT) != 2
+    if force or migrating or now - attempt >= 180:
+        save(db, SCHEMA_ATTEMPT, 2)
         save(db, ATTEMPT, now)
         db.commit()
         try:
@@ -230,6 +270,7 @@ def configure(db, payload):
     save(db, SNAPSHOT, snapshot)
     save(db, ATTEMPT, snapshot['checked_at'])
     save(db, ERROR, None)
+    save(db, SCHEMA_ATTEMPT, 2)
     db.commit()
     return {'ok': True, 'rows': len(snapshot['rows']), 'url': settings['url']}
 
@@ -242,5 +283,6 @@ def report(db, config):
     copy = {'sources': config.get('sources', [])}
     rows = apply_snapshot(copy, snapshot)
     return {'connected': True, 'url': settings['url'],
+            'authoritative': True,
             'checked_at': snapshot.get('checked_at'), 'error': state(db, ERROR),
             'rows': rows}
