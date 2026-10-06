@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -24,7 +26,10 @@ CREATE TABLE IF NOT EXISTS api_usage (
  status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, lease_until TEXT,
  elapsed_seconds REAL, input_tokens INTEGER, cached_input_tokens INTEGER,
  output_tokens INTEGER, search_requested INTEGER NOT NULL DEFAULT 0,
- search_calls INTEGER, estimated_usd REAL, error_code TEXT
+ search_calls INTEGER, estimated_usd REAL, error_code TEXT,
+ stage TEXT, transport_attempt INTEGER, reasoning_tokens INTEGER, source_id INTEGER, response_model TEXT,
+ search_actions INTEGER, search_tool TEXT, service_tier TEXT, response_status TEXT,
+ request_bytes INTEGER, response_bytes INTEGER, pricing_json TEXT
 );
 CREATE INDEX IF NOT EXISTS api_usage_time_idx ON api_usage(created_at);
 CREATE TABLE IF NOT EXISTS stage_cache (
@@ -35,7 +40,23 @@ CREATE TABLE IF NOT EXISTS cache_events (
  event_id INTEGER PRIMARY KEY, stage TEXT NOT NULL, item_id INTEGER,
  created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS resource_operations (
+ operation_id INTEGER PRIMARY KEY, stage TEXT NOT NULL, role TEXT NOT NULL,
+ category TEXT NOT NULL, item_id INTEGER, job_id INTEGER, source_id INTEGER,
+ created_at TEXT NOT NULL, finished_at TEXT NOT NULL, status TEXT NOT NULL,
+ elapsed_seconds REAL NOT NULL, cpu_seconds REAL NOT NULL, error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS resource_operations_time_idx ON resource_operations(created_at);
 """
+
+USAGE_COLUMNS = (
+    ('lease_until', 'TEXT'), ('search_requested', 'INTEGER NOT NULL DEFAULT 0'),
+    ('stage', 'TEXT'), ('transport_attempt', 'INTEGER'), ('reasoning_tokens', 'INTEGER'),
+    ('source_id', 'INTEGER'), ('response_model', 'TEXT'),
+    ('search_actions', 'INTEGER'), ('search_tool', 'TEXT'), ('service_tier', 'TEXT'),
+    ('response_status', 'TEXT'), ('request_bytes', 'INTEGER'), ('response_bytes', 'INTEGER'),
+    ('pricing_json', 'TEXT'),
+)
 
 
 def stamp():
@@ -70,8 +91,8 @@ class Runtime:
         self._lock = threading.Lock()
 
     @contextmanager
-    def db(self):
-        db = sqlite3.connect(self.database, timeout=30)
+    def db(self, timeout=30):
+        db = sqlite3.connect(self.database, timeout=timeout)
         db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA temp_store=MEMORY")
@@ -84,6 +105,8 @@ class Runtime:
         scope = SCOPE.get()
         category = settings.get("_work_category", scope.get("category", "fresh"))
         role = settings.get("_work_role", scope.get("role", "collector"))
+        from .resources import safe_stage
+        stage = safe_stage(settings.get('_work_stage', scope.get('stage')))
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self.window)).isoformat(timespec="microseconds")
         # Expiry covers the request timeout and its network overhead. Expired
         # calls retain unknown usage, and still count in their request window.
@@ -123,32 +146,57 @@ class Runtime:
                 if busy or used.get('background', 0) >= max(0, int(self.settings.get('api_background_per_window', 2))):
                     raise BudgetDeferred('background', self.window)
             call_id = uuid.uuid4().hex
-            db.execute("INSERT INTO api_usage(call_id,role,category,item_id,job_id,model,status,created_at,search_requested,lease_until) "
-                       "VALUES(?,?,?,?,?,?,'RESERVED',?,?,?)",
+            source_id = scope.get('source_id')
+            if source_id is None and scope.get('item_id') is not None:
+                item_source = db.execute('SELECT source_id FROM items WHERE item_id=?', (scope['item_id'],)).fetchone()
+                source_id = item_source[0] if item_source else None
+            db.execute("INSERT INTO api_usage(call_id,role,category,item_id,job_id,model,status,created_at,search_requested,lease_until,"
+                       "stage,transport_attempt,search_tool,service_tier,request_bytes,source_id) "
+                       "VALUES(?,?,?,?,?,?,'RESERVED',?,?,?,?,?,?,?,?,?)",
                        (call_id, role, category, scope.get("item_id"), scope.get("job_id"),
-                        payload.get("model", "unknown"), stamp(), int(is_search), lease_until))
+                        payload.get("model", "unknown"), stamp(), int(is_search), lease_until,
+                        stage, settings.get('_transport_attempt', 0),
+                        next((t['type'] for t in payload.get('tools', []) if isinstance(t, dict) and str(t.get('type','')).startswith('web_search')), None),
+                        payload.get('service_tier'), settings.get('_request_bytes'), source_id))
         return call_id
 
-    def finish(self, call_id, response, elapsed, error=None):
-        usage = (response or {}).get("usage") or {}
-        def integer(value):
-            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    def finish(self, call_id, response, elapsed, error=None, response_bytes=None):
+        from .resources import integer, price_receipt
+        def mapping(value):
+            return value if isinstance(value, dict) else {}
+        response_data = mapping(response)
+        usage = mapping(response_data.get('usage'))
         input_tokens = integer(usage.get("input_tokens"))
         output_tokens = integer(usage.get("output_tokens"))
-        cached = integer((usage.get("input_tokens_details") or {}).get("cached_tokens"))
-        searches = sum(entry.get("type") == "web_search_call" for entry in (response or {}).get("output", []) if isinstance(entry, dict))
+        cached = integer(mapping(usage.get('input_tokens_details')).get('cached_tokens'))
+        reasoning = integer(mapping(usage.get('output_tokens_details')).get('reasoning_tokens'))
+        if input_tokens is None or (cached is not None and cached > input_tokens):
+            cached = None
+        if output_tokens is None or (reasoning is not None and reasoning > output_tokens):
+            reasoning = None
+        output = response_data.get('output')
+        output = output if isinstance(output, list) else []
+        search_entries = [entry for entry in output
+                          if isinstance(entry, dict) and entry.get('type') == 'web_search_call']
+        searches = len(search_entries)
+        actions = sum(isinstance(entry.get('action'), dict) and entry['action'].get('type') == 'search' for entry in search_entries)
+        if response is None or not isinstance(response_data.get('output'), list) or any(not isinstance(entry.get('action'), dict) or entry['action'].get('type') not in {'search','open_page','find_in_page'} for entry in search_entries):
+            actions = None
         with self.db() as db:
-            row = db.execute("SELECT model,search_requested FROM api_usage WHERE call_id=?", (call_id,)).fetchone()
-            rates = (self.settings.get("model_prices") or {}).get(row["model"], {})
-            estimate = None
-            if input_tokens is not None and output_tokens is not None and cached is not None and cached <= input_tokens:
-                names = ("input_per_million", "cached_input_per_million", "output_per_million")
-                if all(isinstance(rates.get(name), (int, float)) and rates[name] >= 0 for name in names):
-                    estimate = ((input_tokens - cached) * rates[names[0]] + cached * rates[names[1]]
-                                + output_tokens * rates[names[2]]) / 1_000_000
-                    if row["search_requested"]:
-                        search_price = self.settings.get("search_price_per_call")
-                        estimate = estimate + searches * search_price if isinstance(search_price, (int, float)) and search_price >= 0 else None
+            row = dict(db.execute("SELECT * FROM api_usage WHERE call_id=?", (call_id,)).fetchone())
+            tier = response_data.get('service_tier') or row.get('service_tier')
+            if not isinstance(tier, str) or tier not in {'default', 'flex', 'priority', 'fast', 'ultrafast', 'auto', 'scale'}:
+                tier = None
+            response_model = response_data.get('model')
+            if not isinstance(response_model, str) or not response_model:
+                response_model = None
+            response_status = response_data.get('status')
+            if response_status not in ('completed', 'incomplete', 'failed', 'in_progress', 'queued', 'cancelled'):
+                response_status = None
+            pricing = price_receipt({**row, 'model': response_model or row['model'], 'input_tokens': input_tokens,
+                'cached_input_tokens': cached, 'output_tokens': output_tokens,
+                'search_actions': actions, 'service_tier': tier}, self.settings)
+            estimate = pricing.get('total_usd')
             code = getattr(error, "code", type(error).__name__) if error else None
             if account_unavailable(code):
                 until = (datetime.now(timezone.utc) + timedelta(seconds=self.account_cooldown_seconds)).isoformat(timespec='microseconds')
@@ -161,10 +209,50 @@ class Runtime:
             if error and (str(code).startswith("NETWORK_") or code in {"INVALID_RESPONSE_JSON", "PROCESS_INTERRUPTED"}):
                 status = "UNKNOWN"
             db.execute("UPDATE api_usage SET status=?,finished_at=?,elapsed_seconds=?,input_tokens=?,"
-                       "cached_input_tokens=?,output_tokens=?,search_calls=?,estimated_usd=?,error_code=? WHERE call_id=?",
+                       "cached_input_tokens=?,output_tokens=?,search_calls=?,estimated_usd=?,error_code=?,"
+                       "reasoning_tokens=?,search_actions=?,service_tier=?,response_status=?,response_bytes=?,pricing_json=?,response_model=? WHERE call_id=?",
                        (status, stamp(), round(elapsed, 4), input_tokens, cached, output_tokens,
                         searches if response is not None else None,
-                        estimate, code, call_id))
+                        estimate, code, reasoning, actions, tier, response_status,
+                        response_bytes, json.dumps(pricing), response_model, call_id))
+
+    @contextmanager
+    def measure(self, stage, role, scope=None):
+        """Worker wall time and CPU are distinct; observation cannot mask failure."""
+        from .resources import safe_stage
+        parent = SCOPE.get().get('_measurement')
+        result = {'status': 'SUCCEEDED', 'error_code': None, 'child_wall': 0., 'child_cpu': 0.}
+        context = {**SCOPE.get(), **(scope or {}), 'stage': safe_stage(stage), 'role': role, 'runtime': self,
+                   '_measurement': result}
+        token = SCOPE.set(context)
+        created, started, cpu = stamp(), time.perf_counter(), time.thread_time()
+        try:
+            yield result
+        except BudgetDeferred as exc:
+            result.update(status='DEFERRED', error_code=exc.reason)
+            raise
+        except Exception as exc:
+            result.update(status='ERROR', error_code=getattr(exc, 'code', type(exc).__name__))
+            raise
+        finally:
+            elapsed, cpu_used = time.perf_counter()-started, time.thread_time()-cpu
+            if parent is not None:
+                parent['child_wall'] += elapsed
+                parent['child_cpu'] += cpu_used
+            try:
+                with self.db(timeout=.2) as db:
+                    source_id = context.get('source_id')
+                    if source_id is None and context.get('item_id') is not None:
+                        item_source = db.execute('SELECT source_id FROM items WHERE item_id=?', (context['item_id'],)).fetchone()
+                        source_id = item_source[0] if item_source else None
+                    db.execute('INSERT INTO resource_operations(stage,role,category,item_id,job_id,source_id,created_at,finished_at,status,elapsed_seconds,cpu_seconds,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (context['stage'], role, context.get('category', 'fresh'), context.get('item_id'),
+                         context.get('job_id'), source_id, created, stamp(), result['status'],
+                         max(0., elapsed-result['child_wall']), max(0., cpu_used-result['child_cpu']), result['error_code']))
+            except sqlite3.Error as exc:
+                logging.getLogger('newsroom.resources').warning('RESOURCE_RECEIPT_FAILED:%s', getattr(exc, 'sqlite_errorname', 'SQLITE_ERROR'))
+            finally:
+                SCOPE.reset(token)
 
     def cached(self, key, stage):
         with self.db() as db:

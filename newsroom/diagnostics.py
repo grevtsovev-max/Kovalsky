@@ -26,7 +26,7 @@ def snapshot(db, config):
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     schemas = {}
     for name in ('processing_jobs', 'processing_job_events', 'api_usage', 'stage_cache',
-                 'cache_events', 'items', 'sources', 'item_revisions', 'interest_feedback'):
+                 'cache_events', 'resource_operations', 'items', 'sources', 'item_revisions', 'interest_feedback'):
         schemas[name] = [row[1] for row in db.execute('PRAGMA table_info('+name+')')]
     from .runtime import snapshot as usage
     from .workflow import snapshot as queue

@@ -160,7 +160,7 @@ def generate_weekly_analysis(db_path: str, config: dict, now: datetime | None = 
         "text": {"format": {"type": "json_schema", "name": "weekly_analysis_draft", "strict": True, "schema": SCHEMA}}}
     try:
         db.commit()
-        response = request_response(request, {**config.get('ai', {}), '_work_role': 'editor', '_work_category': 'background'})
+        response = request_response(request, {**config.get('ai', {}), '_work_role': 'editor', '_work_category': 'background', '_work_stage': 'weekly_analysis'})
         result = _response_text(response)
     except BudgetDeferred:
         db.execute("DELETE FROM app_state WHERE key='weekly_analysis_last_attempt'")

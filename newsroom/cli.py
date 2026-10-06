@@ -65,6 +65,14 @@ def telegram_token(config: dict) -> str:
 
 
 def telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -> dict:
+    runtime = config.get('ai', {}).get('_runtime')
+    if runtime:
+        with runtime.measure('telegram_delivery', 'editor'):
+            return _telegram_api(config, method, payload, timeout)
+    return _telegram_api(config, method, payload, timeout)
+
+
+def _telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -> dict:
     token = telegram_token(config)
     url = f"https://api.telegram.org/bot{token}/{method}"
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
@@ -173,6 +181,14 @@ def _link_digest_action(headline: str, url: str) -> str:
 
 
 def publish_digest(db_path: str, config: dict, kind: str = "daily", *, rebuild_unsent=False) -> tuple[bool, int]:
+    runtime = config.get('ai', {}).get('_runtime')
+    if runtime:
+        with runtime.measure('digest', 'editor', {'category': 'digest'}):
+            return _publish_digest_measured(db_path, config, kind, rebuild_unsent=rebuild_unsent)
+    return _publish_digest_measured(db_path, config, kind, rebuild_unsent=rebuild_unsent)
+
+
+def _publish_digest_measured(db_path: str, config: dict, kind: str = "daily", *, rebuild_unsent=False) -> tuple[bool, int]:
     """Publish the scheduled daily or Saturday weekly digest of published channel posts."""
     db = connect(db_path)
     try:

@@ -45,7 +45,7 @@ def analyze_submitted_post(text: str, settings: dict,
                          "кратко опиши, что именно в глубине или структуре стоит брать за ориентир, не оценивай истинность выводов."),
         "input": json.dumps({"publication": text[:12000], "existing_topics": existing_topics or []}, ensure_ascii=False),
         "text": {"format": {"type": "json_schema", "name": "interest_and_analysis_profile", "strict": True, "schema": schema}},
-    }, {**settings, '_work_role': 'filter', '_work_category': 'background'})
+    }, {**settings, '_work_role': 'filter', '_work_category': 'background', '_work_stage': 'interest_learning'})
     raw = "".join(block.get("text", "") for output in response.get("output", [])
                   for block in output.get("content", []) if block.get("type") == "output_text")
     data = json.loads(raw)
@@ -89,7 +89,7 @@ def summarize_editorial_edit(previous_text: str, edited_text: str, settings: dic
                          "не как универсальное правило и не как проверенный факт. Если вывод неоднозначен, прямо укажи это в пункте."),
         "input": json.dumps({"previous_version": previous_text[:5000], "edited_version": edited_text[:5000]}, ensure_ascii=False),
         "text": {"format": {"type": "json_schema", "name": "editorial_edit_lessons", "strict": True, "schema": schema}},
-    }, {**settings, '_work_role': 'editor', '_work_category': 'background'})
+    }, {**settings, '_work_role': 'editor', '_work_category': 'background', '_work_stage': 'interest_learning'})
     raw = "".join(block.get("text", "") for output in response.get("output", [])
                   for block in output.get("content", []) if block.get("type") == "output_text")
     data = json.loads(raw)

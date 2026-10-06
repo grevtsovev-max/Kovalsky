@@ -238,11 +238,12 @@ def connect(path: str) -> sqlite3.Connection:
     db.execute("PRAGMA temp_store=MEMORY")
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
-    from .runtime import SCHEMA as RUNTIME_SCHEMA
+    from .runtime import SCHEMA as RUNTIME_SCHEMA, USAGE_COLUMNS, stamp
     from .workflow import SCHEMA as WORKFLOW_SCHEMA
     db.executescript(RUNTIME_SCHEMA)
+    db.execute("INSERT OR IGNORE INTO app_state(key,value) VALUES('resource_accounting_started_at',?)", (stamp(),))
     runtime_columns = {row[1] for row in db.execute('PRAGMA table_info(api_usage)')}
-    for name, declaration in (('lease_until', 'TEXT'), ('search_requested', 'INTEGER NOT NULL DEFAULT 0')):
+    for name, declaration in USAGE_COLUMNS:
         if name not in runtime_columns:
             db.execute(f'ALTER TABLE api_usage ADD COLUMN {name} {declaration}')
     db.executescript(WORKFLOW_SCHEMA)

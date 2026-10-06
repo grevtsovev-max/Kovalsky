@@ -143,6 +143,19 @@ def request_response(payload, settings):
             isinstance(tool, dict) and str(tool.get('type', '')).startswith('web_search')
             for tool in payload.get('tools', [])):
         raise AIResponseError('WEB_SEARCH_DISABLED')
+    from .runtime import SCOPE
+    from .resources import safe_stage
+    scope = SCOPE.get()
+    runtime = settings.get('_runtime') or scope.get('runtime')
+    stage = safe_stage(settings.get('_work_stage', scope.get('stage')))
+    if runtime and (not scope.get('_measurement') or stage != scope.get('stage')):
+        with runtime.measure(stage, settings.get('_work_role', scope.get('role', 'collector')),
+                             {'category': settings.get('_work_category', scope.get('category', 'fresh'))}):
+            return _request_response(payload, settings)
+    return _request_response(payload, settings)
+
+
+def _request_response(payload, settings):
     api_key = get_api_key(settings)
     if not api_key:
         raise AIResponseError("CREDENTIALS_MISSING")
@@ -150,8 +163,9 @@ def request_response(payload, settings):
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     for attempt in range(2):
-        runtime = settings.get("_runtime")
-        call_id = runtime.reserve(payload, settings) if runtime else None
+        from .runtime import SCOPE
+        runtime = settings.get("_runtime") or SCOPE.get().get('runtime')
+        call_id = runtime.reserve(payload, {**settings, '_transport_attempt': attempt, '_request_bytes': len(req.data)}) if runtime else None
         call_started = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=int(settings.get("timeout_seconds", 45)), context=ssl.create_default_context()) as response:
@@ -163,7 +177,7 @@ def request_response(payload, settings):
             if not isinstance(parsed, dict):
                 raise AIResponseError('INVALID_RESPONSE_JSON')
             if runtime:
-                runtime.finish(call_id, parsed, time.perf_counter() - call_started)
+                runtime.finish(call_id, parsed, time.perf_counter() - call_started, response_bytes=len(raw))
             return parsed
         except urllib.error.HTTPError as exc:
             code = safe_api_error(exc)
@@ -382,7 +396,7 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
         request_data['text']['format']['schema'] = schema
         request_data['instructions'] += '\n\n' + INSTRUCTIONS
         request_data['max_output_tokens'] = max(5000, request_data['max_output_tokens'])
-    result = request_response(request_data, {**settings, '_work_role': 'editor'})
+    result = request_response(request_data, {**settings, '_work_role': 'editor', '_work_stage': 'editorial'})
 
     if result.get("status") == "incomplete":
         details = result.get("incomplete_details") or {}
@@ -499,7 +513,7 @@ def correct_published_post(current_text: str, feedback: str, item: dict,
         "text": {"format": {"type": "json_schema", "name": "published_post_correction",
                              "strict": True, "schema": FEEDBACK_CORRECTION_SCHEMA}},
     }
-    result = request_response(payload, {**settings, '_work_role': 'editor', '_work_category': 'correction'})
+    result = request_response(payload, {**settings, '_work_role': 'editor', '_work_category': 'correction', '_work_stage': 'correction'})
     if result.get("status") == "incomplete":
         raise AIResponseError("CORRECTION_OUTPUT_INCOMPLETE")
     for output in result.get("output", []):

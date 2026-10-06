@@ -164,7 +164,7 @@ def _research_steps(context, settings, handlers, *, max_steps, execute_tools, on
         }
         model_started = time.perf_counter()
         try:
-            response = yield Work('collector', request_response, (payload, settings))
+            response = yield Work('collector', request_response, (payload, {**settings, '_work_stage': 'research_agent'}))
         except Exception:
             emit({"step": step, "tool": "model_request", "status": "ERROR",
                   "model_seconds": round(time.perf_counter() - model_started, 3),

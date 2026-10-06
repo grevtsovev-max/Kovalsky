@@ -12,6 +12,7 @@ import inspect
 import json
 import time
 import uuid
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -51,13 +52,22 @@ class Work:
     kwargs: dict = field(default_factory=dict)
     key: str | None = None
     ttl: int = 0
+    stage: str | None = None
 
     def execute(self, runtime=None, scope=None):
-        token = SCOPE.set({**(scope or {}), "role": self.role, "runtime": runtime})
+        from .resources import FUNCTION_STAGES
+        stage = self.stage or FUNCTION_STAGES.get(getattr(self.function, '__name__', ''), 'unattributed')
+        measurement = runtime.measure(stage, self.role, scope) if runtime else nullcontext({})
+        with measurement as measured:
+            return self._execute(runtime, scope, measured)
+
+    def _execute(self, runtime, scope, measured):
+        token = SCOPE.set({**SCOPE.get(), **(scope or {}), "role": self.role, "runtime": runtime})
         try:
             if runtime and self.key:
                 cached = runtime.cached(self.key, self.role)
                 if cached is not None:
+                    measured['status'] = 'CACHED'
                     return cached
             result = self.function(*self.args, **self.kwargs)
             # Only completed and validated stage outputs reach this point;
