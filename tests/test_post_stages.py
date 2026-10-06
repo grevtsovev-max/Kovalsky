@@ -27,3 +27,17 @@ class PostStagesTests(unittest.TestCase):
             with self.assertRaises(ai.AIResponseError):
                 ai.draft_post(decision, {'content': 'Прочитанный текст'}, {})
         self.assertEqual(decision['facts'][0]['claim_type'], 'REPORT')
+
+    def test_nullable_nonmessage_content_does_not_break_analysis(self):
+        r = response({'action': 'NEW_STORY'})
+        r['output'].insert(0, {'type': 'reasoning', 'content': None})
+        with patch.object(ai, 'get_api_key', return_value='test'), patch.object(ai, 'request_response', return_value=r):
+            result = ai.analyze({'title': 'Событие'}, {'name': 'Источник', 'priority': 1, 'reputation': 'unknown'}, [], {'_analysis_only': True})
+        self.assertEqual(result['action'], 'NEW_STORY')
+
+    def test_nullable_nonmessage_content_does_not_break_drafting(self):
+        draft = {'headline_ru': 'Заголовок', 'summary_ru': 'Текст', 'what_is_new': 'Изменение', 'editorial_check': {}}
+        r = response(draft)
+        r['output'].insert(0, {'type': 'reasoning', 'content': None})
+        with patch.object(ai, 'request_response', return_value=r):
+            self.assertEqual(ai.draft_post({'facts': []}, {'content': 'Источник'}, {}), draft)

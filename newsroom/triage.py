@@ -136,8 +136,8 @@ def classify(item, candidates, feedback, settings):
     if result.get('status') == 'incomplete':
         raise AIResponseError('TRIAGE_INCOMPLETE')
     decision = None
-    for output in result.get('output', []):
-        for block in output.get('content', []):
+    for output in (result.get('output') or []):
+        for block in (output.get('content') or []):
             if block.get('type') == 'output_text':
                 try:
                     decision = json.loads(block['text'])

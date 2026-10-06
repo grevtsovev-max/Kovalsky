@@ -439,8 +439,8 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
         code = "OUTPUT_TOKEN_LIMIT" if reason == "max_output_tokens" else "INCOMPLETE_RESPONSE"
         raise AIResponseError(code)
 
-    for output in result.get("output", []):
-        for block in output.get("content", []):
+    for output in (result.get("output") or []):
+        for block in (output.get("content") or []):
             if block.get("type") == "refusal":
                 raise RuntimeError("OpenAI refused this item")
             if block.get("type") == "output_text":
@@ -477,8 +477,8 @@ def draft_post(decision, source, settings):
     response = request_response(payload, {**settings, '_work_role': 'editor', '_work_stage': 'editorial'})
     if response.get('status') == 'incomplete':
         raise AIResponseError('INCOMPLETE_RESPONSE')
-    for output in response.get('output', []):
-        for block in output.get('content', []):
+    for output in (response.get('output') or []):
+        for block in (output.get('content') or []):
             if block.get('type') == 'output_text':
                 try:
                     draft = json.loads(block['text'])
@@ -590,8 +590,8 @@ def correct_published_post(current_text: str, feedback: str, item: dict,
     result = request_response(payload, {**settings, '_work_role': 'editor', '_work_category': 'correction', '_work_stage': 'correction'})
     if result.get("status") == "incomplete":
         raise AIResponseError("CORRECTION_OUTPUT_INCOMPLETE")
-    for output in result.get("output", []):
-        for block in output.get("content", []):
+    for output in (result.get("output") or []):
+        for block in (output.get("content") or []):
             if block.get("type") == "refusal":
                 raise AIResponseError("CORRECTION_REFUSED")
             if block.get("type") == "output_text":
