@@ -233,6 +233,9 @@ def connect(path: str) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path, timeout=30)
     db.row_factory = sqlite3.Row
+    # Service sandboxes may have no writable SQLite temporary directory.
+    # Sorting and temporary indexes must not depend on filesystem access.
+    db.execute("PRAGMA temp_store=MEMORY")
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
     from .runtime import SCHEMA as RUNTIME_SCHEMA
@@ -317,6 +320,7 @@ def connect_readonly(path: str) -> sqlite3.Connection:
     db_path = Path(path).expanduser().resolve()
     db = sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=5)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA temp_store=MEMORY")
     db.execute("PRAGMA query_only=ON")
     db.execute("PRAGMA busy_timeout=5000")
     return db
