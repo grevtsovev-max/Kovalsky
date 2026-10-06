@@ -311,7 +311,10 @@ class Coordinator:
         marks = ','.join('?' for _ in self.categories)
         preferred = ('WAITING_CONFIRMATION', '', 'PRIMARY_RETRY', '', 'AI_RETRY', '')[self.claimed % 6] if 'retry' in self.categories else ''
         preferred_category = ('fresh', 'retry', 'fresh', 'watch')[self.claimed % 4] if self.continuous else ''
-        preferred_stage = ('drafting', '', 'analysis', '', 'reading', '', 'screening', '')[self.claimed % 8] if self.continuous else ''
+        # Hold a stage preference for a complete category rotation. Using
+        # the same modulo for both permanently assigned drafting to fresh
+        # slots, so drafting retries never received their intended priority.
+        preferred_stage = ('drafting', '', 'analysis', '', 'reading', '', 'screening', '')[(self.claimed // 4) % 8] if self.continuous else ''
         candidates = self.db.execute("SELECT j.*,i.story_id AS current_story_id FROM processing_jobs j JOIN items i ON i.item_id=j.item_id "
                               "JOIN sources s ON s.source_id=i.source_id "
                               "WHERE j.status IN ('PENDING','WAITING') AND j.next_at<=? AND i.disposition<>'TECHNICAL_ERROR' "

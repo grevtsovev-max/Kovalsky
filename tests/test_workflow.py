@@ -481,6 +481,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(checkpoint['status'], 'ERROR')
         self.assertNotIn('private', checkpoint['reason'])
 
+    def test_drafting_retry_receives_priority_over_older_screening_retry(self):
+        from newsroom.material_flow import mark
+        enqueue(self.db, None, self.item(910), self.source, self.options, category='retry')
+        enqueue(self.db, None, self.item(911), self.source, self.options, category='retry')
+        mark(self.db, 1, 'screening', 'WAITING', 'Old screening')
+        mark(self.db, 2, 'drafting', 'WAITING', 'Ready to write')
+        self.db.execute("UPDATE processing_jobs SET next_at='2000-01-01'")
+        self.db.commit()
+        coordinator = Coordinator(self.db, {**self.config, '_continuous_processing': True}, {}, categories=('fresh','retry','watch'))
+        coordinator.claimed = 1  # The retry slot must also prefer drafting.
+        try:
+            self.assertEqual(coordinator._claim()['item_id'], 2)
+        finally:
+            coordinator.max_jobs = 0
+            coordinator.close()
+
     def test_expired_owner_recovers_without_duplicate_job(self):
         enqueue(self.db, None, self.item(), self.source, self.options)
         self.db.execute("UPDATE processing_jobs SET status='RUNNING',owner='dead',lease_until='2000-01-01'")
