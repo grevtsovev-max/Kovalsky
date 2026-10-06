@@ -414,6 +414,73 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
 
+    def test_recovery_repairs_checkpoints_but_preserves_active_lease_and_old_version(self):
+        from newsroom.material_flow import mark, revision
+        enqueue(self.db, None, self.item(), self.source, self.options)
+        mark(self.db, 1, 'analysis', 'RUNNING')
+        self.db.execute("UPDATE processing_jobs SET status='RUNNING',owner='dead',lease_until='2000-01-01'")
+        self.db.commit()
+        coordinator = Coordinator(self.db, self.config, {}, max_jobs=0)
+        self.addCleanup(coordinator.close)
+        row = self.db.execute("SELECT status,block_kind FROM material_stage_state WHERE stage='analysis'").fetchone()
+        self.assertEqual(tuple(row), ('READY', 'recovery'))
+        mark(self.db, 1, 'analysis', 'RUNNING')
+        self.db.execute("UPDATE processing_jobs SET status='RUNNING',owner='live',lease_until='2099-01-01'")
+        self.db.commit()
+        coordinator._resume_expired()
+        self.assertEqual(self.db.execute("SELECT status FROM material_stage_state WHERE stage='analysis'").fetchone()[0], 'RUNNING')
+        old_revision = revision(self.db, 1)
+        self.db.execute("UPDATE items SET ingest_revision='new-version',disposition='REJECTED',processed_at=?", (self.now,))
+        mark(self.db, 1, 'drafting', 'WAITING', 'Old wait')
+        self.db.commit()
+        coordinator._resume_expired()
+        self.assertEqual(self.db.execute("SELECT status FROM material_stage_state WHERE revision=? AND stage='analysis'", (old_revision,)).fetchone()[0], 'RUNNING')
+        self.assertEqual(self.db.execute("SELECT status FROM material_stage_state WHERE revision='new-version' AND stage='drafting'").fetchone()[0], 'CLOSED')
+
+    def test_rejected_post_closes_only_its_current_gate(self):
+        from newsroom.material_flow import mark
+        item = self.item(904)
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', return_value=self.publish_result(item)):
+            self.assertEqual(process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=self.config['ai']), 'NEW_STORY')
+        self.db.execute("UPDATE posts SET status='REJECTED'")
+        self.db.commit()
+        coordinator = Coordinator(self.db, self.config, {}, max_jobs=0)
+        self.addCleanup(coordinator.close)
+        self.assertEqual(self.db.execute("SELECT status FROM material_stage_state WHERE stage='gate'").fetchone()[0], 'CLOSED')
+        self.db.execute("UPDATE items SET ingest_revision='revised',processed_at='2099-01-01'")
+        mark(self.db, 1, 'gate', 'READY')
+        self.db.commit()
+        coordinator._resume_expired()
+        self.assertEqual(self.db.execute("SELECT status FROM material_stage_state WHERE stage='gate' AND revision='revised'").fetchone()[0], 'READY')
+
+    def test_draft_request_is_accounted_as_drafting(self):
+        from newsroom.ai import draft_post
+        draft = {'headline_ru': 'Банк открыл счета', 'summary_ru': 'Банк открыл счета цифрового рубля.',
+                 'what_is_new': '', 'editorial_check': {}}
+        response = {'output': [{'content': [{'type': 'output_text', 'text': json.dumps(draft)}]}]}
+        with patch('newsroom.ai.request_response', return_value=response) as request:
+            self.assertEqual(draft_post({}, {}, {}), draft)
+        self.assertEqual(request.call_args.args[1]['_work_stage'], 'drafting')
+
+    def test_local_coordinator_type_error_is_terminal_without_retry(self):
+        enqueue(self.db, None, self.item(), self.source, self.options)
+        counts = {}
+        coordinator = Coordinator(self.db, self.config, counts, max_jobs=1)
+        self.addCleanup(coordinator.close)
+        job = coordinator._claim()
+        def broken():
+            raise TypeError('private diagnostic detail')
+            yield
+        coordinator._advance(job, broken())
+        self.assertEqual(counts, {'TECHNICAL_ERROR': 1})
+        self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'TECHNICAL_ERROR')
+        self.assertEqual(tuple(self.db.execute('SELECT status,outcome FROM processing_jobs').fetchone()), ('DONE', 'TECHNICAL_ERROR'))
+        self.assertIsNone(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone())
+        checkpoint = self.db.execute("SELECT status,reason FROM material_stage_state WHERE stage='screening'").fetchone()
+        self.assertEqual(checkpoint['status'], 'ERROR')
+        self.assertNotIn('private', checkpoint['reason'])
+
     def test_expired_owner_recovers_without_duplicate_job(self):
         enqueue(self.db, None, self.item(), self.source, self.options)
         self.db.execute("UPDATE processing_jobs SET status='RUNNING',owner='dead',lease_until='2000-01-01'")

@@ -479,7 +479,7 @@ def draft_post(decision, source, settings):
         'input': json.dumps({'checked_decision': checked, 'read_source': source,
                             'max_post_length': settings.get('max_post_length', 3500)}, ensure_ascii=False),
         'text': {'format': {'type': 'json_schema', 'name': 'newsroom_post_draft', 'strict': True, 'schema': schema}}}
-    response = request_response(payload, {**settings, '_work_role': 'editor', '_work_stage': 'editorial'})
+    response = request_response(payload, {**settings, '_work_role': 'editor', '_work_stage': 'drafting'})
     if response.get('status') == 'incomplete':
         raise AIResponseError('INCOMPLETE_RESPONSE')
     for output in (response.get('output') or []):
