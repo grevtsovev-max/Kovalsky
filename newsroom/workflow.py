@@ -258,6 +258,40 @@ class Coordinator:
                         "WHERE status IN ('PENDING','WAITING') AND EXISTS(SELECT 1 FROM items i WHERE i.item_id=processing_jobs.item_id "
                         "AND i.disposition IN ('TECHNICAL_ERROR','REJECTED','STALE','UNDATED','BASELINE_SKIPPED','NOISE','DUPLICATE','STORE_ONLY','NEW_STORY','UPDATE_CANDIDATE','AGENT_CORRECTION_QUEUED') "
                         "AND julianday(i.processed_at)>=julianday(processing_jobs.created_at,'-1 second'))", (stamp(),))
+        from .material_flow import mark
+        terminal = {'REJECTED', 'STALE', 'UNDATED', 'BASELINE_SKIPPED', 'NOISE',
+                    'DUPLICATE', 'STORE_ONLY', 'EDITOR_REJECTED', 'TECHNICAL_ERROR'}
+        checkpoints = self.db.execute(
+            "SELECT s.*,i.disposition FROM material_stage_state s JOIN items i "
+            "ON i.item_id=s.item_id AND i.ingest_revision=s.revision "
+            "WHERE s.status IN ('RUNNING','READY','WAITING') AND NOT EXISTS "
+            "(SELECT 1 FROM processing_jobs j WHERE j.item_id=s.item_id "
+            "AND j.revision=s.revision AND j.status='RUNNING')").fetchall()
+        for checkpoint in checkpoints:
+            item_id, stage = checkpoint['item_id'], checkpoint['stage']
+            if checkpoint['disposition'] in terminal:
+                technical = checkpoint['disposition'] == 'TECHNICAL_ERROR'
+                mark(self.db, item_id, stage, 'ERROR' if technical else 'CLOSED',
+                     'Обработка остановлена технической ошибкой.' if technical else 'Материал завершён без публикации.',
+                     block_kind='technical' if technical else None)
+            elif checkpoint['disposition'] in {'NEW_STORY', 'UPDATE_CANDIDATE'} and stage not in {'gate', 'delivery'}:
+                mark(self.db, item_id, stage, 'CLOSED', 'Обработка передана на допуск готового поста.')
+            elif checkpoint['status'] == 'RUNNING' and stage not in {'gate', 'delivery'}:
+                job = self.db.execute("SELECT status,next_at FROM processing_jobs WHERE item_id=? "
+                                      "AND revision=? AND status IN ('PENDING','WAITING') ORDER BY next_at LIMIT 1",
+                                      (item_id, checkpoint['revision'])).fetchone()
+                mark(self.db, item_id, stage, 'WAITING' if job and job['status'] == 'WAITING' else 'READY',
+                     'Предыдущая обработка прервана; ожидает продолжения по сохранённым результатам.',
+                     block_kind='recovery', next_at=job['next_at'] if job else None)
+        rejected = self.db.execute(
+            "SELECT s.item_id,s.stage FROM material_stage_state s JOIN items i "
+            "ON i.item_id=s.item_id AND i.ingest_revision=s.revision "
+            "JOIN posts p ON p.origin_item_id=i.item_id "
+            "WHERE s.stage='gate' AND s.status IN ('READY','WAITING','RUNNING') "
+            "AND p.status='REJECTED' AND julianday(p.created_at)>=julianday(i.processed_at,'-1 second') "
+            "AND NOT EXISTS (SELECT 1 FROM posts newer WHERE newer.origin_item_id=i.item_id AND newer.post_id>p.post_id)").fetchall()
+        for checkpoint in rejected:
+            mark(self.db, checkpoint['item_id'], 'gate', 'CLOSED', 'Готовый пост окончательно отклонён проверками допуска.')
         self.db.commit()
 
     def _event(self, job_id, role, status):
@@ -373,6 +407,21 @@ class Coordinator:
                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             (json.dumps({'at': stamp(), 'code': type(exc).__name__,
                                          'location': error_location(exc)}),))
+            from .material_flow import technical_error, mark
+            if technical_error(exc):
+                self.counts['ERROR'] -= 1
+                if not self.counts['ERROR']:
+                    del self.counts['ERROR']
+                self.counts['TECHNICAL_ERROR'] = self.counts.get('TECHNICAL_ERROR', 0) + 1
+                self.db.execute("UPDATE items SET disposition='TECHNICAL_ERROR',processed_at=? WHERE item_id=?",
+                                (stamp(), job['item_id']))
+                mark(self.db, job['item_id'], job.get('_stage', 'screening'), 'ERROR',
+                     'Техническая ошибка обработчика: ' + type(exc).__name__, block_kind='technical')
+                self.db.execute("UPDATE processing_jobs SET status='DONE',outcome='TECHNICAL_ERROR',error_code=?,"
+                                "finished_at=?,owner=NULL,lease_until=NULL WHERE job_id=?",
+                                (type(exc).__name__, stamp(), job['job_id']))
+                self.db.commit()
+                return
             from .triage import schedule_retry
             attempts = schedule_retry(self.db, job["item_id"], "ERROR")
             status = "DONE" if attempts >= 3 else "WAITING"
