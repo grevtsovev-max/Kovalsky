@@ -3113,8 +3113,12 @@ def _finish_post_steps(db, item, ai_settings, context):
         citation_name = (primary_source.get("publisher") or "Первоисточник") if primary_source else (publisher_report or {}).get("publisher", publisher_name)
         source_is_report = (bool(primary_source and str(primary_source.get("type") or "").startswith(("ORIGINAL_MEDIA_", "ORIGINAL_SOCIAL_")))
                             if primary_source else bool(publisher_report))
-        issues = editorial_issues(headline, quality_body or "", ai_result,
-                                 source_name=citation_name, source_is_report=source_is_report)
+        # Check the assembled text, including the normalized source footer,
+        # before creating a post. The send boundary checks this same format.
+        preview = make_post(headline, quality_body or '', citation_name, citation_url, max_length)
+        checked_headline, _, checked_body = preview.partition('\n')
+        issues = editorial_issues(checked_headline, checked_body, ai_result,
+                                 source_is_report=source_is_report)
         if issues:
             ai_result["editorial_issues"] = issues
             ai_result['_needs_post_draft'] = True
