@@ -179,21 +179,21 @@ class StageExecutor:
         stage = 'drafting' if name == 'draft_post' else 'screening' if work.role == 'filter' else 'analysis' if name in {'analyze', 'analyze_with_ai'} else 'reading'
         def invoke():
             runtime, scope = args
-            if runtime and scope.get('item_id') is not None:
-                from .material_flow import mark
-                with runtime.db() as db:
-                    mark(db, scope['item_id'], stage, 'RUNNING')
+            def record(status, reason='', **details):
+                if runtime and scope.get('item_id') is not None:
+                    from .material_flow import mark, revision
+                    with runtime.db() as db:
+                        if scope.get('revision') is None or revision(db, scope['item_id']) == scope['revision']:
+                            mark(db, scope['item_id'], stage, status, reason, **details)
             from .runtime import BudgetDeferred
             while not self.stopping.is_set():
                 try:
+                    record('RUNNING')
                     return function(*args)
                 except BudgetDeferred as exc:
                     if exc.reason != 'concurrency':
                         raise
-                    if runtime and scope.get('item_id') is not None:
-                        from .material_flow import mark
-                        with runtime.db() as db:
-                            mark(db, scope['item_id'], stage, 'READY', 'Ожидает свободного места API.', block_kind='capacity')
+                    record('READY', 'Ожидает свободного места API.', block_kind='capacity')
                     self.stopping.wait(.5)
             raise BudgetDeferred('shutdown', 1)
         return self.pools[stage].submit(invoke)

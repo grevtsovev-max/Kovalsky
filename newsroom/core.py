@@ -2134,7 +2134,8 @@ def _save_item(db, source, item, existing_item_id=None):
                 stored_feed_hash = prior["feed_content_hash"] if "feed_content_hash" in prior.keys() else ""
                 # `items.content` is enriched with fetched article text. Compare a
                 # feed poll to its own last-seen body so enrichment cannot reset retries.
-                unchanged = same_metadata and (not stored_feed_hash or stored_feed_hash == feed_content_hash)
+                unchanged = (prior['ingest_revision'] == ingest_revision or
+                             same_metadata and (not stored_feed_hash or stored_feed_hash == feed_content_hash))
                 if unchanged:
                     if not stored_feed_hash:
                         db.execute("UPDATE items SET feed_content_hash=? WHERE item_id=?",

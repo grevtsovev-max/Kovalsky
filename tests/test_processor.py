@@ -50,6 +50,48 @@ class ProcessorTests(unittest.TestCase):
             release.set()
             executor.shutdown()
 
+    def test_capacity_wait_returns_to_running_without_counting_a_retry(self):
+        from newsroom.runtime import BudgetDeferred
+        from newsroom.material_flow import revision, snapshot
+        enqueue(self.db, None, self.fixture.item(), self.source, self.fixture.options)
+        runtime = self.config['ai']['_runtime']
+        scope = {'item_id': 1, 'revision': revision(self.db, 1)}
+        calls = []
+        def analyze():
+            calls.append(1)
+            if len(calls) == 1:
+                raise BudgetDeferred('concurrency', 1)
+            with runtime.db() as db:
+                state = next(x for x in snapshot(db, 1) if x['stage'] == 'analysis')
+            self.assertEqual(state['status'], 'RUNNING')
+            self.assertIsNone(state['block_kind'])
+            self.assertGreater(state['wait_seconds'], .3)
+            return {'action': 'NOISE'}
+        executor = StageExecutor(1)
+        try:
+            future = executor.submit(Work('editor', analyze).execute, runtime, scope)
+            self.assertEqual(future.result(timeout=3), {'action': 'NOISE'})
+        finally:
+            executor.shutdown()
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone())
+
+    def test_old_worker_does_not_mark_new_material_revision_running(self):
+        from newsroom.material_flow import revision, snapshot
+        enqueue(self.db, None, self.fixture.item(), self.source, self.fixture.options)
+        old = revision(self.db, 1)
+        self.db.execute("UPDATE items SET ingest_revision='new-version' WHERE item_id=1")
+        self.db.commit()
+        def analyze():
+            return {'action': 'NOISE'}
+        executor = StageExecutor(1)
+        try:
+            future = executor.submit(Work('editor', analyze).execute, self.config['ai']['_runtime'], {'item_id': 1, 'revision': old})
+            future.result(timeout=3)
+        finally:
+            executor.shutdown()
+        self.assertEqual(snapshot(self.db, 1), [])
+
     def test_legacy_migration_preserves_attempts_and_read_source(self):
         from newsroom.material_flow import migrate, snapshot
         enqueue(self.db, None, self.fixture.item(), self.source, self.fixture.options)
@@ -103,6 +145,25 @@ class ProcessorTests(unittest.TestCase):
         old = dict(item, _expected_revision=old_revision)
         self.assertIsNone(_save_item(self.db, self.source, old, existing_item_id=item_id))
         self.assertEqual(self.db.execute('SELECT content FROM items').fetchone()[0], changed['content'])
+
+    def test_unchanged_feed_does_not_reset_enriched_article_or_attempts(self):
+        from newsroom.core import _save_item
+        item = self.fixture.item()
+        item_id = _save_item(self.db, self.source, item)
+        enriched = dict(item, title=item['title']+' Уточнённый заголовок.',
+                        description='Описание из страницы издателя.', content=item['content']+' Полный прочитанный текст.')
+        _save_item(self.db, self.source, enriched, existing_item_id=item_id)
+        self.db.execute("UPDATE items SET disposition='AI_RETRY' WHERE item_id=?", (item_id,))
+        self.db.execute("INSERT INTO app_state VALUES('selection_retry:1',?)", (json.dumps({'attempts': 2}),))
+        self.db.commit()
+        self.assertIsNone(_save_item(self.db, self.source, item))
+        row = self.db.execute('SELECT title,content,disposition FROM items WHERE item_id=?', (item_id,)).fetchone()
+        self.assertEqual(tuple(row), (enriched['title'], enriched['content'], 'AI_RETRY'))
+        self.assertEqual(json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])['attempts'], 2)
+        changed = dict(item, description='Издатель добавил новое условие в ленту.')
+        self.assertEqual(_save_item(self.db, self.source, changed), item_id)
+        self.assertEqual(self.db.execute('SELECT disposition FROM items WHERE item_id=?', (item_id,)).fetchone()[0], 'PENDING')
+        self.assertIsNone(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone())
 
     def test_google_discovery_does_not_read_article_before_selection(self):
         from newsroom.core import fetch_google_news
