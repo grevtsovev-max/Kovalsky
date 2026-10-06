@@ -52,7 +52,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
              patch("newsroom.core.fetch_publisher_article", side_effect=TimeoutError("TLS handshake timed out")):
             items = fetch_google_news("https://news.google.com/rss/search?q=crypto")
         self.assertEqual(items, [])
-        self.assertEqual(items.diagnostics, ["TLS_CONNECTION_ERROR@ria.ru"])
+        self.assertEqual(items.diagnostics, ["NETWORK_TIMEOUT@ria.ru"])
 
     def test_fetch_reads_official_page_and_returns_its_url_and_text(self):
         article_url = "https://news.example/crypto-story"
@@ -73,7 +73,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
         self.assertEqual(article["primary_source_url"], source_url)
         self.assertEqual(article["primary_source_type"], "OFFICIAL")
         self.assertIn("условия доступа", article["primary_source_content"])
-        self.assertEqual(article["primary_source_title"], "Сообщение Банка России")
+        self.assertEqual(article["primary_source_title"], "Решение регулятора")
         self.assertEqual(article["primary_source_status"], "READ")
 
     def test_unreadable_explicit_document_forces_editor_review(self):
@@ -97,7 +97,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
         self.assertEqual(article["primary_source_url"], url)
         self.assertIn("сроки применения", article["primary_source_content"])
 
-    def test_transient_network_timeout_gets_one_retry(self):
+    def test_network_timeout_does_not_repeat_the_full_wait(self):
         class Headers:
             def get_content_type(self):
                 return "text/html"
@@ -109,9 +109,9 @@ class PrimarySourceExtractionTests(unittest.TestCase):
             def geturl(self): return "https://news.example/article"
         with patch("newsroom.core.time.sleep"), \
              patch("newsroom.core.urllib.request.urlopen", side_effect=[TimeoutError("timed out"), Response()]) as opener:
-            result = _request_with_url("https://news.example/article")
-        self.assertEqual(result, (b"body", "https://news.example/article", "text/html"))
-        self.assertEqual(opener.call_count, 2)
+            with self.assertRaises(TimeoutError):
+                _request_with_url("https://news.example/article")
+        self.assertEqual(opener.call_count, 1)
 
     def test_network_error_is_logged_without_url_or_response_text(self):
         error = _safe_source_error(RuntimeError("HTTP Error 403: secret payload at https://host/path?token=private"))
@@ -213,6 +213,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
                        "primary_source_type": "OFFICIAL",
                        "primary_source_publisher": "www.cbr.ru",
                        "primary_source_status": "READ"}
+            article["primary_source_content"] += f' Дата сообщения: {now[:10]}.'
             ai_result = {
                 "action": "NEW_STORY", "story_id": "", "is_relevant": True,
                 "topic_category": "OTHER", "is_concrete": False,
@@ -225,6 +226,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
                 "what_is_new": "Опубликован документ.", "event_status": "DECISION",
                 "publication_recommendation": "AUTO_PUBLISH", "facts": [],
             }
+            ai_result.update(development_date=now[:10], development_date_evidence=article["primary_source_content"])
             with patch("newsroom.core.fetch_publisher_article", return_value=article) as fetch, \
                  patch("newsroom.core.get_api_key", return_value="test-key"), \
                  patch("newsroom.core.analyze_with_ai", return_value=ai_result) as analyze:
@@ -269,6 +271,8 @@ class PrimarySourceExtractionTests(unittest.TestCase):
                 "what_is_new": "Опубликовано решение.", "event_status": "DECISION",
                 "publication_recommendation": "AUTO_PUBLISH", "facts": [],
             }
+            item["primary_source_content"] += f' Дата сообщения: {now[:10]}.'
+            ai_result.update(development_date=now[:10], development_date_evidence=item["primary_source_content"])
             with patch("newsroom.core.get_api_key", return_value="test-key"), \
                  patch("newsroom.core.analyze_with_ai", return_value=ai_result) as analyze:
                 process_item(db, source, item, 0.35, 700, 48, ai_settings={"model": "test"})

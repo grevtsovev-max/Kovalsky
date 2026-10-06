@@ -16,7 +16,7 @@ class MemoryIntegrationTests(unittest.TestCase):
                       facts=[{'text':self.evidence,'claim_type':'FACT'}])
         result['memory']={'match_status':'CERTAIN','existing_event_id':'',
             'event':{'subject':'Банк России','action':'установил','object':'условия доступа','jurisdiction':'RU',
-                     'event_date':'2026-09-28','statement_date':'','effective_date':'','document_id':'','stage':'APPROVED'},
+                     'event_date':self.now[:10],'statement_date':'','effective_date':'','document_id':'','stage':'APPROVED'},
             'claims':[{'subject':'Банк России','predicate':'условия доступа','scope':'цифровые активы RU','value':value,
                 'statement':self.evidence,'claim_type':'FACT','source_quote':self.evidence,'post_quote':self.evidence,
                 'valid_from':'','valid_to':'','previous_fact_id':previous,'relation':relation,

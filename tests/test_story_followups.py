@@ -26,7 +26,7 @@ class StoryFollowupTests(unittest.TestCase):
         with patch('newsroom.core.fetch_publisher_article',return_value=article), patch('newsroom.core.get_api_key',return_value='test'), patch('newsroom.core.analyze_with_ai',return_value=result):
             return process_item(self.db,self.source,item,0.35,3500,48,ai_settings={'model':'test'})
 
-    def test_updates_link_first_publication_and_duplicates_create_no_post(self):
+    def test_updates_link_relevant_previous_publication_and_duplicates_create_no_post(self):
         story=self.create_first()
         for number in (2,3):
             self.assertEqual(self.next_item('UPDATE',story,number),'UPDATE_CANDIDATE')
@@ -34,8 +34,8 @@ class StoryFollowupTests(unittest.TestCase):
                 publish(self.db,self.config,number,automatic=True)
                 text=send.call_args.args[1]
                 self.assertIn(f'Дополнение номер {number}',text)
-                self.assertIn('https://t.me/test_channel/101',text)
-                self.assertNotIn('https://t.me/test_channel/102',text)
+                self.assertIn(f'https://t.me/test_channel/{99+number}',text)
+                self.assertNotIn(f'https://t.me/test_channel/{100+number}',text)
                 self.assertEqual(text.count('Ранее:'),1)
                 self.assertIn('https://www.cbr.ru/crypto',text)
         self.assertEqual(self.next_item('DUPLICATE',story,4),'DUPLICATE')

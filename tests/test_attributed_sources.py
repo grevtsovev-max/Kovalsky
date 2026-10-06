@@ -15,7 +15,7 @@ class AttributedSourceTests(integration.MemoryIntegrationTests):
         self.prepare()
         self.db.execute("UPDATE sources SET name='Издание',priority=1,reputation='unknown',source_role='aggregator'")
         self.source = self.db.execute('SELECT * FROM sources').fetchone()
-        self.evidence = 'По данным издания, Банк России установил условия доступа российских участников к цифровым активам.'
+        self.evidence = f'По данным издания, Банк России установил условия доступа российских участников к цифровым активам {self.now[:10]}.'
         self.article = dict(self.item, content=self.evidence, material_read=True,
                             material_url=self.item['url'], primary_source_status=status)
         result = self.result()

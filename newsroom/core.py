@@ -272,10 +272,10 @@ def _safe_source_error(exc: Exception) -> str:
         return message.upper()
     if "certificate_verify_failed" in message or "certificate verify failed" in message:
         return "TLS_CERTIFICATE_ERROR"
+    if isinstance(getattr(exc, "reason", exc), TimeoutError) or "timed out" in message or "timeout" in message:
+        return "NETWORK_TIMEOUT"
     if "handshake" in message or "ssl" in message or "tls" in message:
         return "TLS_CONNECTION_ERROR"
-    if "timed out" in message or "timeout" in message:
-        return "NETWORK_TIMEOUT"
     code = re.search(r"(?:http error|http)[_\s]*(\d{3})", message)
     if code:
         return f"HTTP_{code.group(1)}"
@@ -2441,7 +2441,11 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             ai_input['editorial_feedback'] = []
             if previous_analysis:
                 previous_result = json.loads(previous_analysis["result_json"])
-                ai_input["editorial_feedback"] = previous_result.get("editorial_issues", []) + previous_result.get("memory_issues", [])
+                ai_input["editorial_feedback"] = [
+                    issue for key in ("editorial_issues", "memory_issues")
+                    for issue in (previous_result.get(key) if isinstance(previous_result.get(key), list) else [])
+                    if isinstance(issue, str)
+                ]
             stage_started = time.perf_counter()
             history_revision = _editor_history_revision(db, item)
             rules = (Path(__file__).resolve().parent.parent / "EDITORIAL_RULES.md").read_text()
@@ -2494,8 +2498,9 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             db.execute("INSERT INTO errors(source_id,timestamp,message) VALUES(?,?,?)",
                        (source["source_id"], NOW(), f"AI editor unavailable ({reason}); item held for automatic retry."))
             db.commit()
+            from .diagnostics import error_location
             db.execute("INSERT INTO app_state(key,value) VALUES('ai_last_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       (json.dumps({"at":NOW(),"code":reason}),))
+                       (json.dumps({"at":NOW(),"code":reason,"location":error_location(exc)}),))
             db.commit()
             ai_settings["_disabled_for_cycle"] = True
             ai_result = None
@@ -2943,7 +2948,8 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
     limit = min(limit, max(0, int(config.get("newsroom", {}).get("retry_items_per_cycle", 2))))
     ai_settings = config.get("ai", {})
     if ai_settings.get("triage_enabled"):
-        limit = min(limit, max(0, int(ai_settings.get("_triage_budget", 0))))
+        limit = min(limit, max(0, int(ai_settings.get("_triage_budget",
+                    config.get("newsroom", {}).get("triage_per_cycle", 12)))))
     if "_analysis_budget" in ai_settings:
         limit = min(limit, max(0, int(ai_settings.get("_analysis_budget", 0))))
     if limit <= 0:

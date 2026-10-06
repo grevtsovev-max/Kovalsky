@@ -63,9 +63,10 @@ class RecoverySeptember28Tests(unittest.TestCase):
             now=datetime.now(timezone.utc).isoformat()
             item={'url':'https://media.example/story','title':'Цифровую валюту используют как залог','content':'Описание','published_at':now,'primary_source_status':'NO_LINK'}
             self.assertEqual(process_item(db,source,item,.35,3500,48,ai_settings={}), 'PRIMARY_RETRY')
-            evidence='Российские организации смогут использовать цифровую валюту в качестве предмета залога.'
+            evidence=f'Российские организации смогут использовать цифровую валюту в качестве предмета залога {now[:10]}.'
             article=dict(item,primary_source_status='READ',primary_source_url='https://cbr.ru/decision',primary_source_content=evidence)
             result={'action':'NEW_STORY','is_relevant':True,'geographic_scope':'RUSSIA','confidence':0.9,'russia_cis_impact':'DIRECT','impact_evidence':evidence,'publication_recommendation':'AUTO_PUBLISH','editorial_check':{"source_matches_event": True, "attribution_preserved": True, "stage_preserved": True, "history_required": False, "history_explained": False, "history_note": "", "headline_main_event": True, "lead_event_first": True, "paragraphs_concise_distinct": True, "no_editorial_process_notes": True},'headline_ru':'🇷🇺 Банк России установил новые правила','summary_ru':evidence}
+            result.update(development_date=now[:10], development_date_evidence=evidence)
             with patch('newsroom.core.fetch_publisher_article',return_value=article) as fetch, patch('newsroom.core.get_api_key',return_value='test'), patch('newsroom.core.analyze_with_ai',return_value=result):
                 outcomes=_retry_ai_held_items(db,{source['source_id']:source},{'newsroom':{},'ai':{}})
             self.assertEqual(outcomes,{'NEW_STORY':1});fetch.assert_called_once()
