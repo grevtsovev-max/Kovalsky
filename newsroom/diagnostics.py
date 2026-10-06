@@ -45,8 +45,8 @@ def snapshot(db, config):
     state = {}
     if 'app_state' in tables:
         for row in db.execute("SELECT key,value FROM app_state WHERE key IN "
-                              "('ai_last_error','ai_last_success','digest_scheduler_last_tick_at','diagnostic_last_error','api_account_blocked_until')"):
-            if row[0] in {'ai_last_error', 'diagnostic_last_error'}:
+                              "('ai_last_error','ai_last_success','digest_scheduler_last_tick_at','diagnostic_last_error','api_account_blocked_until','material_processor_heartbeat','material_processor_error')"):
+            if row[0] in {'ai_last_error', 'diagnostic_last_error', 'material_processor_error'}:
                 try:
                     value = json.loads(row[1])
                 except (TypeError, ValueError):
@@ -58,6 +58,7 @@ def snapshot(db, config):
     return {'release': release if re.fullmatch('[0-9a-f]{40}', release) else None,
             'code_hashes': {name: hashlib.sha256((root/name).read_bytes()).hexdigest()
                             for name in ('workflow.py','runtime.py','core.py','cli.py','diagnostics.py')},
+            'independent_processing': bool(config.get('newsroom', {}).get('independent_processing')),
             'processing_workers': max(1, min(8, int(config.get('newsroom', {}).get('processing_workers', 2)))),
             'api_concurrency': max(1, min(8, int(config.get('ai', {}).get('api_concurrency', 2)))),
             'processing_limits': {key: int(config.get('newsroom', {}).get(key, default))

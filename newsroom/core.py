@@ -953,10 +953,21 @@ def _independent_candidates(item: dict, candidates: list[dict], trusted_domains:
     return [entry for _, entry in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit]]
 
 
-def fetch_google_news(url: str) -> list[dict]:
+def fetch_google_news(url: str, *, read_articles=True) -> list[dict]:
     """Use Google News for discovery, then resolve and read each publisher article."""
     root = ET.fromstring(_request(url))
     entries = root.findall(".//item")[:6]
+    if not read_articles:
+        result = []
+        for node in entries:
+            link = (node.findtext('link') or '').strip()
+            if not link:
+                continue
+            result.append({'url': link, 'title': node.findtext('title') or '',
+                           'description': node.findtext('description') or '', 'content': '',
+                           'publisher_name': node.findtext('source') or '',
+                           'published_at': parse_date(node.findtext('pubDate'))})
+        return FetchedItems(result, [])
 
     def read_entry(node):
         fields = {child.tag.rsplit("}", 1)[-1].lower(): child for child in node}
@@ -1422,7 +1433,10 @@ def _primary_source_from_item(item: dict, status: str) -> dict | None:
 def _read_feed_article(item: dict, publisher_name: str) -> str:
     """Read a fresh RSS/Atom article page and its linked primary source once."""
     try:
-        article = fetch_publisher_article(item["url"], publisher_name, item.get("published_at"), timeout=8)
+        article_url = item['url']
+        if (urllib.parse.urlsplit(article_url).hostname or '').lower() == 'news.google.com':
+            article_url = decode_google_news_url(article_url)
+        article = fetch_publisher_article(article_url, publisher_name, item.get("published_at"), timeout=8)
     except Exception as exc:
         item["material_read"] = False
         item["primary_source_status"] = "ARTICLE_UNREADABLE"
@@ -1432,6 +1446,7 @@ def _read_feed_article(item: dict, publisher_name: str) -> str:
         "title": article["title"] or item["title"],
         "description": article.get("description") or item.get("description", ""),
         "content": article["content"],
+        "published_at": item.get("published_at") or article.get("published_at"),
         "publisher_name": article.get("publisher_name") or publisher_name,
         "material_read": article.get("material_read", False),
         "material_url": article.get("material_url", article["url"]),
@@ -2140,6 +2155,8 @@ def _save_item(db, source, item, existing_item_id=None):
         else:
             item_id = existing_item_id
             prior = db.execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
+            if prior and item.get('_expected_revision') and prior['ingest_revision'] != item['_expected_revision']:
+                return None
             if prior and (prior["content_hash"] != content_hash or prior["title_hash"] != title_hash
                           or prior["published_at"] != item.get("published_at")
                           or prior["updated_at"] != item.get("updated_at")):
@@ -2184,6 +2201,9 @@ def process_item_steps(db, source, item: dict, threshold: float, max_length: int
         row = db.execute("SELECT item_id,disposition FROM items WHERE source_id=? AND canonical_url=?",
                          (source["source_id"], canonicalize(item["url"]))).fetchone()
         if row and row["disposition"] == outcome:
+            if item.get('_technical_error'):
+                outcome = 'TECHNICAL_ERROR'
+                db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (outcome, NOW(), row['item_id']))
             if outcome in {"PRIMARY_RETRY", "AI_RETRY", "WAITING_CONFIRMATION"}:
                 retry_without_count = bool(item.get("_retry_without_count") or item.get("_source_search_deferred"))
                 attempts = schedule_retry(
@@ -2224,6 +2244,8 @@ def process_item_steps(db, source, item: dict, threshold: float, max_length: int
                 "STORE_ONLY": "Свидетельство сохранено в памяти; нового повода для поста нет.",
             }.get(outcome, "Обработка завершена."))
             _trace_item(item, "Итог обработки", outcome, summary)
+            from .material_flow import finish_attempt
+            finish_attempt(db, row['item_id'], outcome, item)
             audit = {}
             if item.get("_audit_trace"):
                 audit["audit_trace"] = item["_audit_trace"]
@@ -2369,6 +2391,12 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "NOISE"
+    from .material_flow import load_draft_context
+    resume_context = load_draft_context(db, item_id, item, ai_settings or {})
+    if resume_context:
+        _trace_item(item, 'Продолжение обработки', 'Написание',
+                    'Сохранённый анализ действителен; чтение и полный анализ не повторяются.')
+        return (yield from _finish_post_steps(db, item, ai_settings or {}, resume_context))
     selection = None
     if ai_settings and ai_settings.get("triage_enabled"):
         stage_started = time.perf_counter()
@@ -2389,6 +2417,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 if selection.get('retry_delay_seconds'):
                     item['_retry_delay_seconds'] = selection['retry_delay_seconds']
                 item["_retry_reason"] = selection.get("reason")
+                item["_technical_error"] = selection.get("technical_error", False)
+                item["_flow_block_kind"] = selection.get("block_kind")
             story_id = int(selection["story_id"]) if decision == "DUPLICATE" else None
             db.execute("UPDATE items SET disposition=?,story_id=?,processed_at=? WHERE item_id=?",
                        (outcome, story_id, now, item_id))
@@ -2543,6 +2573,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                         and (publisher_report or str(evidence_source.get('type', '')).startswith(('ORIGINAL_MEDIA_', 'ORIGINAL_SOCIAL_')))):
                     ai_input['editorial_feedback'].extend(_source_evidence_issues(
                         previous_result, str(evidence_source.get('content') or '')))
+                from .material_flow import verification_questions
+                ai_input["editorial_feedback"].extend(verification_questions(previous_result))
                 date_check = previous_result.get("development_date_check")
                 if isinstance(date_check, dict) and isinstance(date_check.get("reason"), str):
                     ai_input["editorial_feedback"].append("Проверка даты события: " + date_check["reason"])
@@ -2609,6 +2641,9 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             if account_unavailable(reason):
                 ai_settings["_disabled_for_cycle"] = True
             ai_result = None
+            from .material_flow import technical_error
+            item['_technical_error'] = technical_error(exc)
+            item['_flow_block_kind'] = 'technical' if item['_technical_error'] else 'transport'
             item["_retry_reason"] = f"ИИ-разбор не завершён: {reason}"
             item["_retry_without_count"] = False
             _trace_item(item, "Редакторский ИИ-разбор", "Ошибка", item["_retry_reason"])
@@ -2919,7 +2954,10 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                     disposition = "REJECTED" if retries and int(retries[0]) >= 3 else "WAITING_CONFIRMATION"
             else:
                 disposition = "REJECTED"
-            reasons = []
+            from .material_flow import verification_questions
+            questions = verification_questions(ai_result)
+            ai_result['verification_questions'] = questions
+            reasons = list(questions)
             if ai_result.get("memory_issues"):
                 reasons.extend(str(value) for value in ai_result["memory_issues"][:3])
             if ai_result.get("source_review_required"):
@@ -2928,26 +2966,84 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 reasons.append("нужна сверка выявленного расхождения")
             if not reasons:
                 reasons.append(f"редакторская рекомендация: {recommendation or 'не задана'}")
+            item["_retry_reason"] = "; ".join(reasons)
+            item["_flow_block_kind"] = "verification"
             _trace_item(item, "Автоматический редакторский допуск", disposition,
                         "; ".join(reasons))
             db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (disposition, now, item_id))
             db.commit()
             return disposition
+    context = {
+        'ai_result': ai_result, 'item_id': item_id, 'primary_source': primary_source,
+        'publisher_report': publisher_report, 'status': status,
+        'has_previous_publication': has_previous_publication if best else False,
+        'headline': headline, 'source_status': source_status, 'publisher_name': publisher_name,
+        'memory_mode': memory_mode, 'memory_diff': memory_diff, 'memory_enforced': memory_enforced,
+        'story_id': story_id, 'best': dict(best) if best else None, 'body': body,
+        'source': dict(source), 'max_length': max_length,
+    }
+    if ai_result:
+        from .material_flow import save_draft_context
+        save_draft_context(db, item_id, item, ai_settings, context)
+    return (yield from _finish_post_steps(db, item, ai_settings, context))
+
+
+def _finish_post_steps(db, item, ai_settings, context):
+    from .workflow import Work
+    from .material_flow import mark
+    now = NOW()
+    ai_options = dict(ai_settings)
+    ai_options['_analysis_only'] = True
+    ai_options['max_post_length'] = context['max_length']
+    ai_result = context['ai_result']
+    item_id = context['item_id']
+    primary_source = context['primary_source']
+    publisher_report = context['publisher_report']
+    status = context['status']
+    has_previous_publication = context['has_previous_publication']
+    headline = context['headline']
+    source_status = context['source_status']
+    publisher_name = context['publisher_name']
+    memory_mode = context['memory_mode']
+    memory_diff = context['memory_diff']
+    memory_enforced = context['memory_enforced']
+    story_id = context['story_id']
+    best = context['best']
+    body = context['body']
+    source = context['source']
+    max_length = context['max_length']
+    if ai_result:
         if ai_result.get('_needs_post_draft'):
             from .ai import draft_post
+            mark(db, item_id, 'drafting', 'RUNNING')
+            db.commit()
             try:
+                from .runtime import cache_key
+                from .ai import _load_editorial_rules
+                draft_key = cache_key('drafting', {'decision': ai_result, 'source': primary_source or publisher_report,
+                    'rules': _load_editorial_rules(ai_options), 'model': ai_options.get('model'),
+                    'max_post_length': max_length, 'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text())})
                 draft = yield Work('editor', draft_post,
-                    (ai_result, primary_source or publisher_report, ai_options))
+                    (ai_result, primary_source or publisher_report, ai_options), key=draft_key, ttl=21600)
             except Exception as exc:
                 from .runtime import BudgetDeferred
                 item['_retry_without_count'] = isinstance(exc, BudgetDeferred)
+                from .material_flow import technical_error
+                item['_technical_error'] = technical_error(exc)
+                item['_flow_block_kind'] = 'technical' if item['_technical_error'] else 'capacity' if isinstance(exc, BudgetDeferred) else 'transport'
                 item['_retry_reason'] = 'Написание поста отложено: ' + getattr(exc, 'code', type(exc).__name__)
+                mark(db, item_id, 'drafting', 'WAITING', item['_retry_reason'],
+                     block_kind='capacity' if isinstance(exc, BudgetDeferred) else 'transport' if isinstance(exc, AIResponseError) else 'technical')
                 _trace_item(item, 'Написание поста', 'AI_RETRY', item['_retry_reason'])
                 db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
                 db.commit()
                 return 'AI_RETRY'
+            mark(db, item_id, 'drafting', 'DONE', 'Текст подготовлен.')
             ai_result.update(draft)
             ai_result['_needs_post_draft'] = False
+            from .material_flow import save_draft_context
+            context['ai_result'] = ai_result
+            save_draft_context(db, item_id, item, ai_settings, context)
             headline = ai_result['headline_ru']
             _trace_item(item, 'Написание поста', 'Завершён', 'Текст подготовлен после проверки актуальности и новизны.')
             db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
@@ -2961,6 +3057,11 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                                  source_name=citation_name, source_is_report=source_is_report)
         if issues:
             ai_result["editorial_issues"] = issues
+            ai_result['_needs_post_draft'] = True
+            from .material_flow import save_draft_context
+            context['ai_result'] = ai_result
+            save_draft_context(db, item_id, item, ai_settings, context)
+            mark(db, item_id, 'drafting', 'WAITING', '; '.join(issues), block_kind='verification')
             _trace_item(item, "Автоматическая проверка текста", "Нужна повторная проверка",
                         "; ".join(issues), issues=issues)
             db.execute("UPDATE item_analysis SET result_json=? WHERE item_id=?",
@@ -3354,7 +3455,7 @@ def _run_cycle(config, db, cleanup):
     from .runtime import attach
     attach(config)
     counts: dict[str, int] = {}
-    reconciled = _reconcile_legacy_retry_loops(db)
+    reconciled = 0 if config.get("_collection_only") else _reconcile_legacy_retry_loops(db)
     if reconciled:
         counts["RETRY_HISTORY_RECONCILED"] = reconciled
     sources = []
@@ -3469,7 +3570,7 @@ def _run_cycle(config, db, cleanup):
         if source_type == "web":
             return fetch_web(source["url"])
         if source_type == "google_news":
-            return fetch_google_news(source["url"])
+            return fetch_google_news(source["url"], read_articles=False) if config.get("_collection_only") else fetch_google_news(source["url"])
         if source_type == "web_search":
             return fetch_web_search(web_search_queries, config.get("ai", {}))
         if source_type == "x":
@@ -3503,8 +3604,8 @@ def _run_cycle(config, db, cleanup):
     # Fetch concurrently and begin processing each source as soon as it returns;
     # waiting in configuration order would let one slow publisher hold up every
     # already available news item and consume the source-to-publication budget.
-    from .workflow import Coordinator, enqueue
-    coordinator = Coordinator(db, config, counts)
+    from .workflow import Coordinator, CollectionCoordinator, enqueue
+    coordinator = CollectionCoordinator() if config.get("_collection_only") else Coordinator(db, config, counts)
     cleanup.callback(coordinator.abort)
     def completed_sources(pending):
         from concurrent.futures import wait, FIRST_COMPLETED
@@ -3635,10 +3736,13 @@ def _run_cycle(config, db, cleanup):
             category='watch')
         return 'QUEUED' if queued else 'DUPLICATE'
     counts.update(run_story_watch(db, config, web_search_quota, process_story_watch_item))
-    watch_coordinator = Coordinator(db, config, counts, categories=('watch',), max_jobs=watch_reserve)
+    watch_coordinator = CollectionCoordinator() if config.get('_collection_only') else Coordinator(db, config, counts, categories=('watch',), max_jobs=watch_reserve)
     cleanup.callback(watch_coordinator.abort)
     watch_coordinator.close()
     stage_times["story_watch_seconds"] = time.perf_counter() - story_watch_started
+    if config.get('_collection_only'):
+        _log_timing('collection_stage_timing', total_seconds=round(time.perf_counter()-run_started, 3), **stage_times)
+        return counts
     # Give newly fetched material and due story watches first access to the
     # shared model budgets. Held-item retries are bounded and run afterward;
     # their reserved slots remain available even when fresh work is heavy.

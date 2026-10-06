@@ -55,6 +55,10 @@ class Work:
     stage: str | None = None
 
     def execute(self, runtime=None, scope=None):
+        if runtime:
+            from .agent_control import require_enabled
+            control = runtime.settings.get('_agent_control_config') or {'newsroom': {'database': runtime.database}}
+            require_enabled(control)
         from .resources import FUNCTION_STAGES
         stage = self.stage or FUNCTION_STAGES.get(getattr(self.function, '__name__', ''), 'unattributed')
         measurement = runtime.measure(stage, self.role, scope) if runtime else nullcontext({})
@@ -64,8 +68,14 @@ class Work:
     def _execute(self, runtime, scope, measured):
         token = SCOPE.set({**SCOPE.get(), **(scope or {}), "role": self.role, "runtime": runtime})
         try:
+            stage_name = 'drafting' if getattr(self.function, '__name__', '') == 'draft_post' else 'screening' if self.role == 'filter' else 'analysis' if self.role == 'editor' else 'reading'
             if runtime and self.key:
                 cached = runtime.cached(self.key, self.role)
+                if cached is None and SCOPE.get().get('item_id') is not None:
+                    from .material_flow import get
+                    with runtime.db() as db:
+                        if db.execute("SELECT 1 FROM sqlite_master WHERE name='material_stage_results'").fetchone():
+                            cached = get(db, SCOPE.get()['item_id'], stage_name, self.key)
                 if cached is not None:
                     measured['status'] = 'CACHED'
                     return cached
@@ -78,8 +88,18 @@ class Work:
             structured = self.role != 'editor' or (isinstance(result, dict) and
                 result.get('action') in {'NEW_STORY', 'UPDATE', 'DUPLICATE', 'NOISE'}
                 and result.get('publication_recommendation') != 'WAIT_FOR_AUTOMATION')
+            if self.role == 'filter':
+                structured = isinstance(result, dict) and result.get('decision') in {'KEEP','NOISE','DUPLICATE'}
+            if getattr(self.function, '__name__', '') == 'draft_post':
+                structured = isinstance(result, dict) and set(result) == {'headline_ru','summary_ru','what_is_new','editorial_check'}
             if runtime and self.key and result is not None and readable and structured:
                 runtime.store(self.key, self.role, result, self.ttl)
+                if SCOPE.get().get('item_id') is not None:
+                    from .material_flow import put, revision
+                    with runtime.db() as db:
+                        if (db.execute("SELECT 1 FROM sqlite_master WHERE name='material_stage_results'").fetchone()
+                                and (not SCOPE.get().get('revision') or revision(db, SCOPE.get()['item_id']) == SCOPE.get()['revision'])):
+                            put(db, SCOPE.get()['item_id'], stage_name, self.key, result)
             return result
         finally:
             SCOPE.reset(token)
@@ -131,16 +151,67 @@ def enqueue(db, item_id, item, source, options, *, category="fresh"):
                "WHERE processing_jobs.status='DONE'",
                (item_id, revision, category, json.dumps(payload, ensure_ascii=False),
                 source["priority"], stamp(), stamp()))
+    from .material_flow import mark
+    mark(db, item_id, 'intake', 'DONE', 'Входной материал сохранён.')
     db.commit()
     return item_id
+
+
+class CollectionCoordinator:
+    """Collection persists inputs; the independent processor owns all work."""
+    running = {}
+    def tick(self): pass
+    def close(self): pass
+    def abort(self): pass
+
+
+class StageExecutor:
+    """Separate bounded queues: blocked article readers cannot occupy editors."""
+    def __init__(self, workers):
+        import threading
+        self.stopping = threading.Event()
+        self.pools = {name: ThreadPoolExecutor(max_workers=workers, thread_name_prefix='newsroom-'+name)
+                      for name in ('reading', 'screening', 'analysis', 'drafting')}
+
+    def submit(self, function, *args):
+        work = function.__self__
+        name = getattr(work.function, '__name__', '')
+        stage = 'drafting' if name == 'draft_post' else 'screening' if work.role == 'filter' else 'analysis' if name in {'analyze', 'analyze_with_ai'} else 'reading'
+        def invoke():
+            runtime, scope = args
+            if runtime and scope.get('item_id') is not None:
+                from .material_flow import mark
+                with runtime.db() as db:
+                    mark(db, scope['item_id'], stage, 'RUNNING')
+            from .runtime import BudgetDeferred
+            while not self.stopping.is_set():
+                try:
+                    return function(*args)
+                except BudgetDeferred as exc:
+                    if exc.reason != 'concurrency':
+                        raise
+                    if runtime and scope.get('item_id') is not None:
+                        from .material_flow import mark
+                        with runtime.db() as db:
+                            mark(db, scope['item_id'], stage, 'READY', 'Ожидает свободного места API.', block_kind='capacity')
+                    self.stopping.wait(.5)
+            raise BudgetDeferred('shutdown', 1)
+        return self.pools[stage].submit(invoke)
+
+    def shutdown(self, wait=True):
+        self.stopping.set()
+        for pool in self.pools.values():
+            pool.shutdown(wait=wait)
 
 
 class Coordinator:
     def __init__(self, db, config, counts, *, categories=('fresh',), max_jobs=None):
         self.db, self.config, self.counts = db, config, counts
         self.runtime = config.get("ai", {}).get("_runtime")
-        self.workers = max(1, min(8, int(config.get("newsroom", {}).get("processing_workers", 2))))
-        self.pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="newsroom-stage")
+        lane_workers = max(1, min(8, int(config.get("newsroom", {}).get("processing_workers", 2))))
+        self.continuous = bool(config.get('_continuous_processing'))
+        self.workers = min(16, lane_workers * 4) if self.continuous else lane_workers
+        self.pool = StageExecutor(lane_workers) if self.continuous else ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="newsroom-stage")
         self.running = {}
         self.owner = uuid.uuid4().hex
         self.started = time.perf_counter()
@@ -176,7 +247,7 @@ class Coordinator:
                         "WHERE status='RUNNING' AND lease_until<?", (stamp(),))
         self.db.execute("UPDATE processing_jobs SET status='DONE',finished_at=?,outcome=(SELECT disposition FROM items WHERE items.item_id=processing_jobs.item_id) "
                         "WHERE status IN ('PENDING','WAITING') AND EXISTS(SELECT 1 FROM items i WHERE i.item_id=processing_jobs.item_id "
-                        "AND i.disposition IN ('REJECTED','STALE','UNDATED','BASELINE_SKIPPED','NOISE','DUPLICATE','STORE_ONLY','NEW_STORY','UPDATE_CANDIDATE','AGENT_CORRECTION_QUEUED') "
+                        "AND i.disposition IN ('TECHNICAL_ERROR','REJECTED','STALE','UNDATED','BASELINE_SKIPPED','NOISE','DUPLICATE','STORE_ONLY','NEW_STORY','UPDATE_CANDIDATE','AGENT_CORRECTION_QUEUED') "
                         "AND julianday(i.processed_at)>=julianday(processing_jobs.created_at,'-1 second'))", (stamp(),))
         self.db.commit()
 
@@ -188,27 +259,31 @@ class Coordinator:
         return (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(timespec="microseconds")
 
     def _claim(self):
-        if self.stop_admission or time.perf_counter() - self.started >= self.budget_seconds or (
+        if self.stop_admission or (not self.continuous and time.perf_counter() - self.started >= self.budget_seconds) or (
                 self.max_jobs is not None and self.claimed >= self.max_jobs):
             return None
         self.db.commit()
         self.db.execute("BEGIN IMMEDIATE")
         # Aging is a separate FIFO lane, not an arbitrary relevance score.
         marks = ','.join('?' for _ in self.categories)
-        preferred = ('WAITING_CONFIRMATION', '', 'PRIMARY_RETRY', '', 'AI_RETRY', '')[self.claimed % 6] if self.categories == ('retry',) else ''
+        preferred = ('WAITING_CONFIRMATION', '', 'PRIMARY_RETRY', '', 'AI_RETRY', '')[self.claimed % 6] if 'retry' in self.categories else ''
+        preferred_category = ('fresh', 'retry', 'fresh', 'watch')[self.claimed % 4] if self.continuous else ''
+        preferred_stage = ('drafting', '', 'analysis', '', 'reading', '', 'screening', '')[self.claimed % 8] if self.continuous else ''
         candidates = self.db.execute("SELECT j.*,i.story_id AS current_story_id FROM processing_jobs j JOIN items i ON i.item_id=j.item_id "
                               "JOIN sources s ON s.source_id=i.source_id "
-                              "WHERE j.status IN ('PENDING','WAITING') AND j.next_at<=? "
+                              "WHERE j.status IN ('PENDING','WAITING') AND j.next_at<=? AND i.disposition<>'TECHNICAL_ERROR' "
                               "AND (s.active=1 OR s.type='manual' OR s.url LIKE 'story-watch://%') "
                               f"AND j.category IN ({marks}) "
                               "AND NOT EXISTS(SELECT 1 FROM processing_jobs busy WHERE busy.item_id=j.item_id AND busy.status='RUNNING') "
                               # Rotate reading, analysis and confirmation;
                               # every other slot remains oldest-due FIFO.
-                              "ORDER BY CASE WHEN i.disposition=? THEN 0 ELSE 1 END,"
+                              "ORDER BY CASE WHEN j.category=? THEN 0 ELSE 1 END,"
+                              "CASE WHEN (SELECT stage FROM material_stage_state st WHERE st.item_id=i.item_id AND st.revision=i.ingest_revision AND st.status IN ('READY','WAITING') ORDER BY updated_at DESC LIMIT 1)=? THEN 0 ELSE 1 END,"
+                              "CASE WHEN i.disposition=? THEN 0 ELSE 1 END,"
                               "CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN 0 ELSE 1 END,"
                               "CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN j.next_at ELSE NULL END,"
                               "j.priority DESC,j.next_at,j.created_at,j.job_id", (stamp(), *self.categories,
-                              preferred))
+                              preferred_category, preferred_stage, preferred))
         busy = self.db.execute("SELECT j.payload_json,i.story_id FROM processing_jobs j JOIN items i USING(item_id) WHERE j.status='RUNNING'").fetchall()
         def related(candidate):
             from .core import canonicalize, similarity
@@ -240,6 +315,10 @@ class Coordinator:
         return row and row["status"] == "RUNNING" and row["owner"] == self.owner and row['revision'] == row['ingest_revision']
 
     def _advance(self, job, generator, value=None, error=None):
+        # Collection has its own connection. Validate under the write lock so
+        # another material revision cannot enter midway through a local step.
+        self.db.commit()
+        self.db.execute('BEGIN IMMEDIATE')
         if not self._valid(job):
             generator.close()
             self.db.execute("UPDATE processing_jobs SET status='SUPERSEDED',finished_at=?,owner=NULL,lease_until=NULL "
@@ -258,9 +337,6 @@ class Coordinator:
             self.counts[outcome] = self.counts.get(outcome, 0) + 1
             held = outcome in {"AI_RETRY", "PRIMARY_RETRY", "WAITING_CONFIRMATION"}
             capacity = bool(job.get("_item", {}).get("_retry_without_count"))
-            if capacity and job.get('_editor_retry_incremented'):
-                self.db.execute("UPDATE app_state SET value=CAST(MAX(0,CAST(value AS INTEGER)-1) AS TEXT) WHERE key=?",
-                                (f"editor_retry:{job['item_id']}",))
             next_at = stamp()
             if held:
                 retry = self.db.execute("SELECT value FROM app_state WHERE key=?", (f"selection_retry:{job['item_id']}",)).fetchone()
@@ -277,7 +353,7 @@ class Coordinator:
                              outcome, next_at, None if held else stamp(), job["job_id"]))
             self._event(job["job_id"], "editor", "WAITING" if held else "DONE")
             self.db.commit()
-            if held and capacity and job.get('_item', {}).get('_budget_deferred'):
+            if not self.continuous and held and capacity and job.get('_item', {}).get('_budget_deferred'):
                 self.stop_admission = True
             return
         except Exception as exc:
@@ -299,10 +375,14 @@ class Coordinator:
                             (status, type(exc).__name__, due, stamp() if status == "DONE" else None, job["job_id"]))
             self.db.commit()
             return
+        from .material_flow import mark
+        stage = 'drafting' if getattr(work.function, '__name__', '') == 'draft_post' else 'screening' if work.role == 'filter' else 'analysis' if getattr(work.function, '__name__', '') in {'analyze', 'analyze_with_ai'} else 'reading'
+        mark(self.db, job['item_id'], stage, 'READY' if self.continuous else 'RUNNING')
+        job['_stage'] = stage
         self.db.execute("UPDATE processing_jobs SET role=?,lease_until=? WHERE job_id=?", (work.role, self._lease(), job["job_id"]))
         self._event(job["job_id"], work.role, "RUNNING")
         self.db.commit()
-        scope = {"item_id": job["item_id"], "job_id": job["job_id"], "category": job["category"]}
+        scope = {"item_id": job["item_id"], "job_id": job["job_id"], "category": job["category"], "revision": job["revision"]}
         future = self.pool.submit(work.execute, self.runtime, scope)
         self.running[future] = (job, generator)
 
@@ -316,6 +396,9 @@ class Coordinator:
             except Exception as exc:
                 self._advance(job, generator, error=exc)
             else:
+                from .material_flow import mark
+                if job.get('_stage') and self._valid(job):
+                    mark(self.db, job['item_id'], job['_stage'], 'DONE')
                 self._advance(job, generator, value=value)
         self.db.execute("UPDATE processing_jobs SET lease_until=? WHERE owner=? AND status='RUNNING'", (self._lease(), self.owner))
         self.db.commit()
@@ -330,14 +413,8 @@ class Coordinator:
                 from .core import _saved_material
                 saved = self.db.execute('SELECT * FROM items WHERE item_id=?', (job['item_id'],)).fetchone()
                 job['_item'].update(_saved_material(saved, payload['source']))
+            job['_item']['_expected_revision'] = job['revision']
             job['_item']['_workflow_first_attempt'] = job['attempts'] == 0 and job['category'] == 'fresh'
-            if job['category'] == 'retry':
-                row = self.db.execute('SELECT disposition FROM items WHERE item_id=?', (job['item_id'],)).fetchone()
-                if row['disposition'] == 'WAITING_CONFIRMATION':
-                    self.db.execute("INSERT INTO app_state(key,value) VALUES(?,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
-                                    (f"editor_retry:{job['item_id']}",))
-                    self.db.commit()
-                    job['_editor_retry_incremented'] = True
             generator = process_item_steps(self.db, payload["source"], job["_item"],
                 **payload["options"], ai_settings=self.config.get("ai", {}), existing_item_id=job["item_id"],
                 post_ready_callback=self.config.get("_publish_ready_callback"))
@@ -393,4 +470,9 @@ def snapshot(db, now=None):
                    for row in db.execute("SELECT created_at,started_at FROM processing_jobs WHERE started_at>=?", (cutoff,)))
     if waits:
         result["wait_p95_seconds"] = waits[max(0, math.ceil(len(waits) * .95) - 1)]
+    if 'material_stage_state' in tables:
+        result['stages'] = [dict(row) for row in db.execute(
+            "SELECT st.stage,st.status,st.block_kind,COUNT(*) AS count FROM material_stage_state st "
+            "JOIN items i ON i.item_id=st.item_id AND i.ingest_revision=st.revision "
+            "WHERE st.status IN ('READY','RUNNING','WAITING','ERROR') GROUP BY st.stage,st.status,st.block_kind")]
     return result

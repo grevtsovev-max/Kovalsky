@@ -241,6 +241,17 @@ def _submit_locked(config: dict, url: str, retry_after_credits_restored: bool = 
                             "_retry_cycle_delay_seconds": min(
                                 180, max(30, int(config["newsroom"].get("poll_interval_seconds", 180))))})
         started = time.perf_counter()
+        if config['newsroom'].get('independent_processing'):
+            from .workflow import enqueue
+            item_id = enqueue(db, existing_item_id, article, source_values, {
+                'threshold': float(config['newsroom'].get('similarity_threshold', .35)),
+                'max_length': int(config['newsroom'].get('max_post_length', 3500)),
+                'freshness_hours': int(config['newsroom'].get('freshness_window_hours', 24)),
+                'initial_backfill_minutes': None, 'relevance_terms': config['newsroom'].get('relevance_terms', []),
+            }, category='retry' if existing_item_id else 'fresh')
+            return {'item_id': item_id, 'outcome': 'QUEUED', 'posts': [], 'published': 0,
+                    'publication_failed': 0, 'publication_rejected': 0,
+                    'message': 'Прочитанный материал сохранён; обработка продолжится в общей очереди.'}
         outcome = process_item(
             db, source_values, article,
             float(config["newsroom"].get("similarity_threshold", 0.35)),

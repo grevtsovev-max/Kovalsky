@@ -204,7 +204,8 @@ def screen_steps(db, item_id, item, settings):
         settings['_triage_budget'] -= 1
     try:
         db.commit()
-        result = yield Work('filter', classify, (dict(item), candidates, feedback, dict(settings)))
+        from .runtime import cache_key
+        result = yield Work('filter', classify, (dict(item), candidates, feedback, dict(settings)), key=cache_key('screening', fingerprint), ttl=21600)
     except BudgetDeferred as exc:
         return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен: исчерпан общий бюджет запросов',
                 'retry_without_count': True, 'budget_deferred': exc.reason != 'concurrency',
@@ -215,8 +216,10 @@ def screen_steps(db, item_id, item, settings):
         if account_unavailable(code):
             settings['_triage_disabled'] = True
         db.execute('INSERT INTO errors(timestamp,message) VALUES(?,?)', (datetime.now(timezone.utc).isoformat(), 'TRIAGE:'+code))
+        from .material_flow import technical_error
         return {'decision': 'DEFER', 'reason': f'Ранний отбор не завершён: {code}',
-                'retry_without_count': False}
+                'retry_without_count': False, 'technical_error': technical_error(exc),
+                'block_kind': 'technical' if technical_error(exc) else 'transport'}
     current = _hash([VERSION, {key:item.get(key) for key in ('title','description','content')},
                      published_candidates(db, item), feedback_examples(db), settings.get("_topic_registry")])
     if current != fingerprint:

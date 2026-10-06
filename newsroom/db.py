@@ -247,6 +247,8 @@ def connect(path: str) -> sqlite3.Connection:
         if name not in runtime_columns:
             db.execute(f'ALTER TABLE api_usage ADD COLUMN {name} {declaration}')
     db.executescript(WORKFLOW_SCHEMA)
+    from .material_flow import SCHEMA as MATERIAL_FLOW_SCHEMA
+    db.executescript(MATERIAL_FLOW_SCHEMA)
     correction_columns = {row[1] for row in db.execute('PRAGMA table_info(telegram_feedback_corrections)')}
     if 'next_attempt_at' not in correction_columns:
         db.execute('ALTER TABLE telegram_feedback_corrections ADD COLUMN next_attempt_at TEXT')

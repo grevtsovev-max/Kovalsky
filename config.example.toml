@@ -1,4 +1,6 @@
 [newsroom]
+# Постоянные очереди этапов работают независимо от сбора.
+independent_processing = true
 database = "data/newsroom.sqlite3"
 poll_interval_seconds = 180
 retry_items_per_cycle = 2

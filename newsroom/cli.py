@@ -436,6 +436,9 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
             failed += 1
             continue
         if not is_eligible_for_auto_publish(row, cutoff, config.get("ai", {}).get("_topic_registry")):
+            if row['origin_item_id']:
+                from .material_flow import mark
+                mark(db, row['origin_item_id'], 'gate', 'CLOSED', 'Условия автоматического допуска не выполнены.')
             db.execute("UPDATE posts SET status='REJECTED',editor_decision='AUTO_REJECTED',auto_last_error='AUTO_PUBLISH_GATE_FAILED' WHERE post_id=?",
                        (post_id,))
             db.commit()
@@ -1040,15 +1043,30 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         memory_issues = publication_issues(db, post_id, post['text'])
         if memory_issues:
             raise RuntimeError('Publication memory gate: ' + ', '.join(memory_issues))
+    if post['origin_item_id']:
+        from .material_flow import mark
+        mark(db, post['origin_item_id'], 'gate', 'DONE', 'Проверки текста, доказательств и опубликованной истории выполнены.')
+        mark(db, post['origin_item_id'], 'delivery', 'RUNNING', 'Отправка через штатный журнал доставки.')
+        db.commit()
     publish_started = time.perf_counter()
     try:
         external_id = deliver(db, config, f"post:{post_id}", post["text"], telegram_send, post_id=post_id)
     except Exception as exc:
+        if post['origin_item_id']:
+            from .material_flow import mark
+            mark(db, post['origin_item_id'], 'delivery', 'WAITING',
+                 'Результат отправки неизвестен; требуется сверка.' if isinstance(exc, DeliveryUncertain) else 'Отправка не завершена: '+type(exc).__name__,
+                 block_kind='delivery_unknown' if isinstance(exc, DeliveryUncertain) else 'transport')
+            db.commit()
         _log_timing("telegram_publish_timing", post_id=post_id,
                     seconds=round(time.perf_counter() - publish_started, 3),
                     result="ERROR", error_type=type(exc).__name__)
         raise
     publish_seconds = time.perf_counter() - publish_started
+    if post['origin_item_id']:
+        from .material_flow import mark
+        mark(db, post['origin_item_id'], 'delivery', 'DONE', 'Ответ Telegram сохранён; публикация подтверждена.')
+        db.commit()
     reconcile_posts(db, config)
     print(f"Опубликовано в Telegram, message_id={external_id}")
     _log_timing("telegram_publish_timing", post_id=post_id,
@@ -1085,6 +1103,12 @@ def run_one_cycle(config: dict, db_path: str) -> dict[str, int]:
 
     cycle_config = dict(config)
     cycle_config["_publish_ready_callback"] = publish_ready_posts
+    if config.get('newsroom', {}).get('independent_processing'):
+        cycle_config['_collection_only'] = True
+        cycle_config.pop('_publish_ready_callback', None)
+        counts = run_cycle(cycle_config)
+        _log_timing('cycle_timing', total_seconds=round(time.perf_counter()-cycle_started, 3), outcomes=counts)
+        return counts
     counts = run_cycle(cycle_config)
     published, failed, rejected = auto_publish_since(
         db_path, config, exclude_post_ids=inline_attempted_posts)
@@ -1270,6 +1294,10 @@ def main() -> None:
         interval = min(180, max(30, int(config["newsroom"].get("poll_interval_seconds", 180))))
         if args.command == "run":
             _start_digest_scheduler(args.config)
+            if config['newsroom'].get('independent_processing'):
+                connect(db_path).close()
+                from .processor import start
+                start(args.config)
         while True:
             cycle_started = time.monotonic()
             config = load_config(args.config)

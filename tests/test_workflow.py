@@ -153,7 +153,7 @@ class WorkflowTests(unittest.TestCase):
             Coordinator(self.db, self.config, {}).close()
         self.assertEqual(editor.call_count, 2)
         rows = self.db.execute('SELECT disposition FROM items ORDER BY item_id').fetchall()
-        self.assertEqual([r[0] for r in rows], ['AI_RETRY', 'NOISE'])
+        self.assertEqual([r[0] for r in rows], ['TECHNICAL_ERROR', 'NOISE'])
 
     def test_retry_rotation_serves_reading_analysis_and_confirmation(self):
         dispositions = ['AI_RETRY', 'WAITING_CONFIRMATION', 'PRIMARY_RETRY', 'AI_RETRY']
@@ -168,6 +168,44 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(claimed, [2, 1, 3, 4])
         finally:
             coordinator.pool.shutdown()
+
+    def test_restart_resumes_drafting_without_reanalysis_or_second_story(self):
+        from newsroom.ai import AIResponseError
+        item = self.item()
+        result = self.publish_result(item)
+        result['_needs_post_draft'] = True
+        draft = {key: result.get(key, '') for key in ('headline_ru', 'summary_ru', 'what_is_new', 'editorial_check')}
+        result['headline_ru'] = result['summary_ru'] = ''
+        self.config['ai']['api_key'] = 'must-not-enter-checkpoint'
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', return_value=result) as editor, \
+             patch('newsroom.ai.draft_post', side_effect=[AIResponseError('NETWORK_TIMEOUT'), draft]) as writer:
+            first = process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=self.config['ai'])
+            self.assertEqual(first, 'AI_RETRY')
+            self.db.close()
+            self.db = connect(self.path)
+            from newsroom.core import _saved_material
+            saved = _saved_material(self.db.execute('SELECT * FROM items').fetchone(), self.source)
+            second = process_item(self.db, self.source, saved, .35, 3500, 24,
+                                  ai_settings=self.config['ai'], existing_item_id=1)
+        self.assertEqual(second, 'NEW_STORY')
+        self.assertEqual(editor.call_count, 1)
+        self.assertEqual(writer.call_count, 2)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM stories').fetchone()[0], 1)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 1)
+        artifact = self.db.execute('SELECT result_json FROM material_stage_results').fetchone()[0]
+        self.assertNotIn('must-not-enter-checkpoint', artifact)
+        self.assertNotIn('api_key', artifact)
+
+    def test_checkpoint_invalidation_on_changed_rules_or_material(self):
+        from newsroom.material_flow import save_draft_context, load_draft_context
+        enqueue(self.db, None, self.item(), self.source, self.options)
+        save_draft_context(self.db, 1, self.item(), self.config['ai'], {'approved': True})
+        self.assertIsNotNone(load_draft_context(self.db, 1, self.item(), self.config['ai']))
+        changed = dict(self.config['ai'], model='changed-model')
+        self.assertIsNone(load_draft_context(self.db, 1, self.item(), changed))
+        self.db.execute("UPDATE items SET content_hash='new-version' WHERE item_id=1")
+        self.assertIsNone(load_draft_context(self.db, 1, self.item(), self.config['ai']))
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
