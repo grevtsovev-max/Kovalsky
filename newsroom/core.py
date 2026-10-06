@@ -989,7 +989,8 @@ def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
             "input": "Search each query scope below for recent news. Return titles, dates and URLs for the strongest relevant results from all scopes. "
                      "Prefer material published within the last 24 hours and retain the publisher URL. Query scopes:\n"
                      f"{query_text}\n"
-                     f"Respect this user's negative interest examples and avoid similar topics: {'; '.join(interest_exclusions or [])}"}, ai_settings)
+            f"Respect this user's negative interest examples and avoid similar topics: {'; '.join(interest_exclusions or [])}"},
+            {**ai_settings, '_work_stage': 'discovery_search' if not ai_settings.get('_work_stage') else ai_settings['_work_stage']})
         if data.get("status") == "incomplete":
             raise AIResponseError("SEARCH_INCOMPLETE")
     except AIResponseError as exc:
@@ -1615,7 +1616,7 @@ class _WebSearchQuota:
         return self.reserve(category="story_watch")
 
     def __call__(self, query: str, ai_settings: dict) -> list[dict]:
-        return fetch_web_search(query, ai_settings)
+        return fetch_web_search(query, {**ai_settings, '_work_stage': 'recovery_search'})
 
 
 def _recover_primary(db, item, settings, *, steps=False):
@@ -1664,7 +1665,7 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
         try:
             db.commit()
             results = yield Work('collector', fetch_web_search,
-                (args["query"], {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))}),
+                (args["query"], {**settings, '_work_stage':'recovery_search', "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))}),
                 {"max_results": 3, "page_timeout": 8})
         except BudgetDeferred:
             item['_source_search_deferred'] = True
@@ -3321,7 +3322,11 @@ def _run_cycle(config, db, cleanup):
     def timed_fetch(source_info):
         started = time.perf_counter()
         try:
-            return fetch_one(source_info), time.perf_counter() - started, None
+            from .workflow import Work
+            stage = 'discovery_search' if source_info[3] == 'web_search' else 'source_' + source_info[3]
+            result = Work('collector', fetch_one, (source_info,), stage=stage).execute(
+                config['ai'].get('_runtime'), {'category': 'feeds', 'source_id': source_info[1]['source_id']})
+            return result, time.perf_counter() - started, None
         except Exception as exc:
             return None, time.perf_counter() - started, exc
 

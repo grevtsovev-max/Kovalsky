@@ -105,7 +105,7 @@ def classify(item, candidates, feedback, settings):
             'editor_feedback': [{**entry, 'content': entry['content'][:1000]} for entry in feedback[:24]]}, ensure_ascii=False)}],
         'text': {'format': {'type': 'json_schema', 'name': 'newsroom_preflight', 'strict': True, 'schema': SCHEMA}},
     }
-    result = request_response(payload, {**settings, '_work_role': 'filter', 'timeout_seconds': min(20, int(settings.get('timeout_seconds', 45)))})
+    result = request_response(payload, {**settings, '_work_role': 'filter', '_work_stage': 'triage', 'timeout_seconds': min(20, int(settings.get('timeout_seconds', 45)))})
     if result.get('status') == 'incomplete':
         raise AIResponseError('TRIAGE_INCOMPLETE')
     decision = None

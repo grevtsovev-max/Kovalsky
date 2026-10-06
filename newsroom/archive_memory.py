@@ -37,7 +37,8 @@ def extract(post,existing,settings):
     from .ai import request_response,AIResponseError
     result=request_response({'model':settings.get('model','gpt-6-luna'),'store':False,'max_output_tokens':4500,
         'instructions':INSTRUCTIONS,'input':[{'role':'user','content':json.dumps({'published_post':post['text'],'existing_coverage':existing},ensure_ascii=False)}],
-        'text':{'format':{'type':'json_schema','name':'historical_coverage','strict':True,'schema':EXTRACTION_SCHEMA}}},settings)
+        'text':{'format':{'type':'json_schema','name':'historical_coverage','strict':True,'schema':EXTRACTION_SCHEMA}}},
+        {**settings, '_work_role': 'editor', '_work_category': 'background', '_work_stage': 'archive_memory'})
     if result.get('status')=='incomplete':raise AIResponseError('ARCHIVE_EXTRACTION_INCOMPLETE')
     for output in result.get('output',[]):
         for block in output.get('content',[]):

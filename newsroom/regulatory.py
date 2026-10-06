@@ -112,7 +112,7 @@ def discover(source, config):
                       ' акты с будущими сроками. Темы крипторынка России/СНГ: ' + ', '.join(terms) +
                       '. Нужны конкретные карточки законопроектов, тексты актов, проектов и официальные'
                       ' разъяснения, не главные страницы. Верни ссылки с цитированием источников.'),
-        }, {**config['ai'],'timeout_seconds':120})
+        }, {**config['ai'],'timeout_seconds':120, '_work_role':'collector', '_work_stage':'regulatory_search'})
         output_text(response)
         for out in response.get('output', []):
             for block in out.get('content', []):
