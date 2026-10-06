@@ -485,8 +485,12 @@ class WorkflowTests(unittest.TestCase):
                  'what_is_new': '', 'editorial_check': {}}
         response = {'output': [{'content': [{'type': 'output_text', 'text': json.dumps(draft)}]}]}
         with patch('newsroom.ai.request_response', return_value=response) as request:
-            self.assertEqual(draft_post({}, {}, {}), draft)
+            contract = {'text_field': 'summary_ru', 'has_previous_publication': False,
+                        'required_fact_quotes': ['Банк открыл счета цифрового рубля.']}
+            self.assertEqual(draft_post({}, {}, {'_draft_contract': contract}), draft)
         self.assertEqual(request.call_args.args[1]['_work_stage'], 'drafting')
+        self.assertEqual(json.loads(request.call_args.args[0]['input'])['draft_contract'], contract)
+        self.assertIn('required_fact_quotes', request.call_args.args[0]['instructions'])
 
     def test_local_coordinator_type_error_is_terminal_without_retry(self):
         enqueue(self.db, None, self.item(), self.source, self.options)

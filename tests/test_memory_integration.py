@@ -37,6 +37,11 @@ class MemoryIntegrationTests(unittest.TestCase):
         self.assertEqual(analyze.call_count,1)
         self.assertEqual(writer.call_count,2)
         self.assertTrue(writer.call_args.args[0]['memory_issues'])
+        for call in writer.call_args_list:
+            contract = call.args[2]['_draft_contract']
+            self.assertEqual(contract['text_field'], 'summary_ru')
+            self.assertFalse(contract['has_previous_publication'])
+            self.assertIn(self.evidence, contract['required_fact_quotes'])
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0],1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0],1)
 

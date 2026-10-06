@@ -474,9 +474,14 @@ def draft_post(decision, source, settings):
             'и цепочку атрибуции. Не добавляй факты, последствия или новую оценку новизны. '
             'headline_ru — заголовок, summary_ru — полный текст без заголовка и ссылки, '
             'what_is_new — самостоятельный текст существенного обновления для уже опубликованного сюжета. '
+            'draft_contract.text_field указывает поле публикуемого текста. Если required_fact_quotes не пуст, '
+            'включи хотя бы один из этих подтверждённых существенных фрагментов дословно в указанное поле; '
+            'не перефразируй его и не переноси только в другое поле. Для ещё не опубликованного сюжета '
+            'полный текст находится в summary_ru, даже если уже есть story_id. '
             'Проверь реально написанный текст в editorial_check. Соблюдай редакционные правила:\n'
             + _load_editorial_rules(settings)),
         'input': json.dumps({'checked_decision': checked, 'read_source': source,
+                            'draft_contract': settings.get('_draft_contract') or {},
                             'max_post_length': settings.get('max_post_length', 3500)}, ensure_ascii=False),
         'text': {'format': {'type': 'json_schema', 'name': 'newsroom_post_draft', 'strict': True, 'schema': schema}}}
     response = request_response(payload, {**settings, '_work_role': 'editor', '_work_stage': 'drafting'})

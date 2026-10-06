@@ -3060,6 +3060,13 @@ def _finish_post_steps(db, item, ai_settings, context):
     body = context['body']
     source = context['source']
     max_length = context['max_length']
+    material_ids = set((memory_diff or {}).get('material_unpublished_facts', []))
+    ai_options['_draft_contract'] = {
+        'text_field': 'what_is_new' if status == 'UPDATE_CANDIDATE' and has_previous_publication else 'summary_ru',
+        'has_previous_publication': bool(has_previous_publication),
+        'required_fact_quotes': [claim['post_quote'] for claim in (memory_diff or {}).get('post_claims', [])
+                                 if claim['fact_id'] in material_ids],
+    }
     if ai_result:
         if ai_result.get('_needs_post_draft'):
             from .ai import draft_post
@@ -3070,7 +3077,8 @@ def _finish_post_steps(db, item, ai_settings, context):
                 from .ai import _load_editorial_rules
                 draft_key = cache_key('drafting', {'decision': ai_result, 'source': primary_source or publisher_report,
                     'rules': _load_editorial_rules(ai_options), 'model': ai_options.get('model'),
-                    'max_post_length': max_length, 'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text())})
+                    'max_post_length': max_length, 'contract': ai_options['_draft_contract'],
+                    'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text())})
                 try:
                     draft = yield Work('editor', draft_post,
                         (ai_result, primary_source or publisher_report, ai_options), key=draft_key, ttl=21600)
