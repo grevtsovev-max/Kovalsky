@@ -194,8 +194,11 @@ class _PublicHttpsConnection(http.client.HTTPSConnection):
 
 class _PublicHttpsHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
-        return self.do_open(_PublicHttpsConnection, req, context=self._context,
-                            check_hostname=self._check_hostname)
+        kwargs = {'context': self._context}
+        # Python 3.12+ moved hostname verification entirely into SSLContext.
+        if hasattr(self, '_check_hostname'):
+            kwargs['check_hostname'] = self._check_hostname
+        return self.do_open(_PublicHttpsConnection, req, **kwargs)
 
 
 class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -3171,6 +3174,8 @@ def run_cycle(config: dict) -> dict[str, int]:
 
 def _run_cycle(config, db, cleanup):
     config = {**config, "ai": {k: v for k, v in config.get("ai", {}).items() if k not in {"_disabled_for_cycle", "_triage_disabled"}}}
+    from .source_registry import sync
+    sync(db, config)
     owner_ids = config.get("telegram", {}).get("interest_owner_user_ids") or []
     if owner_ids:
         config["ai"]["_correction_owner_chat_id"] = str(owner_ids[0])
