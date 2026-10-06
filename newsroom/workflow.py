@@ -76,15 +76,13 @@ class Work:
                     with runtime.db() as db:
                         if db.execute("SELECT 1 FROM sqlite_master WHERE name='material_stage_results'").fetchone():
                             cached = get(db, SCOPE.get()['item_id'], stage_name, self.key)
-                if cached is not None:
+                if cached is not None and (self.role != 'collector' or readable_result(cached)):
                     measured['status'] = 'CACHED'
                     return cached
             result = self.function(*self.args, **self.kwargs)
             # Only completed and validated stage outputs reach this point;
             # raised errors, incomplete API responses and missing results do not.
-            readable = self.role != 'collector' or (isinstance(result, dict) and (
-                (result.get('item') or result).get('material_read') is True or
-                (result.get('item') or result).get('primary_source_status') == 'READ'))
+            readable = self.role != 'collector' or readable_result(result)
             structured = self.role != 'editor' or (isinstance(result, dict) and
                 result.get('action') in {'NEW_STORY', 'UPDATE', 'DUPLICATE', 'NOISE'}
                 and result.get('publication_recommendation') != 'WAIT_FOR_AUTOMATION')
@@ -103,6 +101,17 @@ class Work:
             return result
         finally:
             SCOPE.reset(token)
+
+
+def readable_result(result):
+    if not isinstance(result, dict):
+        return False
+    material = result.get('item') or result
+    if not isinstance(material, dict):
+        return False
+    text = material.get('content') or result.get('body') or material.get('primary_source_content') or ''
+    return (len(str(text).strip()) >= 24 and
+            (material.get('material_read') is True or material.get('primary_source_status') == 'READ'))
 
 
 def drive(generator, runtime=None, scope=None):
@@ -398,7 +407,11 @@ class Coordinator:
             else:
                 from .material_flow import mark
                 if job.get('_stage') and self._valid(job):
-                    mark(self.db, job['item_id'], job['_stage'], 'DONE')
+                    if job['_stage'] == 'reading' and not readable_result(value):
+                        mark(self.db, job['item_id'], 'reading', 'WAITING',
+                             'Прочитанный пригодный материал пока не получен.', block_kind='evidence')
+                    else:
+                        mark(self.db, job['item_id'], job['_stage'], 'DONE')
                 self._advance(job, generator, value=value)
         self.db.execute("UPDATE processing_jobs SET lease_until=? WHERE owner=? AND status='RUNNING'", (self._lease(), self.owner))
         self.db.commit()

@@ -76,6 +76,15 @@ class BudgetDeferred(RuntimeError):
         self.delay_seconds = delay_seconds
         super().__init__("Shared request capacity unavailable")
 
+    @property
+    def block_kind(self):
+        return 'account' if self.reason == 'account' else 'capacity'
+
+    @property
+    def user_reason(self):
+        return ('недоступен счёт ИИ; требуется проверить баланс и доступ'
+                if self.reason == 'account' else 'нет свободного места или общего лимита запросов')
+
 
 class Runtime:
     def __init__(self, database, settings):
@@ -263,6 +272,10 @@ class Runtime:
             if not row:
                 return None
             result = json.loads(row[0])
+            if stage == 'collector':
+                from .workflow import readable_result
+                if not readable_result(result):
+                    return None
             if stage == 'editor' and isinstance(result, dict) and result.get('publication_recommendation') == 'WAIT_FOR_AUTOMATION':
                 return None
             db.execute("INSERT INTO cache_events(stage,item_id,created_at) VALUES(?,?,?)", (stage, SCOPE.get().get("item_id"), stamp()))

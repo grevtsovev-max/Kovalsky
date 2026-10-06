@@ -207,9 +207,9 @@ def screen_steps(db, item_id, item, settings):
         from .runtime import cache_key
         result = yield Work('filter', classify, (dict(item), candidates, feedback, dict(settings)), key=cache_key('screening', fingerprint), ttl=21600)
     except BudgetDeferred as exc:
-        return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен: исчерпан общий бюджет запросов',
+        return {'decision': 'DEFER', 'reason': 'Ранний отбор отложен: '+exc.user_reason,
                 'retry_without_count': True, 'budget_deferred': exc.reason != 'concurrency',
-                'retry_delay_seconds': exc.delay_seconds}
+                'retry_delay_seconds': exc.delay_seconds, 'block_kind': exc.block_kind}
     except Exception as exc:
         code = exc.code if isinstance(exc, AIResponseError) else type(exc).__name__
         from .runtime import account_unavailable
@@ -218,8 +218,9 @@ def screen_steps(db, item_id, item, settings):
         db.execute('INSERT INTO errors(timestamp,message) VALUES(?,?)', (datetime.now(timezone.utc).isoformat(), 'TRIAGE:'+code))
         from .material_flow import technical_error
         return {'decision': 'DEFER', 'reason': f'Ранний отбор не завершён: {code}',
-                'retry_without_count': False, 'technical_error': technical_error(exc),
-                'block_kind': 'technical' if technical_error(exc) else 'transport'}
+                'retry_without_count': account_unavailable(code), 'technical_error': technical_error(exc),
+                'retry_delay_seconds': getattr(settings.get('_runtime'), 'account_cooldown_seconds', 900) if account_unavailable(code) else None,
+                'block_kind': 'account' if account_unavailable(code) else 'technical' if technical_error(exc) else 'transport'}
     current = _hash([VERSION, {key:item.get(key) for key in ('title','description','content')},
                      published_candidates(db, item), feedback_examples(db), settings.get("_topic_registry")])
     if current != fingerprint:

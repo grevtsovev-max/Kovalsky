@@ -2449,7 +2449,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         timings["primary_source_read_seconds"] += time.perf_counter() - stage_started
         source_status = item.get("primary_source_status", "ARTICLE_UNREADABLE")
         primary_source = _primary_source_from_item(item, source_status)
-        read_reason = ("Материал прочитан; текст сохранён для проверки." if source_status == "READ"
+        read_reason = ("Материал прочитан; текст сохранён для проверки." if source_status == "READ" or item.get('material_read') is True
                        else f"Не удалось прочитать материал ({source_status}).")
         _trace_item(item, "Чтение материала", source_status, read_reason)
         content_hash = digest(body)
@@ -2649,7 +2649,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             item["_retry_without_count"] = True
             item['_budget_deferred'] = exc.reason != 'concurrency'
             item['_retry_delay_seconds'] = exc.delay_seconds
-            item["_retry_reason"] = "ИИ-разбор отложен: исчерпан общий бюджет запросов"
+            item["_retry_reason"] = "ИИ-разбор отложен: "+exc.user_reason
+            item['_flow_block_kind'] = exc.block_kind
             ai_result = None
         except Exception as exc:
             http_status = re.search(r"HTTP (\d{3})", str(exc))
@@ -2674,9 +2675,11 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             ai_result = None
             from .material_flow import technical_error
             item['_technical_error'] = technical_error(exc)
-            item['_flow_block_kind'] = 'technical' if item['_technical_error'] else 'transport'
+            item['_flow_block_kind'] = 'account' if account_unavailable(reason) else 'technical' if item['_technical_error'] else 'transport'
             item["_retry_reason"] = f"ИИ-разбор не завершён: {reason}"
-            item["_retry_without_count"] = False
+            item["_retry_without_count"] = account_unavailable(reason)
+            if account_unavailable(reason):
+                item['_retry_delay_seconds'] = getattr(ai_settings.get('_runtime'), 'account_cooldown_seconds', 900)
             _trace_item(item, "Редакторский ИИ-разбор", "Ошибка", item["_retry_reason"])
         if ai_result is not None:
             _trace_item(item, "Редакторский ИИ-разбор", "Завершён",
@@ -3057,14 +3060,19 @@ def _finish_post_steps(db, item, ai_settings, context):
                 draft = yield Work('editor', draft_post,
                     (ai_result, primary_source or publisher_report, ai_options), key=draft_key, ttl=21600)
             except Exception as exc:
-                from .runtime import BudgetDeferred
-                item['_retry_without_count'] = isinstance(exc, BudgetDeferred)
+                from .runtime import BudgetDeferred, account_unavailable
+                account_blocked = account_unavailable(getattr(exc, 'code', None))
+                item['_retry_without_count'] = isinstance(exc, BudgetDeferred) or account_blocked
+                if isinstance(exc, BudgetDeferred):
+                    item['_retry_delay_seconds'] = exc.delay_seconds
+                elif account_blocked:
+                    item['_retry_delay_seconds'] = getattr(ai_settings.get('_runtime'), 'account_cooldown_seconds', 900)
                 from .material_flow import technical_error
                 item['_technical_error'] = technical_error(exc)
-                item['_flow_block_kind'] = 'technical' if item['_technical_error'] else 'capacity' if isinstance(exc, BudgetDeferred) else 'transport'
-                item['_retry_reason'] = 'Написание поста отложено: ' + getattr(exc, 'code', type(exc).__name__)
+                item['_flow_block_kind'] = 'account' if account_blocked else 'technical' if item['_technical_error'] else exc.block_kind if isinstance(exc, BudgetDeferred) else 'transport'
+                item['_retry_reason'] = 'Написание поста отложено: ' + (exc.user_reason if isinstance(exc, BudgetDeferred) else getattr(exc, 'code', type(exc).__name__))
                 mark(db, item_id, 'drafting', 'WAITING', item['_retry_reason'],
-                     block_kind='capacity' if isinstance(exc, BudgetDeferred) else 'transport' if isinstance(exc, AIResponseError) else 'technical')
+                     block_kind=item['_flow_block_kind'])
                 _trace_item(item, 'Написание поста', 'AI_RETRY', item['_retry_reason'])
                 db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
                 db.commit()

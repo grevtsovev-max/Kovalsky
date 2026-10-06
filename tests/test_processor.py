@@ -76,6 +76,45 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIsNone(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone())
 
+    def test_first_account_failure_does_not_consume_attempt_at_any_ai_stage(self):
+        from newsroom.ai import AIResponseError
+        from newsroom.core import process_item
+        from newsroom.material_flow import snapshot
+        for number, stage in enumerate(('screening', 'analysis', 'drafting'), 200):
+            with self.subTest(stage=stage):
+                item = self.fixture.item(number)
+                settings = dict(self.config['ai'], triage_enabled=stage == 'screening')
+                result = self.fixture.publish_result(item)
+                result['_needs_post_draft'] = True
+                result['headline_ru'] = result['summary_ru'] = ''
+                error = AIResponseError('HTTP_429:credit_balance_exhausted')
+                with patch('newsroom.core.get_api_key', return_value='test'), \
+                     patch('newsroom.triage.classify', side_effect=error), \
+                     patch('newsroom.core.analyze_with_ai', side_effect=error if stage == 'analysis' else None, return_value=result), \
+                     patch('newsroom.ai.draft_post', side_effect=error):
+                    self.assertEqual(process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=settings), 'AI_RETRY')
+                item_id = self.db.execute('SELECT item_id FROM items WHERE url=?', (item['url'],)).fetchone()[0]
+                retry = json.loads(self.db.execute('SELECT value FROM app_state WHERE key=?', (f'selection_retry:{item_id}',)).fetchone()[0])
+                self.assertEqual(retry['attempts'], 0)
+                self.assertEqual(snapshot(self.db, item_id)[-1]['block_kind'], 'account')
+
+    def test_failed_article_read_is_not_marked_done(self):
+        from newsroom.material_flow import snapshot
+        item = {key: value for key, value in self.fixture.item().items() if not key.startswith('primary_source_') and key != 'material_read'}
+        config = prepare({**self.config, 'newsroom': dict(self.config['newsroom']), 'ai': dict(self.config['ai'])}, self.db)
+        config['ai']['triage_enabled'] = True
+        enqueue(self.db, None, item, self.source, self.fixture.options)
+        with patch('newsroom.triage.classify', return_value={'decision': 'KEEP', 'reason': 'Нужно прочитать материал'}), \
+             patch('newsroom.core.fetch_publisher_article', side_effect=TimeoutError()), \
+             patch('newsroom.core._recover_primary', return_value=None), \
+             patch('newsroom.core._agent_recover_primary', return_value=None), \
+             patch('newsroom.core.analyze_with_ai') as analyze:
+            Coordinator(self.db, config, {}, max_jobs=1).close()
+        analyze.assert_not_called()
+        reading = next(x for x in snapshot(self.db, 1) if x['stage'] == 'reading')
+        self.assertEqual(reading['status'], 'WAITING')
+        self.assertEqual(reading['block_kind'], 'evidence')
+
     def test_old_worker_does_not_mark_new_material_revision_running(self):
         from newsroom.material_flow import revision, snapshot
         enqueue(self.db, None, self.fixture.item(), self.source, self.fixture.options)
@@ -91,6 +130,16 @@ class ProcessorTests(unittest.TestCase):
         finally:
             executor.shutdown()
         self.assertEqual(snapshot(self.db, 1), [])
+
+    def test_legacy_read_flag_without_text_does_not_prevent_real_reading(self):
+        runtime = self.config['ai']['_runtime']
+        runtime.store('legacy-read', 'collector', {'material_read': True}, 60)
+        text = {'material_read': True, 'content': 'Фактически прочитанный текст источника с описанием события.'}
+        with patch('newsroom.core.fetch_publisher_article', return_value=text) as reader:
+            work = Work('collector', reader, key='legacy-read', ttl=60)
+            self.assertEqual(work.execute(runtime), text)
+            self.assertEqual(work.execute(runtime), text)
+        reader.assert_called_once()
 
     def test_legacy_migration_preserves_attempts_and_read_source(self):
         from newsroom.material_flow import migrate, snapshot
