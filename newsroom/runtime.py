@@ -68,6 +68,7 @@ class Runtime:
         db = sqlite3.connect(self.database, timeout=30)
         db.row_factory = sqlite3.Row
         try:
+            db.execute("PRAGMA temp_store=MEMORY")
             with db:
                 yield db
         finally:

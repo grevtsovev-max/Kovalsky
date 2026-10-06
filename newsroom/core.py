@@ -1917,7 +1917,7 @@ def _editorial_examples(db, item: dict, item_id: int, limit: int = 12,
         if score > 0.05 and not is_general:
             scored.append((score, row))
     scored.sort(key=lambda pair: (pair[0], pair[1]["created_at"] or ""), reverse=True)
-    general.sort(key=lambda pair: (pair[0], pair[1]["created_at"] or ""), reverse=True)
+    general.sort(key=lambda pair: (pair[0], pair[1], pair[2]["created_at"] or ""), reverse=True)
     general_limit = min(3, limit)
     selected = [row for _, row in scored[:max(0, limit - general_limit)]]
     selected_ids = {row["feedback_id"] for row in selected}

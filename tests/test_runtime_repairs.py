@@ -9,6 +9,7 @@ from unittest.mock import patch
 import test_workflow as workflow_tests
 from newsroom.core import process_item, _save_item, _safe_source_error
 from newsroom.diagnostics import snapshot, error_location
+from newsroom.db import connect_readonly
 
 
 class RuntimeRepairTests(unittest.TestCase):
@@ -28,6 +29,23 @@ class RuntimeRepairTests(unittest.TestCase):
                                   existing_item_id=item_id, ai_settings=self.config['ai'])
         self.assertEqual(result, 'NOISE')
         self.assertEqual(editor.call_args.args[0]['editorial_feedback'], [])
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM errors').fetchone()[0], 0)
+
+    def test_owner_feedback_reaches_editor_without_type_error_and_keeps_priority(self):
+        for kind, reason in (('OTHER', 'Короткий лид'),
+                             ('TELEGRAM_LINK_FEEDBACK', 'Уточнить стадию решения'),
+                             ('TELEGRAM_EDIT_REFINEMENT', 'Не повторять заголовок в лиде')):
+            self.db.execute('INSERT INTO editorial_feedback(created_at,feedback_type,reason,item_title) VALUES(?,?,?,?)',
+                            (self.now, kind, reason, 'Замечание владельца'))
+        self.db.commit()
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', side_effect=self.noise) as editor:
+            result = process_item(self.db, self.source, self.item(), **self.options,
+                                  ai_settings=self.config['ai'])
+        self.assertEqual(result, 'NOISE')
+        examples = editor.call_args.args[0]['editorial_examples']
+        self.assertEqual([entry['feedback_type'] for entry in examples],
+                         ['TELEGRAM_EDIT_REFINEMENT', 'TELEGRAM_LINK_FEEDBACK', 'OTHER'])
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM errors').fetchone()[0], 0)
 
     def test_diagnostics_read_existing_schema_and_hide_private_settings(self):
@@ -56,6 +74,18 @@ class RuntimeRepairTests(unittest.TestCase):
         self.assertEqual(_safe_source_error(error), 'NETWORK_TIMEOUT')
         self.assertEqual(_safe_source_error(RuntimeError('certificate verify failed')), 'TLS_CERTIFICATE_ERROR')
         self.assertEqual(_safe_source_error(RuntimeError('TLS connection aborted')), 'TLS_CONNECTION_ERROR')
+
+    def test_database_connections_sort_without_a_writable_temporary_directory(self):
+        self.assertEqual(self.db.execute('PRAGMA temp_store').fetchone()[0], 2)
+        with self.config['ai']['_runtime'].db() as database:
+            self.assertEqual(database.execute('PRAGMA temp_store').fetchone()[0], 2)
+        readonly = connect_readonly(self.path)
+        try:
+            self.assertEqual(readonly.execute('PRAGMA temp_store').fetchone()[0], 2)
+            self.assertEqual(readonly.execute('PRAGMA query_only').fetchone()[0], 1)
+            readonly.execute('SELECT item_id FROM items ORDER BY content DESC').fetchall()
+        finally:
+            readonly.close()
 
     def test_live_dashboard_reads_queue_and_diagnostics_without_schema_writes(self):
         from newsroom.dashboard import serve
