@@ -104,7 +104,8 @@ def editorial_issues(headline, body, facts, *, final_post=False, source_name=Non
                 'headline_main_event', 'lead_event_first', 'paragraphs_concise_distinct'):
         if audit.get(key) is not True:
             issues.append(key.upper())
-    if not ACTION.search(headline):
+    from .digest_language import has_finite_action
+    if not ACTION.search(headline) and not has_finite_action(headline):
         issues.append('HEADLINE_NOT_EVENT_LED')
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
     prose = [p for p in paragraphs if not p.startswith(('Источник:', 'Источники:', 'Ранее:', '**', '➠ '))]

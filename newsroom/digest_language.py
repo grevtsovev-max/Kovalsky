@@ -33,3 +33,11 @@ def digest_action_span(headline):
 def is_digest_action(word):
     return bool(re.fullmatch(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*", word)
                 and _parse(word).tag.POS in {"VERB", "INFN"})
+
+
+def has_finite_action(headline):
+    for word in re.findall(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*", headline):
+        tag = _parse(word).tag
+        if tag.POS == 'VERB' and tag.mood != 'impr':
+            return True
+    return False
