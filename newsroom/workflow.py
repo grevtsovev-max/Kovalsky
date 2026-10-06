@@ -261,6 +261,11 @@ class Coordinator:
         except Exception as exc:
             self.db.rollback()
             self.counts["ERROR"] = self.counts.get("ERROR", 0) + 1
+            from .diagnostics import error_location
+            self.db.execute("INSERT INTO app_state(key,value) VALUES('diagnostic_last_error',?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (json.dumps({'at': stamp(), 'code': type(exc).__name__,
+                                         'location': error_location(exc)}),))
             from .triage import schedule_retry
             attempts = schedule_retry(self.db, job["item_id"], "ERROR")
             status = "DONE" if attempts >= 3 else "WAITING"

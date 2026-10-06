@@ -24,8 +24,10 @@ class RetryQueueTests(unittest.TestCase):
         for i in range(1, 23):
             self.add_item(i)
         with patch('newsroom.core.process_item', side_effect=TimeoutError), patch('newsroom.core.NOW', return_value='2026-09-26T00:00:00+00:00'):
-            first = _retry_ai_held_items(self.db, self.sources, {'newsroom': {}})
-        self.assertEqual(first, {'ERROR': 20})
+            # The production contract permits two retries per cycle. Ten
+            # cycles must rotate through twenty different failing materials.
+            for _ in range(10):
+                self.assertEqual(_retry_ai_held_items(self.db, self.sources, {'newsroom': {}}), {'ERROR': 2})
         seen = []
         def recover(*args, **kwargs):
             item_id = kwargs['existing_item_id']

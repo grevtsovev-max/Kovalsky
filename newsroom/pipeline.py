@@ -152,6 +152,11 @@ def same_processing_run(item, post):
         except ValueError: return False
     if item['source_id'] not in ids or not item['processed_at']:
         return False
+    try:
+        delta = datetime.fromisoformat(post['created_at']) - datetime.fromisoformat(item['processed_at'])
+        return abs(delta.total_seconds()) <= 2
+    except (TypeError, ValueError):
+        return False
 
 
 def publication_trace(db, post_id, tables):
@@ -183,11 +188,6 @@ def publication_trace(db, post_id, tables):
         'updated_at': attempt['updated_at'],
         'events': events,
     }
-    try:
-        delta = datetime.fromisoformat(post['created_at']) - datetime.fromisoformat(item['processed_at'])
-        return abs(delta.total_seconds()) <= 2
-    except (TypeError, ValueError):
-        return False
 
 
 def pipeline_snapshot(db, config, params, posts, now=None):

@@ -286,6 +286,13 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
             try:
                 if parsed.path == "/api/summary":
                     self._json(self._summary())
+                elif parsed.path == "/api/diagnostics":
+                    from .diagnostics import snapshot
+                    db = self._read_db()
+                    try:
+                        self._json(snapshot(db, config))
+                    finally:
+                        db.close()
                 elif parsed.path == "/api/pipeline":
                     from .pipeline import pipeline_snapshot
                     db = self._read_db()
@@ -316,7 +323,13 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                 else:
                     self._json({"error": "Не найдено"}, 404)
             except Exception as exc:
-                self._json({"error": f"Не удалось прочитать базу ({type(exc).__name__})"}, 500)
+                from .diagnostics import error_location
+                location = error_location(exc)
+                # Server logs contain code locations only, never query arguments
+                # or SQLite messages that can include private data.
+                print(json.dumps({"event": "dashboard_read_error", "location": location}), flush=True)
+                self._json({"error": f"Не удалось прочитать базу ({type(exc).__name__})",
+                            "diagnostic": location}, 500)
 
         def _tasks(self):
             with tasks_lock:

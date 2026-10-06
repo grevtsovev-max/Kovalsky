@@ -16,11 +16,12 @@ class RecoveryIntegrationTests(unittest.TestCase):
         self.db.execute("INSERT INTO sources(name,type,url) VALUES('Регулятор','rss','https://example.org/feed')")
         self.source = self.db.execute('SELECT * FROM sources').fetchone()
         self.now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        self.evidence = 'Банк России установил условия доступа российских участников к цифровым активам.'
+        self.evidence = f'Банк России установил условия доступа российских участников к цифровым активам {self.now[:10]}.'
         self.item = {'url':'https://example.org/story','title':'Новые правила цифровых активов в России','content':'Изменения условий для участников рынка.', 'published_at': self.now}
         self.article = dict(self.item, primary_source_status='READ', primary_source_url='https://www.cbr.ru/crypto', primary_source_title='Новые правила', primary_source_content=self.evidence, primary_source_type='OFFICIAL')
         self.result = {'action':'NEW_STORY','is_relevant':True,'geographic_scope':'RUSSIA','confidence':0.9,'russia_cis_impact':'DIRECT','impact_evidence':self.evidence,'topic_category':'REGULATION','importance':'HIGH','editorial_check':{"source_matches_event": True, "attribution_preserved": True, "stage_preserved": True, "history_required": False, "history_explained": False, "history_note": "", "headline_main_event": True, "lead_event_first": True, "paragraphs_concise_distinct": True, "no_editorial_process_notes": True},'headline_ru':'🇷🇺 Банк России установил новые правила цифровых активов','summary_ru':self.evidence,'publication_recommendation':'AUTO_PUBLISH','independent_check':'NO_MATCH'}
         self.config = {'newsroom':{},'ai':{'model':'test'}}
+        self.result.update(development_date=self.now[:10], development_date_evidence=self.evidence)
 
     def process(self, settings=None):
         return process_item(self.db,self.source,dict(self.item),0.35,3500,48,ai_settings=settings or {'model':'test'})
@@ -53,7 +54,7 @@ class RecoveryIntegrationTests(unittest.TestCase):
         with patch('newsroom.core.fetch_publisher_article',return_value=self.article), patch('newsroom.core.get_api_key',return_value='test'), patch('newsroom.core.analyze_with_ai',side_effect=[AIResponseError('OUTPUT_TOKEN_LIMIT'),self.result]) as analyze:
             self.assertEqual(self.process({'max_output_tokens':1800}),'NEW_STORY')
             self.assertEqual(analyze.call_count,2)
-            self.assertEqual(analyze.call_args_list[1].args[3]['max_output_tokens'],3600)
+            self.assertEqual(analyze.call_args_list[1].args[3]['max_output_tokens'],8000)
         self.assert_ready()
 
     def test_two_token_limits_hold_item_without_post_or_third_attempt(self):
