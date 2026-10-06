@@ -454,6 +454,31 @@ class WorkflowTests(unittest.TestCase):
         coordinator._resume_expired()
         self.assertEqual(self.db.execute("SELECT status FROM material_stage_state WHERE stage='gate' AND revision='revised'").fetchone()[0], 'READY')
 
+    def test_draft_token_limit_retries_only_writing_with_more_room(self):
+        from newsroom.ai import AIResponseError
+        item = self.item(920)
+        decision = self.publish_result(item)
+        draft = {key: decision.get(key, '') for key in ('headline_ru','summary_ru','what_is_new','editorial_check')}
+        decision['_needs_post_draft'] = True
+        decision['headline_ru'] = decision['summary_ru'] = ''
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', return_value=decision) as analyze, \
+             patch('newsroom.ai.draft_post', side_effect=[AIResponseError('OUTPUT_TOKEN_LIMIT'), draft]) as writer:
+            self.assertEqual(process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=self.config['ai']), 'NEW_STORY')
+        self.assertEqual(analyze.call_count, 1)
+        self.assertEqual(writer.call_count, 2)
+        self.assertGreaterEqual(writer.call_args_list[1].args[2]['max_output_tokens'], 8000)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM posts').fetchone()[0], 1)
+
+    def test_draft_incomplete_response_reports_token_limit(self):
+        from newsroom.ai import draft_post, AIResponseError
+        response = {'status': 'incomplete', 'incomplete_details': {'reason': 'max_output_tokens'}}
+        with patch('newsroom.ai.request_response', return_value=response) as request:
+            with self.assertRaises(AIResponseError) as caught:
+                draft_post({}, {}, {})
+        self.assertEqual(caught.exception.code, 'OUTPUT_TOKEN_LIMIT')
+        self.assertGreaterEqual(request.call_args.args[0]['max_output_tokens'], 5000)
+
     def test_draft_request_is_accounted_as_drafting(self):
         from newsroom.ai import draft_post
         draft = {'headline_ru': 'Банк открыл счета', 'summary_ru': 'Банк открыл счета цифрового рубля.',

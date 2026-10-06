@@ -3071,8 +3071,16 @@ def _finish_post_steps(db, item, ai_settings, context):
                 draft_key = cache_key('drafting', {'decision': ai_result, 'source': primary_source or publisher_report,
                     'rules': _load_editorial_rules(ai_options), 'model': ai_options.get('model'),
                     'max_post_length': max_length, 'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text())})
-                draft = yield Work('editor', draft_post,
-                    (ai_result, primary_source or publisher_report, ai_options), key=draft_key, ttl=21600)
+                try:
+                    draft = yield Work('editor', draft_post,
+                        (ai_result, primary_source or publisher_report, ai_options), key=draft_key, ttl=21600)
+                except AIResponseError as exc:
+                    if exc.code != 'OUTPUT_TOKEN_LIMIT':
+                        raise
+                    retry_options = dict(ai_options)
+                    retry_options['max_output_tokens'] = max(8000, int(ai_options.get('max_output_tokens', 1800)) * 3)
+                    draft = yield Work('editor', draft_post,
+                        (ai_result, primary_source or publisher_report, retry_options), key=draft_key, ttl=21600)
             except Exception as exc:
                 from .runtime import BudgetDeferred, account_unavailable
                 account_blocked = account_unavailable(getattr(exc, 'code', None))
