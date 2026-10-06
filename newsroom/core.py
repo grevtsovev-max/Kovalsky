@@ -2454,6 +2454,19 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         _trace_item(item, "Чтение материала", source_status, read_reason)
         content_hash = digest(body)
         title_hash = digest(item["title"].lower().strip())
+        duplicate = db.execute('SELECT item_id FROM items WHERE source_id=? AND content_hash=? AND item_id<>?',
+                               (source['source_id'], content_hash, item_id)).fetchone()
+        if duplicate:
+            # Distinct discovery URLs may resolve to the same publisher text.
+            # Preserve this read under its own version before closing the copy;
+            # do not overwrite the original item or invent a different hash.
+            from .material_flow import put
+            put(db, item_id, 'reading', read_key, read)
+            _trace_item(item, 'Повтор материала', 'Дубликат',
+                        'Прочитанный текст совпадает с ранее сохранённым материалом этого источника.')
+            db.execute("UPDATE items SET disposition='DUPLICATE',processed_at=? WHERE item_id=?", (now, item_id))
+            db.commit()
+            return 'DUPLICATE'
         db.execute("""UPDATE items SET title=?,description=?,content=?,content_hash=?,title_hash=?,primary_source_json=?,published_at=?
                       WHERE item_id=?""",
                    (item["title"], item.get("description", ""), body, content_hash, title_hash,

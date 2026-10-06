@@ -23,6 +23,26 @@ class ProcessorTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.db, self.config, self.source = self.fixture.db, self.fixture.config, self.fixture.source
 
+    def test_same_publisher_text_after_read_closes_duplicate_without_analysis(self):
+        from newsroom.core import process_item, _save_item
+        original = self.fixture.item(901)
+        original_id = _save_item(self.db, self.source, original)
+        self.db.commit()
+        item = self.fixture.item(902)
+        for key in tuple(item):
+            if key.startswith('primary_source_') or key == 'material_read':
+                item.pop(key)
+        read_item = dict(original, url=item['url'])
+        with patch('newsroom.core._read_material_work', return_value={'body': original['content'], 'item': read_item}), \
+             patch('newsroom.core.analyze_with_ai') as analyze:
+            result = process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=self.config['ai'])
+        self.assertEqual(result, 'DUPLICATE')
+        analyze.assert_not_called()
+        self.assertEqual(self.db.execute('SELECT content FROM items WHERE item_id=?', (original_id,)).fetchone()[0], original['content'])
+        copy_id = self.db.execute('SELECT item_id FROM items WHERE url=?', (item['url'],)).fetchone()[0]
+        artifact = self.db.execute("SELECT result_json FROM material_stage_results WHERE item_id=? AND stage='reading'", (copy_id,)).fetchone()
+        self.assertEqual(json.loads(artifact[0])['body'], original['content'])
+
     def test_collection_does_not_wait_for_editor(self):
         from newsroom.core import run_cycle
         self.config['_collection_only'] = True
