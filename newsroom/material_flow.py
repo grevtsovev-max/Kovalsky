@@ -80,7 +80,7 @@ def draft_dependency(db, item_id, item, settings):
     from .ai import _load_editorial_rules
     from .core import _editor_history_revision, FILTER_VERSION
     row = db.execute('SELECT content_hash,primary_source_json,story_id FROM items WHERE item_id=?', (item_id,)).fetchone()
-    return cache_key('draft-continuation-v1', {
+    return cache_key('draft-continuation-v2', {
         'material': dict(row), 'history': _editor_history_revision(db, item),
         'rules': _load_editorial_rules(settings), 'topic': settings.get('_topic_registry'),
         'editorial': settings.get('_editorial_registry'), 'filter': FILTER_VERSION,

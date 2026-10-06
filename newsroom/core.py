@@ -1600,7 +1600,7 @@ def _restore_exact_social_headline_evidence(ai_result: dict, item: dict,
     return ai_result
 
 
-def _source_evidence_issues(result: dict, content: str) -> list[str]:
+def _source_evidence_issues(result: dict, content: str, *, analysis_only=False) -> list[str]:
     audit = result.get('original_reporting_check') or {}
     quote = str(audit.get('evidence') or '')
     issues = []
@@ -1608,7 +1608,7 @@ def _source_evidence_issues(result: dict, content: str) -> list[str]:
         issues.append('Не подтверждено центральное утверждение прочитанным материалом.')
     if len(quote.strip()) < 24 or ' '.join(quote.casefold().split()) not in ' '.join(content.casefold().split()):
         issues.append('Нужна дословная подтверждающая выдержка из прочитанного материала длиной не менее 24 символов.')
-    if audit.get('attribution_preserved') is not True:
+    if not analysis_only and audit.get('attribution_preserved') is not True:
         issues.append('Не подтверждено сохранение атрибуции автора сообщения.')
     claims = result.get('facts') or []
     if not claims or any(f.get('claim_type') not in {'CLAIM', 'REPORT', 'OPINION'} for f in claims):
@@ -1617,14 +1617,14 @@ def _source_evidence_issues(result: dict, content: str) -> list[str]:
 
 
 def require_primary_source_review(ai_result: dict | None, source_status: str, primary_source: dict | None = None,
-                                  publisher_report: dict | None = None) -> dict | None:
+                                  publisher_report: dict | None = None, *, analysis_only=False) -> dict | None:
     if ai_result is None or ai_result.get("action") == "DUPLICATE" or ai_result.get("publication_recommendation") == "DO_NOT_PUBLISH":
         return ai_result
     result = dict(ai_result)
     if publisher_report:
-        supported = attributed_report_supported(publisher_report, result)
+        supported = attributed_report_supported(publisher_report, result, analysis_only=analysis_only)
         if not supported or result.get("publication_recommendation") == "WAIT_FOR_AUTOMATION":
-            result['source_review_issues'] = _source_evidence_issues(result, publisher_report.get('content', ''))
+            result['source_review_issues'] = _source_evidence_issues(result, publisher_report.get('content', ''), analysis_only=analysis_only)
             result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
             result["source_review_required"] = True
             return result
@@ -1642,11 +1642,11 @@ def require_primary_source_review(ai_result: dict | None, source_status: str, pr
         supported = (audit.get("central_claim_supported") is True
                      and len(quote.strip()) >= 24
                      and " ".join(quote.casefold().split()) in " ".join(primary_source["content"].casefold().split())
-                     and audit.get("attribution_preserved") is True
+                     and (analysis_only or audit.get("attribution_preserved") is True)
                      and result.get("facts")
                      and all(f.get("claim_type") in {"CLAIM", "REPORT", "OPINION"} for f in result["facts"]))
         if not supported or result.get("publication_recommendation") == "WAIT_FOR_AUTOMATION":
-            result['source_review_issues'] = _source_evidence_issues(result, primary_source['content'])
+            result['source_review_issues'] = _source_evidence_issues(result, primary_source['content'], analysis_only=analysis_only)
             result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
             result["source_review_required"] = True
             return result
@@ -2706,7 +2706,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 ai_result['action'] = 'UPDATE' if ai_result.get('story_id') else 'NEW_STORY'
             ai_result = _restore_exact_social_headline_evidence(ai_result, item, primary_source)
             ai_result = require_primary_source_review(ai_result, source_status, primary_source,
-                                                       publisher_report=publisher_report)
+                                                       publisher_report=publisher_report,
+                                                       analysis_only=ai_result.get('_needs_post_draft') is True)
             confidence = ai_result.get("confidence")
             if (ai_result.get("publication_recommendation") == "AUTO_PUBLISH"
                     and (not isinstance(confidence, (int, float)) or confidence < 0.72)):
@@ -3079,6 +3080,13 @@ def _finish_post_steps(db, item, ai_settings, context):
                 return 'AI_RETRY'
             mark(db, item_id, 'drafting', 'DONE', 'Текст подготовлен.')
             ai_result.update(draft)
+            if isinstance(ai_result.get('original_reporting_check'), dict):
+                # Evidence was checked before writing. This flag now describes
+                # the writer's check of the actual text, not an unwritten draft.
+                ai_result['original_reporting_check'] = {
+                    **ai_result['original_reporting_check'],
+                    'attribution_preserved': (draft.get('editorial_check') or {}).get('attribution_preserved') is True,
+                }
             ai_result['_needs_post_draft'] = False
             from .material_flow import save_draft_context
             context['ai_result'] = ai_result

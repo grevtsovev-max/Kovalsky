@@ -141,6 +141,49 @@ class ProcessorTests(unittest.TestCase):
             self.assertEqual(work.execute(runtime), text)
         reader.assert_called_once()
 
+    def test_unwritten_attribution_is_checked_by_writer_without_repeating_analysis(self):
+        from newsroom.core import process_item
+        source = dict(self.source, name='РБК')
+        item = dict(self.fixture.item(300), primary_source_type='ORIGINAL_MEDIA_REPORT',
+                    primary_source_publisher='РБК')
+        item['primary_source_url'] = item['url']
+        result = self.fixture.publish_result(item)
+        result['facts'] = [{**fact, 'claim_type': 'REPORT'} for fact in result['facts']]
+        result['original_reporting_check'] = {'central_claim_supported': True,
+            'attribution_preserved': False, 'evidence': item['primary_source_content']}
+        good = {key: copy.deepcopy(result.get(key, '')) for key in ('headline_ru', 'summary_ru', 'what_is_new', 'editorial_check')}
+        bad = copy.deepcopy(good)
+        bad['editorial_check']['attribution_preserved'] = False
+        result['_needs_post_draft'] = True
+        result['headline_ru'] = result['summary_ru'] = ''
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', return_value=result) as analyze, \
+             patch('newsroom.ai.draft_post', side_effect=[bad, good]) as writer:
+            first = process_item(self.db, source, item, .35, 3500, 24, ai_settings=self.config['ai'])
+            self.assertEqual(first, 'WAITING_CONFIRMATION')
+            self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
+            item_id = self.db.execute('SELECT item_id FROM items WHERE url=?', (item['url'],)).fetchone()[0]
+            second = process_item(self.db, source, item, .35, 3500, 24, ai_settings=self.config['ai'], existing_item_id=item_id)
+        self.assertEqual(second, 'NEW_STORY', self.db.execute('SELECT result_json FROM item_analysis WHERE item_id=?', (item_id,)).fetchone()[0])
+        self.assertEqual(analyze.call_count, 1)
+        self.assertEqual(writer.call_count, 2)
+        facts = json.loads(self.db.execute('SELECT fact_check_result FROM posts').fetchone()[0])
+        self.assertTrue(facts['original_reporting_check']['attribution_preserved'])
+        self.assertIn('[РБК]('+item['url']+')', self.db.execute('SELECT text FROM posts').fetchone()[0])
+
+    def test_analysis_phase_still_requires_quote_and_safe_claim_type(self):
+        from newsroom.core import require_primary_source_review
+        source = {'url': 'https://example.org/report', 'publisher': 'РБК',
+                  'content': 'Прочитанное сообщение источника о конкретном новом событии.',
+                  'type': 'ATTRIBUTED_REPORT', 'material_read': True}
+        base = {'action': 'NEW_STORY', 'publication_recommendation': 'AUTO_PUBLISH',
+                'facts': [{'claim_type': 'REPORT'}], 'original_reporting_check': {
+                    'central_claim_supported': True, 'attribution_preserved': False, 'evidence': source['content']}}
+        self.assertEqual(require_primary_source_review(base, 'NO_LINK', publisher_report=source, analysis_only=True)['publication_recommendation'], 'AUTO_PUBLISH')
+        self.assertEqual(require_primary_source_review(base, 'NO_LINK', publisher_report=source)['publication_recommendation'], 'WAIT_FOR_AUTOMATION')
+        for changed in ({'facts': [{'claim_type': 'FACT'}]}, {'original_reporting_check': {**base['original_reporting_check'], 'evidence': 'Выдуманная цитата, которой нет в источнике.'}}):
+            self.assertEqual(require_primary_source_review({**base, **changed}, 'NO_LINK', publisher_report=source, analysis_only=True)['publication_recommendation'], 'WAIT_FOR_AUTOMATION')
+
     def test_legacy_migration_preserves_attempts_and_read_source(self):
         from newsroom.material_flow import migrate, snapshot
         enqueue(self.db, None, self.fixture.item(), self.source, self.fixture.options)
