@@ -164,7 +164,10 @@ def request_response(payload, settings):
                 exc.close()
             if runtime:
                 runtime.finish(call_id, None, time.perf_counter() - call_started, AIResponseError(code))
-            if attempt == 0 and (status == 429 or 500 <= status <= 599):
+            from .runtime import account_unavailable, BudgetDeferred
+            if runtime and account_unavailable(code):
+                raise BudgetDeferred('account', runtime.account_cooldown_seconds) from None
+            if attempt == 0 and not account_unavailable(code) and (status == 429 or 500 <= status <= 599):
                 time.sleep(0.5)
                 continue
             raise AIResponseError(code) from None

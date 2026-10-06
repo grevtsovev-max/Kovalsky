@@ -38,7 +38,7 @@ def snapshot(db, config):
     state = {}
     if 'app_state' in tables:
         for row in db.execute("SELECT key,value FROM app_state WHERE key IN "
-                              "('ai_last_error','ai_last_success','digest_scheduler_last_tick_at','diagnostic_last_error')"):
+                              "('ai_last_error','ai_last_success','digest_scheduler_last_tick_at','diagnostic_last_error','api_account_blocked_until')"):
             if row[0] in {'ai_last_error', 'diagnostic_last_error'}:
                 try:
                     value = json.loads(row[1])

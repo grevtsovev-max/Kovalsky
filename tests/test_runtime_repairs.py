@@ -1,8 +1,9 @@
 import json
+import io
 import unittest
 import threading
 import urllib.request
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -10,6 +11,8 @@ import test_workflow as workflow_tests
 from newsroom.core import process_item, _save_item, _safe_source_error
 from newsroom.diagnostics import snapshot, error_location
 from newsroom.db import connect_readonly
+from newsroom.runtime import Runtime, BudgetDeferred
+from newsroom.ai import request_response, AIResponseError
 
 
 class RuntimeRepairTests(unittest.TestCase):
@@ -86,6 +89,35 @@ class RuntimeRepairTests(unittest.TestCase):
             readonly.execute('SELECT item_id FROM items ORDER BY content DESC').fetchall()
         finally:
             readonly.close()
+
+    def test_exhausted_account_pauses_all_roles_and_preserves_material_attempts(self):
+        error = HTTPError('https://api.openai.com/v1/responses', 429, 'private', {},
+                          io.BytesIO(json.dumps({'error': {'code': 'credit_balance_exhausted',
+                                                          'message': 'private billing text'}}).encode()))
+        with patch('newsroom.ai.get_api_key', return_value='test'), \
+             patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.ai.urllib.request.urlopen', side_effect=error) as transport:
+            with self.assertRaises(BudgetDeferred) as caught:
+                request_response({'model': 'test'}, self.config['ai'])
+            self.assertEqual(caught.exception.reason, 'account')
+            self.assertEqual(transport.call_count, 1)
+            other = Runtime(self.path, {})
+            with self.assertRaises(BudgetDeferred) as blocked:
+                other.reserve({'model': 'test'}, {'_work_role': 'filter'})
+            self.assertEqual(blocked.exception.reason, 'account')
+            self.assertGreater(blocked.exception.delay_seconds, 850)
+            self.assertEqual(process_item(self.db, self.source, self.item(), **self.options,
+                                         ai_settings=self.config['ai']), 'AI_RETRY')
+            self.assertEqual(transport.call_count, 1)
+        retry = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])
+        self.assertEqual(retry['attempts'], 0)
+        state = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='ai_last_error'").fetchone()[0])
+        self.assertEqual(state['code'], 'HTTP_429:credit_balance_exhausted')
+        self.assertNotIn('private billing text', json.dumps(state))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM api_usage').fetchone()[0], 1)
+        self.db.execute("UPDATE app_state SET value='2000-01-01T00:00:00+00:00' WHERE key='api_account_blocked_until'")
+        self.db.commit()
+        self.assertIsNotNone(other.reserve({'model': 'test'}, {}))
 
     def test_live_dashboard_reads_queue_and_diagnostics_without_schema_writes(self):
         from newsroom.dashboard import serve
