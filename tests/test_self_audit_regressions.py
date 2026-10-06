@@ -115,7 +115,7 @@ class SelfAuditRegressionTests(unittest.TestCase):
 
     def test_cycle_searches_all_topics_in_one_request_per_window(self):
         config = {"newsroom": {"database": self.path}, "ai": {},
-                  "web_search": {"min_interval_minutes": 15},
+                  "web_search": {"enabled": True, "min_interval_minutes": 15},
                   "sources": [{"name": f"Тема {n}", "type": "web_search",
                                "url": f"web-search://{n}", "query": f"topic {n}"}
                               for n in range(4)]}

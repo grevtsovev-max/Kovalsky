@@ -382,6 +382,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(analyze.call_count, 1)
 
     def test_search_capacity_deferral_does_not_mark_source_broken(self):
+        self.config['web_search'] = {'enabled': True}
         self.config['sources'] = [{'name': 'Search', 'type': 'web_search',
                                   'url': 'https://example.org/search', 'query': 'digital assets'}]
         with patch('newsroom.core.fetch_web_search', side_effect=BudgetDeferred()):

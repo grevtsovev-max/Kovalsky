@@ -26,7 +26,7 @@ class SearchIntegrationTests(unittest.TestCase):
              patch("newsroom.core.urllib.request.urlopen", return_value=MockResponse(json.dumps(response).encode())), \
              patch("newsroom.core.fetch_publisher_article", return_value={"url": "https://publisher.example/news",
                    "title": "Publisher report", "content": "Full publisher text", "primary_source_status": "READ"}) as read:
-            items = fetch_web_search("crypto news", {"api_key_env": "SEARCH_TEST_KEY", "model": "test-model"})
+            items = fetch_web_search("crypto news", {"api_key_env": "SEARCH_TEST_KEY", "model": "test-model", "web_search_enabled": True})
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["content"], "Full publisher text")
         read.assert_called_once_with("https://publisher.example/news", "publisher.example", None,

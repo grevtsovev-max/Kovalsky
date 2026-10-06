@@ -134,7 +134,15 @@ def safe_api_error(exc):
     return f"HTTP_{exc.code}{code}"
 
 
+def web_search_enabled(settings):
+    return settings.get('web_search_enabled', False) is True
+
+
 def request_response(payload, settings):
+    if not web_search_enabled(settings) and any(
+            isinstance(tool, dict) and str(tool.get('type', '')).startswith('web_search')
+            for tool in payload.get('tools', [])):
+        raise AIResponseError('WEB_SEARCH_DISABLED')
     api_key = get_api_key(settings)
     if not api_key:
         raise AIResponseError("CREDENTIALS_MISSING")

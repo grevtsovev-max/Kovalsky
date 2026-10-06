@@ -30,6 +30,13 @@ def snapshot(db, config):
         schemas[name] = [row[1] for row in db.execute('PRAGMA table_info('+name+')')]
     from .runtime import snapshot as usage
     from .workflow import snapshot as queue
+    from .ai import web_search_enabled
+    search = {'enabled': web_search_enabled(config.get('ai', {})),
+              'active_sources': db.execute("SELECT COUNT(*) FROM sources WHERE type='web_search' AND active=1").fetchone()[0],
+              'last_api_attempt_at': None}
+    if 'api_usage' in tables:
+        search['last_api_attempt_at'] = db.execute(
+            "SELECT MAX(created_at) FROM api_usage WHERE search_requested=1").fetchone()[0]
     errors = []
     if 'processing_jobs' in tables:
         errors = [dict(row) for row in db.execute(
@@ -53,5 +60,5 @@ def snapshot(db, config):
                             for name in ('workflow.py','runtime.py','core.py','cli.py','diagnostics.py')},
             'processing_workers': max(1, min(8, int(config.get('newsroom', {}).get('processing_workers', 2)))),
             'api_concurrency': max(1, min(8, int(config.get('ai', {}).get('api_concurrency', 2)))),
-            'schemas': schemas, 'queue': queue(db), 'usage': usage(db),
+            'schemas': schemas, 'queue': queue(db), 'usage': usage(db), 'web_search': search,
             'job_errors': errors, 'state': state}

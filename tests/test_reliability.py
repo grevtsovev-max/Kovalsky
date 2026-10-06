@@ -15,13 +15,13 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(str(caught.exception),'HTTP_403:unsupported_country_region_territory');call.assert_called_once()
     def test_search_uses_independent_index_when_api_fails(self):
         with patch('newsroom.core.request_response',side_effect=AIResponseError('HTTP_403')),patch('newsroom.core.fetch_google_news',return_value=FetchedItems([{'url':'https://tass.ru/1'}])) as fallback:
-            result=fetch_web_search('цифровая валюта',{})
+            result=fetch_web_search('цифровая валюта',{'web_search_enabled':True})
         self.assertEqual(len(result),1);self.assertIn('SEARCH_FALLBACK:HTTP_403',result.diagnostics);fallback.assert_called_once()
     def test_search_fallback_failure_preserves_both_safe_error_codes(self):
         with patch('newsroom.core.request_response',side_effect=AIResponseError('NETWORK_TIMEOUT')), \
              patch('newsroom.core.fetch_google_news',side_effect=TimeoutError('https://private.example timed out')):
             with self.assertRaises(AIResponseError) as caught:
-                fetch_web_search('цифровая валюта',{})
+                fetch_web_search('цифровая валюта',{'web_search_enabled':True})
         self.assertEqual(caught.exception.code,
                          'SEARCH_FALLBACK_FAILED:NETWORK_TIMEOUT:NETWORK_TIMEOUT')
         self.assertNotIn('private.example',str(caught.exception))

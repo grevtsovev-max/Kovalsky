@@ -27,7 +27,7 @@ from pathlib import Path
 from .db import connect
 from .triage import MAX_AUTOMATIC_RETRIES, screen as screen_item, schedule_retry
 from .quality import editorial_issues, attributed_report_supported
-from .ai import request_response, AIResponseError, FILTER_VERSION, analyze as analyze_with_ai, get_api_key
+from .ai import request_response, AIResponseError, FILTER_VERSION, analyze as analyze_with_ai, get_api_key, web_search_enabled
 
 NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -964,6 +964,8 @@ def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
                      interest_exclusions: list[str] | None = None,
                      max_results: int = 8, page_timeout: int = 20) -> list[dict]:
     """Use Responses web_search for discovery, then read publisher pages."""
+    if not web_search_enabled(ai_settings):
+        return FetchedItems([], ['WEB_SEARCH_DISABLED'])
     raw_scopes = [query] if isinstance(query, str) else query
     scopes = []
     for value in raw_scopes:
@@ -2336,7 +2338,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
     # an otherwise readable account hostage to an unavailable original.
     if not publisher_report and (not primary_source or source_status != "READ") and ai_settings and _likely_local(item) and (selection is None or selection["decision"] == "KEEP"):
         agent_mode = ai_settings.get("research_agent_mode", "active")
-        if (agent_mode in {"active", "shadow"}
+        if (web_search_enabled(ai_settings) and agent_mode in {"active", "shadow"}
                 and int(ai_settings.get("_research_agent_budget", 0)) > 0):
             ai_settings["_research_agent_budget"] -= 1
             agent_started = time.perf_counter()
@@ -3205,6 +3207,7 @@ def _run_cycle(config, db, cleanup):
         for source_cfg in config.get("sources", [])
         if source_cfg.get("type", "rss") in {"rss", "web", "telegram", "google_news", "web_search", "x"}
         and source_cfg.get("active", True)
+        and (source_cfg.get('type') != 'web_search' or web_search_enabled(config['ai']))
     ]
     active_configs.sort(key=lambda entry: (
         0 if entry[1] == "google_news" else
