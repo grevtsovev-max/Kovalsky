@@ -487,9 +487,16 @@ class WorkflowTests(unittest.TestCase):
         with patch('newsroom.ai.request_response', return_value=response) as request:
             contract = {'text_field': 'summary_ru', 'has_previous_publication': False,
                         'required_fact_quotes': ['Банк открыл счета цифрового рубля.']}
-            self.assertEqual(draft_post({}, {}, {'_draft_contract': contract}), draft)
+            old_audit = {'history_required': True, 'history_note': 'No previous link was supplied'}
+            self.assertEqual(draft_post({'editorial_check': old_audit, 'summary_ru': 'Old draft', 'facts': []},
+                                        {}, {'_draft_contract': contract}), draft)
         self.assertEqual(request.call_args.args[1]['_work_stage'], 'drafting')
-        self.assertEqual(json.loads(request.call_args.args[0]['input'])['draft_contract'], contract)
+        content = json.loads(request.call_args.args[0]['input'])
+        self.assertEqual(content['draft_contract'], contract)
+        self.assertNotIn('editorial_check', content['checked_decision'])
+        self.assertNotIn('summary_ru', content['checked_decision'])
+        self.assertEqual(content['previous_draft']['editorial_check'], old_audit)
+        self.assertEqual(content['previous_draft']['summary_ru'], 'Old draft')
         self.assertIn('required_fact_quotes', request.call_args.args[0]['instructions'])
 
     def test_local_coordinator_type_error_is_terminal_without_retry(self):
