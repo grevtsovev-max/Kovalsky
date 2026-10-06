@@ -10,6 +10,36 @@ from newsroom.cli import publish
 class MemoryIntegrationTests(unittest.TestCase):
     setUp = recovery.RecoveryIntegrationTests.setUp
 
+    def test_missing_fact_in_draft_is_redrafted_from_saved_analysis(self):
+        from newsroom.core import _saved_material
+        self.prepare()
+        result = self.result()
+        good = {key: copy.deepcopy(result[key]) for key in ('headline_ru','summary_ru','what_is_new','editorial_check')}
+        bad = {**good, 'summary_ru': 'Банк России уточнил порядок доступа российских участников к цифровым активам.'}
+        result['_needs_post_draft'] = True
+        result['headline_ru'] = result['summary_ru'] = ''
+        item = dict(self.item, url='https://example.org/draft-recovery')
+        article = dict(self.article, **item)
+        with patch('newsroom.core.fetch_publisher_article', return_value=article) as read, \
+             patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', return_value=result) as analyze, \
+             patch('newsroom.ai.draft_post', side_effect=[bad,good]) as writer:
+            self.assertEqual(process_item(self.db,self.source,item,.35,3500,48,ai_settings=self.config['ai']), 'WAITING_CONFIRMATION')
+            row = self.db.execute('SELECT * FROM items').fetchone()
+            saved = json.loads(self.db.execute('SELECT result_json FROM item_analysis').fetchone()[0])
+            self.assertTrue(saved['_needs_post_draft'])
+            self.assertTrue(saved['memory_issues'])
+            self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
+            resumed = _saved_material(row,self.source)
+            outcome = process_item(self.db,self.source,resumed,.35,3500,48,ai_settings=self.config['ai'],existing_item_id=row['item_id'])
+        self.assertEqual(outcome,'NEW_STORY')
+        self.assertEqual(read.call_count,1)
+        self.assertEqual(analyze.call_count,1)
+        self.assertEqual(writer.call_count,2)
+        self.assertTrue(writer.call_args.args[0]['memory_issues'])
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0],1)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0],1)
+
     def result(self, action='NEW_STORY', value='доступ открыт', previous='', relation='NEW'):
         result=copy.deepcopy(self.result_data)
         result.update(action=action,story_id='1' if previous else '',what_is_new=self.evidence,

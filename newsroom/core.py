@@ -3172,6 +3172,14 @@ def _finish_post_steps(db, item, ai_settings, context):
             db.execute('ROLLBACK TO memory_post')
             db.execute('RELEASE memory_post')
             ai_result['memory_issues'] = [str(exc)]
+            ai_result['editorial_issues'] = [str(exc)]
+            ai_result['_needs_post_draft'] = True
+            item['_retry_reason'] = str(exc)
+            from .material_flow import save_draft_context
+            context['ai_result'] = ai_result
+            save_draft_context(db, item_id, item, ai_settings, context)
+            mark(db, item_id, 'drafting', 'WAITING', str(exc), block_kind='verification')
+            _trace_item(item, 'Проверка фактов в готовом тексте', 'Нужна правка текста', str(exc))
             db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
                        (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
             db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION',processed_at=? WHERE item_id=?",(now,item_id))

@@ -184,6 +184,17 @@ class ProcessorTests(unittest.TestCase):
         for changed in ({'facts': [{'claim_type': 'FACT'}]}, {'original_reporting_check': {**base['original_reporting_check'], 'evidence': 'Выдуманная цитата, которой нет в источнике.'}}):
             self.assertEqual(require_primary_source_review({**base, **changed}, 'NO_LINK', publisher_report=source, analysis_only=True)['publication_recommendation'], 'WAIT_FOR_AUTOMATION')
 
+    def test_headline_action_accepts_finite_verbs_beyond_the_word_list(self):
+        from newsroom.quality import editorial_issues
+        facts = self.fixture.publish_result(self.fixture.item())
+        for headline in ('🇷🇺 Компании вошли в реестры Банка России',
+                         '🇷🇺 Банк России добавил криптопосредников в справочник',
+                         '🇷🇺 Форум Ассоциации ФинТех завершился'):
+            self.assertNotIn('HEADLINE_NOT_EVENT_LED', editorial_issues(headline, facts['summary_ru'], facts))
+        for headline in ('🇷🇺 Новые счета цифрового рубля', '🇷🇺 Новые правила цифровых активов',
+                         '🇷🇺 Открыть счёт цифрового рубля', '🇷🇺 Откройте счёт цифрового рубля'):
+            self.assertIn('HEADLINE_NOT_EVENT_LED', editorial_issues(headline, facts['summary_ru'], facts))
+
     def test_legacy_migration_preserves_attempts_and_read_source(self):
         from newsroom.material_flow import migrate, snapshot
         enqueue(self.db, None, self.fixture.item(), self.source, self.fixture.options)
