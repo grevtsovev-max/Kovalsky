@@ -1033,7 +1033,8 @@ def _read_discovery_links(links: list[dict], max_results: int = 8, page_timeout:
 
 def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
                      interest_exclusions: list[str] | None = None,
-                     max_results: int = 8, page_timeout: int = 20) -> list[dict]:
+                     max_results: int = 8, page_timeout: int = 20,
+                     read_articles: bool = True) -> list[dict]:
     """Use Responses web_search for discovery, then read publisher pages."""
     if not web_search_enabled(ai_settings):
         return FetchedItems([], ['WEB_SEARCH_DISABLED'])
@@ -1078,7 +1079,7 @@ def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
             url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
                 {"q": search_query, "hl": "ru", "gl": "RU", "ceid": "RU:ru"})
             try:
-                items = fetch_google_news(url)
+                items = fetch_google_news(url) if read_articles else fetch_google_news(url, read_articles=False)
                 fallback_items.extend(items)
                 fallback_diagnostics.extend(getattr(items, "diagnostics", []))
             except Exception as fallback_exc:
@@ -1107,6 +1108,13 @@ def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
                     if url and url not in seen:
                         seen.add(url)
                         links.append({"url": url, "title": annotation.get("title", "")})
+    if not read_articles:
+        return FetchedItems([
+            {'url': link['url'], 'title': link.get('title') or link['url'],
+             'description': '', 'content': '', 'published_at': None, 'updated_at': None}
+            for link in links[:max(1, min(8, int(max_results)))]
+            if link['url'].startswith(('https://', 'http://'))
+        ], [])
     return _read_discovery_links(links, max_results=max_results, page_timeout=page_timeout)
 
 
@@ -2352,13 +2360,16 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         db.commit()
         return "NOISE"
     event_time = item.get("updated_at") or item.get("published_at")
-    if not event_time:
+    # Search citations contain a URL and headline, not a verified publication
+    # date. Read the publisher page before deciding whether its date is absent.
+    date_pending = not event_time and source['type'] == 'web_search'
+    if not event_time and not date_pending:
         _trace_item(item, "Дата публикации", "Отсеян", "У материала не указана дата публикации.")
         db.execute("UPDATE items SET disposition='UNDATED',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "UNDATED"
     try:
-        age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(event_time.replace("Z", "+00:00"))).total_seconds() / 3600
+        age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(event_time.replace("Z", "+00:00"))).total_seconds() / 3600 if event_time else 0
     except ValueError:
         age_hours = 0
     if initial_backfill_minutes is not None and age_hours * 60 > initial_backfill_minutes:
@@ -2443,10 +2454,10 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         _trace_item(item, "Чтение материала", source_status, read_reason)
         content_hash = digest(body)
         title_hash = digest(item["title"].lower().strip())
-        db.execute("""UPDATE items SET title=?,description=?,content=?,content_hash=?,title_hash=?,primary_source_json=?
+        db.execute("""UPDATE items SET title=?,description=?,content=?,content_hash=?,title_hash=?,primary_source_json=?,published_at=?
                       WHERE item_id=?""",
                    (item["title"], item.get("description", ""), body, content_hash, title_hash,
-                    _stored_primary(item, primary_source, source_status),
+                    _stored_primary(item, primary_source, source_status), item.get('published_at'),
                     item_id))
 
     publisher_report = (_read_material_report(source, item, body)
@@ -2512,6 +2523,25 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (held, now, item_id))
         db.commit()
         return held
+
+    if date_pending:
+        event_time = item.get('updated_at') or item.get('published_at')
+        if not event_time:
+            _trace_item(item, 'Дата публикации', 'Отсеян', 'В прочитанном материале не подтверждена дата публикации.')
+            db.execute("UPDATE items SET disposition='UNDATED',processed_at=? WHERE item_id=?", (now, item_id))
+            db.commit()
+            return 'UNDATED'
+        try:
+            age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(event_time.replace('Z', '+00:00'))).total_seconds() / 3600
+        except ValueError:
+            age_hours = 0
+        date_outcome = ('BASELINE_SKIPPED' if initial_backfill_minutes is not None and age_hours * 60 > initial_backfill_minutes
+                        else 'STALE' if age_hours > freshness_hours else None)
+        if date_outcome:
+            _trace_item(item, 'Дата публикации', 'Отсеян', 'Прочитанный материал старше допустимого окна публикации.')
+            db.execute('UPDATE items SET disposition=?,processed_at=? WHERE item_id=?', (date_outcome, now, item_id))
+            db.commit()
+            return date_outcome
 
     story_rows = db.execute("SELECT * FROM stories ORDER BY last_updated_at DESC LIMIT 1000").fetchall()
     candidate = f"{item['title']} {item.get('description','')} {body}"
@@ -3573,7 +3603,7 @@ def _run_cycle(config, db, cleanup):
         if source_type == "google_news":
             return fetch_google_news(source["url"], read_articles=False) if config.get("_collection_only") else fetch_google_news(source["url"])
         if source_type == "web_search":
-            return fetch_web_search(web_search_queries, config.get("ai", {}))
+            return fetch_web_search(web_search_queries, config.get("ai", {}), read_articles=False) if config.get('_collection_only') else fetch_web_search(web_search_queries, config.get("ai", {}))
         if source_type == "x":
             return fetch_x_recent(source_cfg.get("query", ""), config.get("x", {}))
         since = source["recovery_since"] or source["last_seen_published_at"] or (

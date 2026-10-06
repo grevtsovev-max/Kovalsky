@@ -173,3 +173,22 @@ class ProcessorTests(unittest.TestCase):
         reader.assert_not_called()
         self.assertEqual(len(items), 1)
         self.assertNotIn('material_read', items[0])
+
+    def test_search_date_is_checked_after_reading_and_before_analysis(self):
+        from datetime import datetime, timedelta, timezone
+        from newsroom.core import process_item
+        source = dict(self.source, type='web_search')
+        old = (datetime.now(timezone.utc)-timedelta(hours=48)).isoformat()
+        for number, date, expected in ((100, self.fixture.now, 'NOISE'), (101, old, 'STALE'), (102, None, 'UNDATED')):
+            with self.subTest(date=date):
+                article = dict(self.fixture.item(number), published_at=date)
+                item = {key: article[key] for key in ('url', 'title')}
+                item.update(description='', content='', published_at=None)
+                with patch('newsroom.core.fetch_publisher_article', return_value=article) as read, \
+                     patch('newsroom.core.get_api_key', return_value='test'), \
+                     patch('newsroom.core.analyze_with_ai', return_value=self.fixture.noise()) as analyze:
+                    outcome = process_item(self.db, source, item, .35, 3500, 24, ai_settings=self.config['ai'])
+                self.assertEqual(outcome, expected)
+                read.assert_called_once()
+                self.assertEqual(analyze.call_count, int(expected == 'NOISE'))
+                self.assertEqual(self.db.execute('SELECT published_at FROM items WHERE url=?', (item['url'],)).fetchone()[0], date)

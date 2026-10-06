@@ -18,6 +18,25 @@ class MockResponse(io.BytesIO):
 
 
 class SearchIntegrationTests(unittest.TestCase):
+    def test_discovery_only_search_saves_links_without_reading_pages(self):
+        response = {'output': [{'content': [{'annotations': [
+            {'type': 'url_citation', 'url': 'https://publisher.example/news', 'title': 'Новое решение'}
+        ]}]}]}
+        with patch('newsroom.core.request_response', return_value=response), \
+             patch('newsroom.core.fetch_publisher_article') as read:
+            items = fetch_web_search('news', {'web_search_enabled': True}, read_articles=False)
+        read.assert_not_called()
+        self.assertEqual(items[0]['url'], 'https://publisher.example/news')
+        self.assertIsNone(items[0]['published_at'])
+        self.assertNotIn('material_read', items[0])
+
+    def test_discovery_fallback_also_defers_article_reading(self):
+        from newsroom.ai import AIResponseError
+        with patch('newsroom.core.request_response', side_effect=AIResponseError('NETWORK_TIMEOUT')), \
+             patch('newsroom.core.fetch_google_news', return_value=[]) as fallback:
+            fetch_web_search('news', {'web_search_enabled': True}, read_articles=False)
+        self.assertFalse(fallback.call_args.kwargs['read_articles'])
+
     def test_web_search_citations_are_read_as_publisher_pages(self):
         response = {"output": [{"content": [{"type": "output_text", "text": "A recent report.",
                     "annotations": [{"type": "url_citation", "url": "https://publisher.example/news",
