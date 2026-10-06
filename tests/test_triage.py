@@ -15,6 +15,13 @@ def decision(kind='KEEP', **changes):
 
 
 class TriageTests(unittest.TestCase):
+    def test_unknown_selection_is_checked_again_with_unchanged_input(self):
+        with patch('newsroom.triage.classify', side_effect=[decision('UNKNOWN'), decision()]) as classify_mock:
+            self.assertEqual(screen(self.db, 1, self.item, self.settings)['decision'], 'UNKNOWN')
+            self.assertEqual(screen(self.db, 1, self.item, self.settings)['decision'], 'KEEP')
+            self.assertEqual(screen(self.db, 1, self.item, self.settings)['decision'], 'KEEP')
+        self.assertEqual(classify_mock.call_count, 2)
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.db=connect(str(Path(self.tmp.name)/'test.db'));self.addCleanup(self.db.close)

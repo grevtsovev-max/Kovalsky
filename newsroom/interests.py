@@ -106,6 +106,14 @@ def extract_topics(text: str, settings: dict, existing_topics: list[str] | None 
     return analyze_submitted_post(text, settings, existing_topics)["topics"]
 
 
+def existing_topic_names(db):
+    from .topic_registry import SETTINGS, SNAPSHOT, policy
+    from .source_registry import state
+    if state(db, SETTINGS):
+        return [t['name'] for t in policy(state(db, SNAPSHOT, {}))['topics']]
+    return [r[0] for r in db.execute("SELECT topic FROM monitoring_topics ORDER BY weight DESC LIMIT 100")]
+
+
 def save_submission(db, *, user_id: str, chat_id: str, message_id: int,
                     forwarded_from: str, source_url: str, text: str,
                     ai_settings: dict) -> tuple[bool, int]:
@@ -126,7 +134,7 @@ def save_submission(db, *, user_id: str, chat_id: str, message_id: int,
         submission_id = cursor.lastrowid
         is_new = True
         db.commit()
-    existing_topics = [row[0] for row in db.execute("SELECT topic FROM monitoring_topics ORDER BY weight DESC LIMIT 100")]
+    existing_topics = existing_topic_names(db)
     try:
         profile = analyze_submitted_post(text, ai_settings, existing_topics)
     except Exception:
@@ -167,7 +175,7 @@ def save_item_feedback(db, item_id: int, is_interesting: bool, ai_settings: dict
     old = db.execute("SELECT * FROM interest_feedback WHERE item_id=?", (item_id,)).fetchone()
     if old and old["is_interesting"] == int(is_interesting) and json.loads(old["topics_json"] or "[]"):
         return [entry.get("topic", "") for entry in json.loads(old["topics_json"] or "[]") if entry.get("topic")]
-    existing_topics = [r[0] for r in db.execute("SELECT topic FROM monitoring_topics ORDER BY weight DESC LIMIT 100")]
+    existing_topics = existing_topic_names(db)
     text = "\n".join(filter(None, [item["title"], item["description"], analysis.get("summary_ru"), item["content"][:5000]]))
     try:
         topics = extract_topics(text, ai_settings, existing_topics)
@@ -216,6 +224,8 @@ def save_item_feedback(db, item_id: int, is_interesting: bool, ai_settings: dict
                     db.execute("DELETE FROM monitoring_topics WHERE topic_id=?", (row["topic_id"],))
         if item["disposition"] in {"WAITING_CONFIRMATION", "AI_RETRY", "PRIMARY_RETRY", "PENDING"}:
             db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
+    from .topic_registry import queue_rating
+    queue_rating(db, item_id)
     db.commit()
     return topic_names
 
@@ -298,12 +308,21 @@ def learning_context(db, *, topic_limit: int = 20, example_limit: int = 4) -> di
         })
         if len(examples) >= example_limit:
             break
+    from .topic_registry import SETTINGS, SNAPSHOT, policy
+    from .source_registry import state
+    if state(db, SETTINGS):
+        thematic = policy(state(db, SNAPSHOT, {}))
+        topics = [{"topic": t["name"], "search_terms": [k["concept"] for k in thematic["keywords"] if k["topic"] == t["name"]], "weight": 1} for t in thematic["topics"]]
+        for example in examples:
+            example.pop("topics", None)
     return {"topics": topics, "preferred_analysis_depth": preferred_depth,
             "analysis_examples": examples}
 
 
 def expand_search_queries(config: dict) -> None:
     """Add learned topic alternatives to existing broad web-search queries."""
+    if config.get("_topic_registry_authoritative"):
+        return
     try:
         from .db import connect
         db = connect(config["newsroom"]["database"])

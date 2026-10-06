@@ -6,11 +6,13 @@ from .triage import MAX_AUTOMATIC_RETRIES
 STAGES = [
     ('received', 'Ждут обработки'), ('primary', 'Чтение источника'),
     ('ai', 'Ждут анализа'), ('confirmation', 'Автоматическая перепроверка'),
+    ('drafting', 'Написание'), ('technical', 'Технические ошибки'),
     ('correction', 'Правки опубликованных постов'),
     ('review', 'Автоматическая публикация'), ('published', 'Опубликованы'),
     ('filtered', 'Отфильтрованы'), ('processed', 'Завершены без публикации'),
 ]
 REASONS = {
+    'TECHNICAL_ERROR': 'Обработка остановлена технической ошибкой; требуется исправление обработчика.',
     'PENDING': 'Материал получен. Результат обработки ещё не сохранён.',
     'PRIMARY_RETRY': 'Пока нет прочитанного пригодного материала. Агент повторит чтение; отдельный первоисточник не обязателен.',
     'AI_RETRY': 'Разбор ИИ не завершён. Материал оставлен на повторную обработку.',
@@ -101,6 +103,8 @@ def retry_queue_positions(db, config, now):
     if not {'items', 'sources', 'app_state'} <= tables:
         return {}, 0, 0
     newsroom = config.get('newsroom', {})
+    if newsroom.get('independent_processing'):
+        return {}, 0, 0  # Continuous stage queues have no per-collection-cycle position.
     ai = config.get('ai', {})
     source_ids = {row[0] for row in db.execute('SELECT source_id FROM sources WHERE active=1')}
     if newsroom.get('story_watch_enabled'):
@@ -261,7 +265,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                 post_link_method = 'LEGACY_PROCESSING_TIME'
         category = {'PRIMARY_RETRY':'primary', 'AI_RETRY':'ai',
                     'WAITING_CONFIRMATION':'confirmation', 'AGENT_CORRECTION_QUEUED':'correction',
-                    'PENDING':'received'}.get(disposition, 'processed')
+                    'PENDING':'received', 'TECHNICAL_ERROR':'technical'}.get(disposition, 'processed')
         reason = retry.get('reason') or REASONS.get(disposition, 'Обработка завершена; связанный пост не найден.')
         if disposition == 'NOISE' and triage.get('decision') == 'NOISE' and triage.get('reason'):
             reason = f"Предварительный ИИ-отбор: {triage['reason']}"
@@ -285,6 +289,25 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                 category, reason = 'confirmation', 'Черновик снят с публикации и оставлен на автоматическую перепроверку.'
             elif post['status'] == 'REJECTED':
                 category, reason = 'filtered', 'Связанный черновик окончательно отклонён проверками допуска.'
+        if 'material_stage_state' in tables:
+            from .material_flow import snapshot as flow_snapshot
+            item['checkpoints'] = flow_snapshot(db, item['item_id'])
+            if post and post.get('publication_trace'):
+                trace = post['publication_trace']
+                for checkpoint in item['checkpoints']:
+                    if checkpoint['stage'] == 'delivery':
+                        checkpoint['status'] = 'DONE' if trace['status'] == 'CONFIRMED' and trace.get('telegram_message_id') else 'WAITING'
+                        checkpoint['reason'] = trace['status_label']
+                        checkpoint['block_kind'] = 'delivery_unknown' if trace['status'] == 'UNKNOWN' else checkpoint['block_kind']
+            active_checkpoint = next((x for x in reversed(item['checkpoints']) if x['status'] in {'READY', 'RUNNING', 'WAITING', 'ERROR'}), None)
+            if active_checkpoint and not post:
+                item['current_checkpoint'] = active_checkpoint
+                if active_checkpoint['stage'] == 'drafting':
+                    category = 'drafting'
+                if active_checkpoint['block_kind'] == 'technical':
+                    category = 'technical'
+                if active_checkpoint['reason']:
+                    reason = active_checkpoint['reason']
         counts[category] += 1
         totals['received'] += 1
         totals['analyzed'] += bool(item['analyzed_at'])
@@ -292,6 +315,8 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         totals['drafted'] += post is not None
         totals['published'] += category == 'published'
         item.update(stage=category, reason=reason,
+            material_status=('Материал прочитан' if primary.get('status') == 'READ' or primary.get('_material_read') is True else 'Нет прочитанного пригодного материала'),
+            material_url=primary.get('url') if primary.get('status') == 'READ' else primary.get('_material_url') if primary.get('_material_read') is True else None,
             primary_status=PRIMARY_LABELS.get(primary.get('status'), 'Проверка не завершена' if primary else 'Нет сохранённой проверки'),
             primary_url=primary.get('url'), summary=analysis.get('summary_ru'),
             analyzed_at=item.get('analyzed_at'), retry_at=retry.get('next_at'),
@@ -301,6 +326,12 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             retry_limit=(MAX_AUTOMATIC_RETRIES if disposition in {'AI_RETRY', 'PRIMARY_RETRY', 'WAITING_CONFIRMATION'} else 0),
             retry_reason=retry.get('reason'),
             what_is_new=analysis.get('what_is_new'), issues=analysis.get('editorial_issues') or [],
+            date_check=analysis.get('development_date_check'),
+            memory_issues=analysis.get('memory_issues') or [],
+            publication_recommendation=analysis.get('publication_recommendation'),
+            source_review_required=analysis.get('source_review_required') is True,
+            source_review_issues=analysis.get('source_review_issues') or [],
+            verification_questions=analysis.get('verification_questions') or [],
             independent_note=analysis.get('independent_check_note'),
             interest_vote=item.get('interest_vote'),
             post=({k:post.get(k) for k in ('post_id','status','created_at','published_at','telegram_url','external_id',
@@ -312,6 +343,17 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     queue_positions, queue_total, queue_batch = retry_queue_positions(db, config, now)
     has_decisions = 'agent_decisions' in tables
     for item in visible:
+        item['processing_job'] = None
+        if 'processing_jobs' in tables:
+            job = db.execute("SELECT job_id,category,status,attempts,next_at,outcome,error_code FROM processing_jobs "
+                             "WHERE item_id=? ORDER BY job_id DESC LIMIT 1", (item['item_id'],)).fetchone()
+            if job:
+                item['processing_job'] = {key: job[key] for key in job.keys() if key != 'job_id'}
+                if 'processing_job_events' in tables:
+                    recovery = db.execute("SELECT status,created_at FROM processing_job_events WHERE job_id=? "
+                        "AND status IN ('LEASE_EXPIRED','CYCLE_ABORTED') ORDER BY event_id DESC LIMIT 1",
+                        (job['job_id'],)).fetchone()
+                    item['processing_job']['last_recovery'] = dict(recovery) if recovery else None
         item['retry_queue_position'] = queue_positions.get(item['item_id'])
         item['retry_queue_total'] = queue_total if item['retry_queue_position'] else 0
         item['retry_queue_batch'] = queue_batch if item['retry_queue_position'] else 0

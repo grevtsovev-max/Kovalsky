@@ -149,7 +149,7 @@ class ResourceTests(unittest.TestCase):
         calls = []
         def read():
             calls.append(True)
-            return {'material_read': True}
+            return {'material_read': True, 'content': 'Прочитанный текст сообщения источника.'}
         work = Work('collector', read, key='read-key', ttl=60, stage='source_read')
         work.execute(self.runtime)
         work.execute(self.runtime)
@@ -212,7 +212,7 @@ class ResourceTests(unittest.TestCase):
         old = (datetime.now(timezone.utc)-timedelta(minutes=10)).isoformat()
         self.db.execute("INSERT INTO cache_events(stage,created_at) VALUES('collector',?)", (old,))
         self.db.commit()
-        work = Work('collector', lambda: {'material_read': True}, key='cached', ttl=60, stage='source_read')
+        work = Work('collector', lambda: {'material_read': True, 'content': 'Прочитанный текст сообщения источника.'}, key='cached', ttl=60, stage='source_read')
         work.execute(self.runtime)
         work.execute(self.runtime)
         report = snapshot(self.db, self.config)

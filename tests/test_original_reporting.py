@@ -33,8 +33,10 @@ class OriginalReportingTests(unittest.TestCase):
         for bad in [dict(audit,evidence='выдуманная цитата '*4),dict(audit,central_claim_supported=False),dict(audit,attribution_preserved=False),{}]:
             held=require_primary_source_review(dict(result,original_reporting_check=bad),'READ',source)
             self.assertEqual(held['publication_recommendation'],'WAIT_FOR_AUTOMATION')
+            self.assertTrue(held['source_review_issues'])
         bad=dict(result,facts=[{'claim_type':'FACT'}])
         self.assertEqual(require_primary_source_review(bad,'READ',source)['publication_recommendation'],'WAIT_FOR_AUTOMATION')
+        self.assertIn('REPORT', require_primary_source_review(bad,'READ',source)['source_review_issues'][0])
     def test_unread_article_never_promoted(self):
         with patch('newsroom.core._request_with_url',side_effect=TimeoutError):
             with self.assertRaises(TimeoutError):fetch_publisher_article('https://tass.ru/story','ТАСС',None)

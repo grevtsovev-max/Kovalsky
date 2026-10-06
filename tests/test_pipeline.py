@@ -6,6 +6,32 @@ from newsroom.pipeline import pipeline_snapshot
 
 
 class PipelineTests(unittest.TestCase):
+    def test_processing_job_exposes_queue_state_without_worker_payload(self):
+        self.add(1, 'WAITING_CONFIRMATION')
+        self.db.execute('CREATE TABLE processing_jobs(job_id INTEGER,item_id INTEGER,category TEXT,status TEXT,attempts INTEGER,next_at TEXT,outcome TEXT,error_code TEXT,payload_json TEXT)')
+        self.db.execute("INSERT INTO processing_jobs VALUES(1,1,'retry','WAITING',2,'2026-09-28T12:02:00+00:00','AI_RETRY',NULL,'private payload')")
+        job = self.snapshot()['items'][0]['processing_job']
+        self.assertEqual(job['category'], 'retry')
+        self.assertEqual(job['attempts'], 2)
+        self.assertNotIn('payload_json', job)
+        self.db.execute('CREATE TABLE processing_job_events(event_id INTEGER,job_id INTEGER,status TEXT,created_at TEXT)')
+        self.db.execute("INSERT INTO processing_job_events VALUES(1,1,'LEASE_EXPIRED','2026-09-28T11:59:00+00:00')")
+        recovery = self.snapshot()['items'][0]['processing_job']['last_recovery']
+        self.assertEqual(recovery['status'], 'LEASE_EXPIRED')
+        self.assertEqual(set(recovery), {'status', 'created_at'})
+
+    def test_saved_gate_reasons_are_visible_for_waiting_material(self):
+        self.add(1, 'WAITING_CONFIRMATION')
+        check = {'status': 'UNVERIFIED', 'reason': 'Не подтверждена дата события.'}
+        self.db.execute('INSERT INTO item_analysis VALUES(?,?,?)',
+                        (1, '2026-09-28T11:00:00+00:00', json.dumps({
+                            'development_date_check': check, 'memory_issues': ['Нужна сверка факта'],
+                            'publication_recommendation': 'WAIT_FOR_AUTOMATION', 'source_review_required': True})))
+        item = self.snapshot()['items'][0]
+        self.assertEqual(item['date_check'], check)
+        self.assertEqual(item['memory_issues'], ['Нужна сверка факта'])
+        self.assertTrue(item['source_review_required'])
+
     def setUp(self):
         self.db = sqlite3.connect(':memory:')
         self.db.row_factory = sqlite3.Row

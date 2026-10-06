@@ -1,0 +1,15 @@
+[Unit]
+Description=Kovalsky local Jina Reader
+Requires=docker.service
+After=docker.service network-online.target
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/kovalsky-jina-network
+ExecStart=/usr/bin/docker run --rm --user jina --name kovalsky-jina --network kovalsky-reader --ip 172.30.89.2 --publish 127.0.0.1:3000:8081 --memory 1200m --memory-swap 1200m --cpus 1 --pids-limit 256 --shm-size 128m --cap-drop ALL --security-opt no-new-privileges --log-opt max-size=10m --log-opt max-file=2 kovalsky-jina:verified
+ExecStop=/usr/bin/docker stop -t 15 kovalsky-jina
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=90
+TimeoutStopSec=30
+[Install]
+WantedBy=multi-user.target

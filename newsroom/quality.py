@@ -3,7 +3,7 @@ import re
 import hashlib
 
 
-def attributed_report_supported(report, facts, *, stored=False):
+def attributed_report_supported(report, facts, *, stored=False, analysis_only=False):
     """Check the read account and its attribution without requiring an original."""
     audit = facts.get('original_reporting_check') or {}
     quote = audit.get('evidence', '')
@@ -13,7 +13,7 @@ def attributed_report_supported(report, facts, *, stored=False):
                  and report.get('material_read') is True
                  and bool(report.get('url')) and bool(report.get('publisher'))
                  and audit.get('central_claim_supported') is True
-                 and audit.get('attribution_preserved') is True
+                 and ((analysis_only and not stored) or audit.get('attribution_preserved') is True)
                  and len(quote.strip()) >= 24
                  and ' '.join(quote.casefold().split()) in ' '.join(content.casefold().split())
                  and bool(claims)

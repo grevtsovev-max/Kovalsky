@@ -23,11 +23,11 @@ STAGES = {
     'regulatory_repair': 'Исправление нормативного разбора',
     'regulatory_review': 'Проверка нормативного разбора',
     'telegram_delivery': 'Обращения к Telegram', 'digest': 'Подготовка и доставка дайджеста',
-    'unattributed': 'Этап не записан',
+    'drafting': 'Написание поста', 'unattributed': 'Этап не записан',
 }
 FUNCTION_STAGES = {
     '_read_material_work': 'source_read', 'fetch_publisher_article': 'source_read',
-    'classify': 'triage', 'analyze': 'editorial', 'request_response': 'research_agent',
+    'classify': 'triage', 'analyze': 'editorial', 'draft_post': 'drafting', 'request_response': 'research_agent',
     'fetch_web_search': 'recovery_search', 'fetch_google_news': 'source_google_news',
 }
 PRICING_URL = 'https://developers.openai.com/api/docs/pricing'
@@ -102,10 +102,10 @@ def _empty():
                 reference_usd=0., priced_calls=0, reference_calls=0, unpriced_calls=0)
 
 
-def snapshot(db, config, hours=24, now=None, item_id=None):
+def snapshot(db, config, hours=24, now=None, item_id=None, start=None):
     now = now or datetime.now(timezone.utc)
     hours = hours if hours in (1, 24, 168) else 24
-    cutoff = (now - timedelta(hours=hours)).isoformat()
+    cutoff = (start or (now - timedelta(hours=hours))).isoformat()
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     settings = config.get('ai', {})
     started_row = db.execute("SELECT value FROM app_state WHERE key='resource_accounting_started_at'").fetchone() if 'app_state' in tables else None
