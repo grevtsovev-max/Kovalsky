@@ -43,6 +43,26 @@ class ProcessorTests(unittest.TestCase):
         artifact = self.db.execute("SELECT result_json FROM material_stage_results WHERE item_id=? AND stage='reading'", (copy_id,)).fetchone()
         self.assertEqual(json.loads(artifact[0])['body'], original['content'])
 
+    def test_draft_check_uses_the_displayed_publisher_name(self):
+        from newsroom.core import process_item
+        item = self.fixture.item(903)
+        item['primary_source_publisher'] = 'DeCenter (Telegram)'
+        item['primary_source_type'] = 'ORIGINAL_MEDIA_REPORT'
+        item['primary_source_url'] = 'https://t.me/DeCenter/903'
+        result = self.fixture.publish_result(item)
+        result['facts'][0]['claim_type'] = 'REPORT'
+        result['original_reporting_check'] = {'central_claim_supported': True,
+            'attribution_preserved': True, 'evidence': item['primary_source_content']}
+        result['summary_ru'] = 'DeCenter сообщает: ' + item['primary_source_content']
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', return_value=result):
+            outcome = process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=self.config['ai'])
+        self.assertEqual(outcome, 'WAITING_CONFIRMATION')
+        analysis = json.loads(self.db.execute('SELECT result_json FROM item_analysis ORDER BY item_id DESC LIMIT 1').fetchone()[0])
+        self.assertIn('REDUNDANT_SOURCE_ATTRIBUTION', analysis['editorial_issues'])
+        self.assertTrue(analysis['_needs_post_draft'])
+        self.assertEqual(self.db.execute('SELECT count(*) FROM posts').fetchone()[0], 0)
+
     def test_collection_does_not_wait_for_editor(self):
         from newsroom.core import run_cycle
         self.config['_collection_only'] = True
