@@ -858,6 +858,8 @@ def recover_feedback_correction_jobs(db) -> None:
 
 
 def process_feedback_corrections(config: dict, db, limit: int = 1) -> int:
+    from .agent_control import require_enabled
+    require_enabled(config)
     from .runtime import attach
     attach(config)
     rows = db.execute("SELECT * FROM telegram_feedback_corrections WHERE status='QUEUED' "
@@ -1210,6 +1212,8 @@ def handle_update(config: dict, db, update: dict) -> None:
 
 
 def run_review_bot(config: dict) -> None:
+    from .agent_control import require_enabled
+    require_enabled(config)
     db_path = config["newsroom"]["database"]
     db = connect(db_path)
     from .runtime import attach
@@ -1227,6 +1231,7 @@ def run_review_bot(config: dict) -> None:
     print("Бот сбора редакционных примеров и интересов запущен.", flush=True)
     from .edit_sync import handle_persisted_update, sync_recent_channel_edits
     while True:
+        require_enabled(config)
         payload = {"timeout": 30, "allowed_updates": REVIEW_ALLOWED_UPDATES}
         if offset is not None:
             payload["offset"] = offset

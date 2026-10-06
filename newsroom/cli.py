@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .agent_control import AgentDisabled, enabled as agent_enabled, require_enabled, set_enabled
 from .quality import editorial_issues, digest_issues, attributed_report_supported
 from .ai import FILTER_VERSION
 from .core import NOW, _log_timing, _registrable_domain, is_non_news_telegram_format, is_relevant, run_cycle, terms
@@ -37,7 +38,7 @@ from .delivery import (DeliveryRejected, DeliveryUncertain, TelegramReceipt,
 def load_config(path: str) -> dict:
     with open(path, "rb") as f:
         config = tomllib.load(f)
-    config.setdefault("newsroom", {})["auto_publish"] = True
+    config.setdefault("newsroom", {}).setdefault("auto_publish", True)
     from .runtime import attach
     attach(config)
     return config
@@ -73,6 +74,7 @@ def telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) ->
 
 
 def _telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -> dict:
+    require_enabled(config)
     token = telegram_token(config)
     url = f"https://api.telegram.org/bot{token}/{method}"
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
@@ -198,6 +200,8 @@ def _publish_digest_measured(db_path: str, config: dict, kind: str = "daily", *,
 
 
 def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visibility_attempt=0) -> tuple[bool, int]:
+    if not agent_enabled(config) or config["newsroom"].get("auto_publish", True) is not True:
+        return False, 0
     from .channel_presence import inspect_channel_posts, inspect_digest_messages, ChannelPresenceUnavailable
     settings = config["newsroom"]
     now = datetime.now(timezone.utc)
@@ -396,6 +400,8 @@ def is_eligible_for_auto_publish(post, cutoff: str) -> bool:
 def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
                       exclude_post_ids=None) -> tuple[int, int, int]:
     """Publish qualified recent posts; retry Telegram errors three times, then close them."""
+    if not agent_enabled(config) or config["newsroom"].get("auto_publish", True) is not True:
+        return 0, 0, 0
     cutoff = config["newsroom"].get("auto_publish_since")
     if not cutoff:
         print("Автопубликация остановлена: не задана дата начала автоматической отправки.", file=sys.stderr)
@@ -410,6 +416,8 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
     selected_ids = None if post_ids is None else set(post_ids)
     excluded_ids = set(exclude_post_ids or [])
     for row in rows:
+        if not agent_enabled(config):
+            break
         post_id = row["post_id"]
         if post_id in excluded_ids:
             continue
@@ -431,6 +439,10 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
         try:
             publish(db, config, post_id, automatic=True)
             published += 1
+        except AgentDisabled:
+            db.execute("UPDATE posts SET auto_attempts=? WHERE post_id=?", (attempt - 1, post_id))
+            db.commit()
+            break
         except DeliveryUncertain:
             failed += 1
             db.execute("UPDATE posts SET auto_last_error='DELIVERY_UNKNOWN' WHERE post_id=?", (post_id,))
@@ -949,6 +961,9 @@ def _attach_previous_story_link(db, config: dict, post) -> None:
 
 
 def publish(db, config, post_id: int, automatic: bool = False) -> None:
+    require_enabled(config)
+    if config.get("newsroom", {}).get("auto_publish", True) is not True:
+        raise DeliveryRejected("Автопубликация отключена")
     if not automatic:
         raise RuntimeError("Ручная публикация отключена; отправка доступна только через автоматический редакционный допуск")
     from .decisions import record_publication
@@ -1044,6 +1059,7 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
 
 def run_one_cycle(config: dict, db_path: str) -> dict[str, int]:
     """Run the same complete work cycle used by scheduled and manual collection."""
+    require_enabled(config)
     cycle_started = time.perf_counter()
     from .runtime import attach
     attach(config)
@@ -1179,6 +1195,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="newsroom", description="Локальный агент мониторинга новостей")
     parser.add_argument("--config", default="config.toml")
     sub = parser.add_subparsers(dest="command", required=True)
+    control = sub.add_parser("agent", help="Постоянное включение/отключение всего агента")
+    control.add_argument("action", choices=["disable", "enable", "status"])
     sub.add_parser("init", help="Создать/обновить локальную базу")
     sub.add_parser("once", help="Проверить все активные RSS-источники один раз")
     sub.add_parser("run", help="Постоянный цикл мониторинга")
@@ -1201,7 +1219,16 @@ def main() -> None:
     admin_publish.add_argument("--request-key", required=True,
                                help="Устойчивый ключ одной команды; повторное использование защищает от дубля")
     args = parser.parse_args()
+    if args.command == "agent":
+        with open(args.config, "rb") as stream:
+            config = tomllib.load(stream)
+        if args.action != "status":
+            set_enabled(config, args.action == "enable")
+        print("Агент включён" if agent_enabled(config) else "Агент отключён")
+        return
     config = load_config(args.config)
+    if args.command not in {"dashboard", "health", "pending", "init"}:
+        require_enabled(config)
     db_path = config["newsroom"]["database"]
     database_path = Path(db_path).expanduser()
     if not database_path.is_absolute():
