@@ -139,6 +139,8 @@ def web_search_enabled(settings):
 
 
 def request_response(payload, settings):
+    from .agent_control import require_enabled
+    require_enabled(settings.get("_agent_control_config", {}))
     if not web_search_enabled(settings) and any(
             isinstance(tool, dict) and str(tool.get('type', '')).startswith('web_search')
             for tool in payload.get('tools', [])):
@@ -163,6 +165,8 @@ def _request_response(payload, settings):
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     for attempt in range(2):
+        from .agent_control import require_enabled
+        require_enabled(settings.get("_agent_control_config", {}))
         from .runtime import SCOPE
         runtime = settings.get("_runtime") or SCOPE.get().get('runtime')
         call_id = runtime.reserve(payload, {**settings, '_transport_attempt': attempt, '_request_bytes': len(req.data)}) if runtime else None

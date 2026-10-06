@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .agent_control import enabled as agent_enabled
 from .db import connect, connect_readonly
 from .quality import publication_source_ready
 
@@ -444,7 +445,8 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                 from .workflow import snapshot as queue_snapshot
                 return {"pending": len(pending), "pending_ai": pending_ai, "pending_rule": pending_rule,
                         "held":held,"ai_current_error":ai_current_error,"ai_last_success":last_ai_ok,
-                        "auto_publish_enabled": True, "auto_eligible":auto_eligible,
+                        "agent_enabled": agent_enabled(config),
+                        "auto_publish_enabled": (agent_enabled(config) and config.get("newsroom", {}).get("auto_publish", True) is True), "auto_eligible":auto_eligible,
                         "published24": published24, "published_total": published_total,
                         "source_ok": healthy, "source_error": failing, "source_stale": stale,
                         "source_total": len(sources), "news24": news24, "ai24": ai24,
@@ -678,6 +680,10 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                 size=int(self.headers.get("Content-Length", "0"))
                 if size > 8192: self._json({"error":"Слишком большой запрос"},413); return
                 parsed=urlparse(self.path); parts=[unquote(x) for x in parsed.path.strip('/').split('/')]
+                from .agent_control import enabled
+                if parts in (["api", "collect"], ["api", "intake-url"], ["api", "post-corrections"]) and not enabled(config):
+                    self._json({"error": "Агент отключён владельцем"}, 409)
+                    return
                 if parts==["api","interest-feedback"]:
                     payload=json.loads(self.rfile.read(size).decode("utf-8"))
                     try: item_id=int(payload.get("item_id"))

@@ -3162,6 +3162,8 @@ def _requeue_social_quote_repairs(db, ai_settings, freshness_hours: int) -> int:
 
 
 def run_cycle(config: dict) -> dict[str, int]:
+    from .agent_control import require_enabled
+    require_enabled(config)
     from contextlib import ExitStack
     with ExitStack() as cleanup:
         db = connect(config["newsroom"]["database"])

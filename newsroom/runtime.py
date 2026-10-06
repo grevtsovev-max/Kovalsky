@@ -102,6 +102,9 @@ class Runtime:
             db.close()
 
     def reserve(self, payload, settings):
+        from .agent_control import require_enabled
+        require_enabled(self.settings.get("_agent_control_config",
+                        {"newsroom": {"database": self.database}}))
         scope = SCOPE.get()
         category = settings.get("_work_category", scope.get("category", "fresh"))
         role = settings.get("_work_role", scope.get("role", "collector"))
@@ -272,6 +275,7 @@ class Runtime:
 def attach(config):
     """Share one ledger across the main cycle, manual intake and review process."""
     settings = config.setdefault("ai", {})
+    settings["_agent_control_config"] = {"newsroom": dict(config.get("newsroom", {}))}
     settings['web_search_enabled'] = config.get('web_search', {}).get('enabled', False) is True
     path = config.get("newsroom", {}).get("database")
     if path and not settings.get("_runtime"):

@@ -22,6 +22,8 @@ class IntakeBusyError(IntakeError):
 
 def submit_article_url(config: dict, url: str, *, retry_after_credits_restored: bool = False,
                        retry_after_validation_fix: bool = False) -> dict:
+    from .agent_control import require_enabled
+    require_enabled(config)
     from .runtime import attach
     attach(config)
     url = str(url or "").strip()

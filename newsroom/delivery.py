@@ -126,6 +126,8 @@ def event(db, attempt_id, status, detail=None):
 
 def deliver(db, config, operation, text, send, post_id=None):
     """Called only AFTER the editorial gate. Commits intent before invoking send."""
+    from .agent_control import require_enabled
+    require_enabled(config)
     target = channel(config)
     key = target + ':' + operation
     db.commit()
@@ -174,12 +176,17 @@ def deliver(db, config, operation, text, send, post_id=None):
     event(db, attempt_id, 'SENDING')
     db.commit()
     try:
+        from .agent_control import AgentDisabled
+        try:
+            require_enabled(config)
+        except AgentDisabled as exc:
+            raise DeliveryRejected(str(exc)) from None
         receipt = send(config, text)
         # The production transport always returns a message ID and its actual response.
         if not isinstance(receipt, (str, int)) or not str(receipt).isdigit():
             raise DeliveryUncertain('Telegram response has no valid message ID')
     except Exception as exc:
-        status = 'FAILED' if isinstance(exc, DeliveryRejected) else 'UNKNOWN'
+        status = 'FAILED' if isinstance(exc, (DeliveryRejected, AgentDisabled)) else 'UNKNOWN'
         changed = db.execute("UPDATE publication_attempts SET status=?,error_code=?,updated_at=? WHERE attempt_id=? AND status='SENDING'",
                    (status, type(exc).__name__, now(), attempt_id)).rowcount
         if not changed:
