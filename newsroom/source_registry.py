@@ -7,12 +7,58 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
 
 SETTINGS = 'source_registry_settings'
 SNAPSHOT = 'source_registry_snapshot'
 ATTEMPT = 'source_registry_attempt'
 ERROR = 'source_registry_error'
+CURSOR = 'source_registry_entity_cursor'
+
+
+def entity_sources(rows):
+    """Every row is also an observation target, including publishers."""
+    names = {}
+    for row in rows:
+        name = re.sub(r'\s*\((?:RSS|Telegram)\)\s*$', '', row['name'], flags=re.I)
+        # Search syntax comes from code; cells supply literal words only.
+        for alias in re.split(r'\s+/\s+', name):
+            alias = ' '.join(re.findall(r'[\w.-]+', alias, re.UNICODE))
+            if alias:
+                names.setdefault(alias.casefold(), alias)
+    groups, group = [], []
+    def source(batch):
+        query = '(' + ' OR '.join('"' + name + '"' for name in batch) + ') (криптовалюта OR крипто OR блокчейн OR ЦФА OR bitcoin OR crypto) when:2d'
+        url = 'https://news.google.com/rss/search?' + urlencode({'q': query, 'hl': 'ru', 'gl': 'RU', 'ceid': 'RU:ru'})
+        return {'name': 'Упоминания: ' + ', '.join(batch)[:85], 'url': url,
+                'type': 'google_news', 'active': True, 'priority': 1,
+                'reputation': 'unknown', 'source_role': 'discovery',
+                'registry_entities': list(batch)}
+    for name in names.values():
+        candidate = group + [name]
+        if group and (len(candidate) > 8 or len(source(candidate)['url']) > 1800):
+            groups.append(source(group))
+            group = []
+        group.append(name)
+    if group:
+        groups.append(source(group))
+    return groups
+
+
+def schedule_entities(db, config, rows):
+    groups = entity_sources(rows)
+    if not groups:
+        return
+    cursor = state(db, CURSOR, 0) % len(groups)
+    count = min(4, len(groups))
+    selected = [groups[(cursor + index) % len(groups)] for index in range(count)]
+    existing = {s['url']: s for s in config.get('sources', [])}
+    for source in selected:
+        # Preserve an explicitly disabled matching discovery source.
+        existing.setdefault(source['url'], source)
+    config['sources'] = list(existing.values())
+    save(db, CURSOR, (cursor + count) % len(groups))
+    db.commit()
 
 
 def state(db, key, default=None):
@@ -117,7 +163,11 @@ def source_for(row, existing):
     else:
         return None, 'Нужна RSS-лента; сайт сохранён в справочнике'
     # A section is a monitoring hint, never proof of ownership or trust.
-    source = {**existing.get(url, {}), 'name': row['name'][:100],
+    old = existing.get(url, {})
+    label = old.get('name') or row['name']
+    if not old.get('name') and kind == 'telegram' and row.get('section') == 'Лица':
+        label = 'Канал @' + parsed.path.strip('/')
+    source = {**old, 'name': label[:100],
               'url': url, 'type': kind}
     source.setdefault('active', True)
     source.setdefault('priority', 1)
@@ -129,9 +179,17 @@ def source_for(row, existing):
 def apply_snapshot(config, snapshot):
     existing = {s['url']: dict(s) for s in config.get('sources', [])}
     rows = []
+    linked_names = {}
+    for row in snapshot.get('rows', []):
+        if row.get('url'):
+            linked_names.setdefault(row['url'], set()).add(row['name'])
     for original in snapshot.get('rows', []):
         row = dict(original)
-        source, row['status'] = source_for(row, existing)
+        row['entity_monitored'] = True
+        source_row = dict(row)
+        if len(linked_names.get(row['url'], set())) > 1 and row['url'].startswith('https://t.me/'):
+            source_row['name'] = 'Канал @' + urlsplit(row['url']).path.strip('/')
+        source, row['status'] = source_for(source_row, existing)
         if source:
             existing[source['url']] = source
         rows.append(row)
@@ -160,6 +218,7 @@ def sync(db, config, force=False):
             save(db, ERROR, None)
         db.commit()
     rows = apply_snapshot(config, snapshot)
+    schedule_entities(db, config, rows)
     return {'url': settings['url'], 'checked_at': snapshot.get('checked_at'),
             'error': state(db, ERROR), 'rows': rows}
 
