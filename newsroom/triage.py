@@ -210,8 +210,10 @@ def screen_steps(db, item_id, item, settings):
                 'retry_without_count': True, 'budget_deferred': exc.reason != 'concurrency',
                 'retry_delay_seconds': exc.delay_seconds}
     except Exception as exc:
-        settings['_triage_disabled'] = True
         code = exc.code if isinstance(exc, AIResponseError) else type(exc).__name__
+        from .runtime import account_unavailable
+        if account_unavailable(code):
+            settings['_triage_disabled'] = True
         db.execute('INSERT INTO errors(timestamp,message) VALUES(?,?)', (datetime.now(timezone.utc).isoformat(), 'TRIAGE:'+code))
         return {'decision': 'DEFER', 'reason': f'Ранний отбор не завершён: {code}',
                 'retry_without_count': False}

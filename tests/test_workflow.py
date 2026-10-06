@@ -140,6 +140,35 @@ class WorkflowTests(unittest.TestCase):
         finally:
             coordinator.pool.shutdown()
 
+    def test_item_error_does_not_disable_other_editor_jobs(self):
+        self.config['newsroom']['processing_workers'] = 1
+        for n in (1, 2):
+            enqueue(self.db, None, self.item(n), self.source, self.options)
+        def analyze(item, *args):
+            if item['url'].endswith('/1'):
+                raise TypeError('item-specific error')
+            return self.noise()
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', side_effect=analyze) as editor:
+            Coordinator(self.db, self.config, {}).close()
+        self.assertEqual(editor.call_count, 2)
+        rows = self.db.execute('SELECT disposition FROM items ORDER BY item_id').fetchall()
+        self.assertEqual([r[0] for r in rows], ['AI_RETRY', 'NOISE'])
+
+    def test_retry_rotation_serves_reading_analysis_and_confirmation(self):
+        dispositions = ['AI_RETRY', 'WAITING_CONFIRMATION', 'PRIMARY_RETRY', 'AI_RETRY']
+        for n, disposition in enumerate(dispositions, 1):
+            enqueue(self.db, None, self.item(n), self.source, self.options, category='retry')
+            self.db.execute('UPDATE items SET disposition=? WHERE item_id=?', (disposition, n))
+        self.db.commit()
+        coordinator = Coordinator(self.db, self.config, {}, categories=('retry',), max_jobs=4)
+        try:
+            with patch('newsroom.core.similarity', return_value=0):
+                claimed = [coordinator._claim()['item_id'] for _ in range(4)]
+            self.assertEqual(claimed, [2, 1, 3, 4])
+        finally:
+            coordinator.pool.shutdown()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

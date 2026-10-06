@@ -195,19 +195,20 @@ class Coordinator:
         self.db.execute("BEGIN IMMEDIATE")
         # Aging is a separate FIFO lane, not an arbitrary relevance score.
         marks = ','.join('?' for _ in self.categories)
+        preferred = ('WAITING_CONFIRMATION', '', 'PRIMARY_RETRY', '', 'AI_RETRY', '')[self.claimed % 6] if self.categories == ('retry',) else ''
         candidates = self.db.execute("SELECT j.*,i.story_id AS current_story_id FROM processing_jobs j JOIN items i ON i.item_id=j.item_id "
                               "JOIN sources s ON s.source_id=i.source_id "
                               "WHERE j.status IN ('PENDING','WAITING') AND j.next_at<=? "
                               "AND (s.active=1 OR s.type='manual' OR s.url LIKE 'story-watch://%') "
                               f"AND j.category IN ({marks}) "
                               "AND NOT EXISTS(SELECT 1 FROM processing_jobs busy WHERE busy.item_id=j.item_id AND busy.status='RUNNING') "
-                              # Alternate a completed-editor retry with the
-                              # oldest due work. Both keep the existing budget.
-                              "ORDER BY CASE WHEN ?=1 AND i.disposition='WAITING_CONFIRMATION' THEN 0 ELSE 1 END,"
+                              # Rotate reading, analysis and confirmation;
+                              # every other slot remains oldest-due FIFO.
+                              "ORDER BY CASE WHEN i.disposition=? THEN 0 ELSE 1 END,"
                               "CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN 0 ELSE 1 END,"
                               "CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN j.next_at ELSE NULL END,"
                               "j.priority DESC,j.next_at,j.created_at,j.job_id", (stamp(), *self.categories,
-                              int(self.categories == ('retry',) and self.claimed % 2 == 0)))
+                              preferred))
         busy = self.db.execute("SELECT j.payload_json,i.story_id FROM processing_jobs j JOIN items i USING(item_id) WHERE j.status='RUNNING'").fetchall()
         def related(candidate):
             from .core import canonicalize, similarity

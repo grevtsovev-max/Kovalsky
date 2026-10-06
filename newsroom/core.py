@@ -2603,7 +2603,11 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             db.execute("INSERT INTO app_state(key,value) VALUES('ai_last_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                        (json.dumps({"at":NOW(),"code":reason,"location":error_location(exc)}),))
             db.commit()
-            ai_settings["_disabled_for_cycle"] = True
+            # Item-level errors must not stall unrelated material. Shared
+            # account failures are held centrally by runtime admission.
+            from .runtime import account_unavailable
+            if account_unavailable(reason):
+                ai_settings["_disabled_for_cycle"] = True
             ai_result = None
             item["_retry_reason"] = f"ИИ-разбор не завершён: {reason}"
             item["_retry_without_count"] = False
