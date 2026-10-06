@@ -1,0 +1,78 @@
+import sqlite3
+import unittest
+from unittest.mock import patch
+
+from newsroom import source_registry as registry
+
+
+class RegistryTests(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(':memory:')
+        self.db.execute('CREATE TABLE app_state(key TEXT PRIMARY KEY, value TEXT)')
+        self.addCleanup(self.db.close)
+
+    def row(self, name='Example', url='https://t.me/example'):
+        return dict(name=name, url=url, section='СМИ', row=2, task='', url_allowed=True)
+
+    def test_headers_spaces_and_blank_links(self):
+        rows = registry.parse_tab('Название ,Ссылка\nКомпания,\nКанал,https://t.me/example\n'.encode(), 'Бренды')
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['url'], '')
+        with self.assertRaises(ValueError):
+            registry.parse_tab(b'<html>Login</html>', 'СМИ')
+
+    def test_merge_preserves_disabled_trust_and_other_sources(self):
+        original = dict(name='Old', url='https://t.me/example', type='telegram',
+                        active=False, reputation='unknown', source_role='aggregator')
+        config = {'sources': [original, dict(name='Other', url='https://other.test/feed')]}
+        snapshot = {'rows': [self.row('New'), self.row('Duplicate')]}
+        rows = registry.apply_snapshot(config, snapshot)
+        self.assertEqual(len(config['sources']), 2)
+        source = config['sources'][0]
+        self.assertFalse(source['active'])
+        self.assertEqual(source['reputation'], 'unknown')
+        self.assertEqual(source['source_role'], 'aggregator')
+        self.assertEqual(rows[0]['status'], 'Выключен в текущих настройках')
+
+    def test_unapproved_url_and_site_are_not_connected(self):
+        row = self.row(url='https://127.0.0.1/feed')
+        row['url_allowed'] = False
+        self.assertIsNone(registry.source_for(row, {})[0])
+        self.assertIsNone(registry.source_for(self.row(url='https://example.com/'), {})[0])
+
+    def test_failure_keeps_last_snapshot_and_backs_off(self):
+        registry.save(self.db, registry.SETTINGS, {'url': 'https://docs.google.com/'})
+        registry.save(self.db, registry.SNAPSHOT, {'rows': [self.row()], 'checked_at': 1})
+        self.db.commit()
+        with patch.object(registry, 'read_registry', side_effect=TimeoutError) as read:
+            config = {'sources': []}
+            result = registry.sync(self.db, config, force=True)
+            self.assertEqual(result['error'], 'TimeoutError')
+            self.assertEqual(config['sources'][0]['url'], 'https://t.me/example')
+            registry.sync(self.db, {'sources': []})
+            self.assertEqual(read.call_count, 1)
+
+    def test_configure_does_not_replace_settings_after_failed_read(self):
+        original = {'url': 'previous'}
+        registry.save(self.db, registry.SETTINGS, original)
+        self.db.commit()
+        payload = {'url': 'https://docs.google.com/spreadsheets/d/' + 'x'*25 + '/edit',
+                   'tabs': [{'name': 'СМИ', 'gid': 123}]}
+        with patch.object(registry, 'read_registry', side_effect=ValueError):
+            with self.assertRaises(ValueError):
+                registry.configure(self.db, payload)
+        self.assertEqual(registry.state(self.db, registry.SETTINGS), original)
+
+    def test_read_failure_in_one_tab_rejects_entire_snapshot(self):
+        settings = {'spreadsheet_id': 'x'*25, 'tabs': [{'name': 'СМИ', 'gid': '1'}, {'name': 'Лица', 'gid': '2'}]}
+        def fetch(url, **kwargs):
+            if 'gid=2' in url:
+                raise TimeoutError
+            return 'Название,Ссылка\nExample,\n'.encode(), url, 'text/csv'
+        with patch('newsroom.core._request_with_url', side_effect=fetch):
+            with self.assertRaises(TimeoutError):
+                registry.read_registry(settings)
+
+
+if __name__ == '__main__':
+    unittest.main()
