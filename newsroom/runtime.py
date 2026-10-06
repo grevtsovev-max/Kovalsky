@@ -184,6 +184,7 @@ class Runtime:
 def attach(config):
     """Share one ledger across the main cycle, manual intake and review process."""
     settings = config.setdefault("ai", {})
+    settings['web_search_enabled'] = config.get('web_search', {}).get('enabled', False) is True
     path = config.get("newsroom", {}).get("database")
     if path and not settings.get("_runtime"):
         settings["_runtime"] = Runtime(path, settings)

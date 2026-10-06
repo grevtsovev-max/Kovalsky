@@ -77,6 +77,8 @@ reputation = "unknown"
 source_role = "discovery"
 
 [web_search]
+# Платный Web Search выключен во всех этапах, пока явно не включён здесь.
+enabled = false
 min_interval_minutes = 3
 
 [x]
