@@ -42,6 +42,7 @@ class MemoryIntegrationTests(unittest.TestCase):
             self.assertEqual(contract['text_field'], 'summary_ru')
             self.assertFalse(contract['has_previous_publication'])
             self.assertIn(self.evidence, contract['required_fact_quotes'])
+            self.assertTrue(contract['source_footer'].startswith('Источник: ['))
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0],1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0],1)
 

@@ -466,7 +466,8 @@ def draft_post(decision, source, settings):
     schema = {'type': 'object', 'additionalProperties': False,
               'properties': {key: copy.deepcopy(SCHEMA['properties'][key]) for key in fields},
               'required': list(fields)}
-    checked = {key: value for key, value in decision.items() if not key.startswith('_')}
+    checked = {key: value for key, value in decision.items() if not key.startswith('_') and key not in fields}
+    previous_draft = {key: decision.get(key) for key in fields if key in decision}
     payload = {'model': settings.get('model', 'gpt-6-luna'), 'store': False,
         'max_output_tokens': max(5000, int(settings.get('max_output_tokens', 1800))),
         'instructions': ('Ты пишешь русский новостной пост по уже проверенному решению. '
@@ -478,9 +479,16 @@ def draft_post(decision, source, settings):
             'включи хотя бы один из этих подтверждённых существенных фрагментов дословно в указанное поле; '
             'не перефразируй его и не переноси только в другое поле. Для ещё не опубликованного сюжета '
             'полный текст находится в summary_ru, даже если уже есть story_id. '
+            'previous_draft — прежний текст и прежние отметки, а не проверка нового текста: пересчитай editorial_check. '
+            'История позиции нужна только для изменения или повторного отстаивания позиции чиновника, '
+            'не для регистрации, реестра, отчёта или административного обновления и не из-за наличия прежнего поста. '
+            'Не заменяй историю заметкой о том, что нет ссылки или данных. '
+            'draft_contract.source_footer система добавит сама: не включай эту строку в текст и не повторяй '
+            'название этого СМИ во вводной «сообщает», «пишет», «по данным». Сохрани автора утверждения '
+            'и необходимые звенья пересказа; ссылка на фактически прочитанный материал будет в указанной строке. '
             'Проверь реально написанный текст в editorial_check. Соблюдай редакционные правила:\n'
             + _load_editorial_rules(settings)),
-        'input': json.dumps({'checked_decision': checked, 'read_source': source,
+        'input': json.dumps({'checked_decision': checked, 'previous_draft': previous_draft, 'read_source': source,
                             'draft_contract': settings.get('_draft_contract') or {},
                             'max_post_length': settings.get('max_post_length', 3500)}, ensure_ascii=False),
         'text': {'format': {'type': 'json_schema', 'name': 'newsroom_post_draft', 'strict': True, 'schema': schema}}}

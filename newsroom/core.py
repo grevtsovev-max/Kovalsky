@@ -3061,7 +3061,11 @@ def _finish_post_steps(db, item, ai_settings, context):
     source = context['source']
     max_length = context['max_length']
     material_ids = set((memory_diff or {}).get('material_unpublished_facts', []))
+    draft_source = primary_source or publisher_report or {}
+    draft_citation_name = draft_source.get('publisher') or publisher_name
+    draft_citation_url = draft_source.get('url') or item['url']
     ai_options['_draft_contract'] = {
+        'source_footer': make_post('', '', draft_citation_name, draft_citation_url, max_length).splitlines()[-1],
         'text_field': 'what_is_new' if status == 'UPDATE_CANDIDATE' and has_previous_publication else 'summary_ru',
         'has_previous_publication': bool(has_previous_publication),
         'required_fact_quotes': [claim['post_quote'] for claim in (memory_diff or {}).get('post_claims', [])
