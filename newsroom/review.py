@@ -536,7 +536,7 @@ def enqueue_agent_fact_correction(db, *, item_id: int, story_id: int, post_id: i
     ).fetchone()
     if existing:
         return int(existing["correction_id"]) if existing["status"] in {"QUEUED", "PROCESSING", "UNKNOWN"} else None
-    post = db.execute("SELECT text,headline FROM posts WHERE post_id=? AND status='PUBLISHED'", (post_id,)).fetchone()
+    post = db.execute("SELECT text FROM posts WHERE post_id=? AND status='PUBLISHED'", (post_id,)).fetchone()
     item = db.execute("SELECT title,url FROM items WHERE item_id=?", (item_id,)).fetchone()
     if not post or not item:
         return None
@@ -1064,8 +1064,14 @@ def _handle_interest_message(config: dict, db, message: dict) -> None:
                     "Если речь о конкретном посте и нужна проверяемая правка, пришлите его ссылку и замечание."})
         return
     if command in {"/topics", "/темы"}:
-        topics = db.execute("SELECT topic,weight FROM monitoring_topics ORDER BY weight DESC,topic").fetchall()
-        body = "Текущий темник:\n" + "\n".join(f"• {r['topic']} ({r['weight']})" for r in topics) if topics else "Темник пока пуст. Перешли мне интересную публикацию."
+        from .topic_registry import SETTINGS, SNAPSHOT, policy
+        from .source_registry import state
+        if state(db, SETTINGS):
+            names = [t['name'] for t in policy(state(db, SNAPSHOT, {}))['topics']]
+            body = 'Темы из Google Таблицы:\n' + '\n'.join('• '+n for n in names) + '\n' + state(db,SETTINGS)['url']
+        else:
+            topics = db.execute("SELECT topic,weight FROM monitoring_topics ORDER BY weight DESC,topic").fetchall()
+            body = "Текущий темник:\n" + "\n".join(f"• {r['topic']} ({r['weight']})" for r in topics) if topics else "Темник пока пуст. Перешли мне интересную публикацию."
         telegram_api(config, "sendMessage", {"chat_id": str(chat.get("id")), "text": body[:3900]})
         return
     if not text and message.get("forward_origin"):
@@ -1109,6 +1115,12 @@ def _handle_interest_message(config: dict, db, message: dict) -> None:
     except Exception as exc:
         # The raw example remains saved even if topic extraction is temporarily unavailable.
         reply = f"Публикацию сохранил. Темы и глубину анализа пока не удалось определить ({type(exc).__name__}); попробую при следующей пересылке."
+    if '_topic_registry' in config.get('ai', {}):
+        from .topic_registry import credentials_available, SETTINGS
+        from .source_registry import state
+        reply = ('Пример сохранён. Предпочтения подачи будут учтены. Тематические уточнения пройдут разбор '
+                 'и будут применены через общую Google Таблицу. ' +
+                 ('' if credentials_available(state(db, SETTINGS)) else 'Для автоматической записи в таблицу ещё нужен доступ Google на сервере.'))
     telegram_api(config, "sendMessage", {"chat_id": str(chat.get("id")), "text": reply})
 
 

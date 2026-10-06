@@ -301,6 +301,11 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             retry_limit=(MAX_AUTOMATIC_RETRIES if disposition in {'AI_RETRY', 'PRIMARY_RETRY', 'WAITING_CONFIRMATION'} else 0),
             retry_reason=retry.get('reason'),
             what_is_new=analysis.get('what_is_new'), issues=analysis.get('editorial_issues') or [],
+            date_check=analysis.get('development_date_check'),
+            memory_issues=analysis.get('memory_issues') or [],
+            publication_recommendation=analysis.get('publication_recommendation'),
+            source_review_required=analysis.get('source_review_required') is True,
+            source_review_issues=analysis.get('source_review_issues') or [],
             independent_note=analysis.get('independent_check_note'),
             interest_vote=item.get('interest_vote'),
             post=({k:post.get(k) for k in ('post_id','status','created_at','published_at','telegram_url','external_id',
@@ -312,6 +317,17 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     queue_positions, queue_total, queue_batch = retry_queue_positions(db, config, now)
     has_decisions = 'agent_decisions' in tables
     for item in visible:
+        item['processing_job'] = None
+        if 'processing_jobs' in tables:
+            job = db.execute("SELECT job_id,category,status,attempts,next_at,outcome,error_code FROM processing_jobs "
+                             "WHERE item_id=? ORDER BY job_id DESC LIMIT 1", (item['item_id'],)).fetchone()
+            if job:
+                item['processing_job'] = {key: job[key] for key in job.keys() if key != 'job_id'}
+                if 'processing_job_events' in tables:
+                    recovery = db.execute("SELECT status,created_at FROM processing_job_events WHERE job_id=? "
+                        "AND status IN ('LEASE_EXPIRED','CYCLE_ABORTED') ORDER BY event_id DESC LIMIT 1",
+                        (job['job_id'],)).fetchone()
+                    item['processing_job']['last_recovery'] = dict(recovery) if recovery else None
         item['retry_queue_position'] = queue_positions.get(item['item_id'])
         item['retry_queue_total'] = queue_total if item['retry_queue_position'] else 0
         item['retry_queue_batch'] = queue_batch if item['retry_queue_position'] else 0

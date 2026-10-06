@@ -17,6 +17,129 @@ from newsroom.workflow import Coordinator, Work, enqueue, snapshot
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_cycle_failure_keeps_safe_diagnostic_after_cleanup(self):
+        with patch('newsroom.core._run_cycle', side_effect=RuntimeError('private credential')):
+            with self.assertRaises(RuntimeError):
+                run_cycle(self.config)
+        stored = self.db.execute("SELECT value FROM app_state WHERE key='diagnostic_last_error'").fetchone()[0]
+        self.assertEqual(json.loads(stored)['code'], 'RuntimeError')
+        self.assertNotIn('private credential', stored)
+
+    def test_post_writing_runs_only_after_analysis_gates(self):
+        for approved in (False, True):
+            with self.subTest(approved=approved):
+                item = self.item(100 + int(approved))
+                result = self.publish_result(item) if approved else self.noise()
+                result['_needs_post_draft'] = True
+                draft = {key: result.get(key, '') for key in ('headline_ru', 'summary_ru', 'what_is_new', 'editorial_check')}
+                if approved:
+                    result['headline_ru'] = result['summary_ru'] = ''
+                with patch('newsroom.core.get_api_key', return_value='test'), \
+                     patch('newsroom.core.analyze_with_ai', return_value=result), \
+                     patch('newsroom.ai.draft_post', return_value=draft) as writer:
+                    outcome = process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=self.config['ai'])
+                self.assertEqual(writer.call_count, int(approved))
+                self.assertEqual(outcome, 'NEW_STORY' if approved else 'NOISE')
+                if approved:
+                    saved = self.db.execute('SELECT text FROM posts ORDER BY post_id DESC LIMIT 1').fetchone()[0]
+                    self.assertIn(draft['headline_ru'], saved)
+
+    def test_history_revision_ignores_unrelated_story_updates(self):
+        from newsroom.core import _editor_history_revision
+        now = datetime.now(timezone.utc).isoformat()
+        self.db.execute("INSERT INTO stories(canonical_topic,headline,first_seen_at,last_updated_at,latest_information) VALUES(?,?,?,?,?)",
+                        ('Цифровой рубль', 'Банк России открыл счета цифрового рубля', now, now, '220 тысяч счетов цифрового рубля'))
+        related_id = self.db.execute('SELECT last_insert_rowid()').fetchone()[0]
+        self.db.execute("INSERT INTO stories(canonical_topic,headline,first_seen_at,last_updated_at,latest_information) VALUES(?,?,?,?,?)",
+                        ('Футбол', 'Команда выиграла футбольный матч', now, now, 'Спортсмены забили гол'))
+        unrelated_id = self.db.execute('SELECT last_insert_rowid()').fetchone()[0]
+        item = {'title': 'Банк России открыл 220 тысяч счетов цифрового рубля'}
+        before = _editor_history_revision(self.db, item)
+        self.db.execute('UPDATE stories SET version=version+1 WHERE story_id=?', (unrelated_id,))
+        self.assertEqual(before, _editor_history_revision(self.db, item))
+        self.db.execute('UPDATE stories SET version=version+1 WHERE story_id=?', (related_id,))
+        self.assertNotEqual(before, _editor_history_revision(self.db, item))
+
+    def test_inconclusive_editor_output_is_not_cached_even_from_legacy_cache(self):
+        runtime = self.config['ai']['_runtime']
+        key = cache_key('test', 'inconclusive-editor')
+        result = {'action': 'NEW_STORY', 'publication_recommendation': 'WAIT_FOR_AUTOMATION'}
+        runtime.store(key, 'editor', result, 60)
+        with patch('newsroom.core.analyze_with_ai', return_value=result) as analyze:
+            work = Work('editor', analyze, key=key, ttl=60)
+            self.assertEqual(work.execute(runtime), result)
+            self.assertEqual(work.execute(runtime), result)
+        self.assertEqual(analyze.call_count, 2)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cache_events').fetchone()[0], 0)
+
+    def test_fresh_timeout_does_not_disable_reserved_editor_retry(self):
+        from newsroom.ai import AIResponseError
+        held = self.item(1)
+        fresh = self.item(2)
+        enqueue(self.db, None, held, self.source, self.options, category='retry')
+        enqueue(self.db, None, fresh, self.source, self.options)
+        self.db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION' WHERE item_id=1")
+        self.db.commit()
+        seen = []
+        def analyze(item, *args):
+            seen.append(item['url'])
+            if item['url'] == fresh['url'] and seen.count(fresh['url']) == 1:
+                raise AIResponseError('NETWORK_TIMEOUT')
+            return self.noise()
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.fetch_rss', return_value=[]), \
+             patch('newsroom.core.analyze_with_ai', side_effect=analyze):
+            run_cycle(self.config)
+        self.assertEqual(seen[0], fresh['url'])
+        self.assertIn(held['url'], seen[1:])
+        self.assertEqual(self.db.execute('SELECT disposition FROM items WHERE item_id=1').fetchone()[0], 'NOISE')
+
+    def test_budget_deferral_does_not_consume_editor_retry_attempt(self):
+        enqueue(self.db, None, self.item(), self.source, self.options, category='retry')
+        self.db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION'")
+        self.db.execute("INSERT INTO app_state(key,value) VALUES('editor_retry:1','2')")
+        self.db.commit()
+        self.config['ai']['triage_enabled'] = True
+        deferred = {'decision': 'DEFER', 'reason': 'Бюджет исчерпан', 'retry_without_count': True, 'budget_deferred': True}
+        with patch('newsroom.core.screen_item', return_value=deferred), \
+             patch('newsroom.core.analyze_with_ai') as editor:
+            Coordinator(self.db, self.config, {}, categories=('retry',), max_jobs=1).close()
+        editor.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT value FROM app_state WHERE key='editor_retry:1'").fetchone()[0], '2')
+        self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'AI_RETRY')
+        self.assertEqual(self.db.execute("SELECT status FROM processing_jobs").fetchone()[0], 'WAITING')
+
+    def test_rotated_out_entity_material_is_processed_without_fetching_its_feed(self):
+        enqueue(self.db, None, self.item(), self.source, self.options)
+        self.db.execute('UPDATE sources SET active=0')
+        self.db.commit()
+        self.config['sources'] = []
+        self.config['_registry_processing_urls'] = [self.source['url']]
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', side_effect=self.noise) as editor, \
+             patch('newsroom.core.fetch_rss') as fetch:
+            counts = run_cycle(self.config)
+        self.assertEqual(counts['NOISE'], 1)
+        editor.assert_called_once()
+        fetch.assert_not_called()
+        self.assertEqual(self.db.execute('SELECT status FROM processing_jobs').fetchone()[0], 'DONE')
+
+    def test_retry_lane_alternates_editor_confirmation_with_oldest_work(self):
+        first = self.item(1, title='Первичный отбор старого материала')
+        second = self.item(2, title='Подтверждение свежего решения регулятора')
+        for item in (first, second):
+            enqueue(self.db, None, item, self.source, self.options, category='retry')
+        self.db.execute("UPDATE items SET disposition=CASE item_id WHEN 1 THEN 'AI_RETRY' ELSE 'WAITING_CONFIRMATION' END")
+        self.db.execute("UPDATE processing_jobs SET created_at='2000-01-01T00:00:00+00:00',next_at='2000-01-01T00:00:00+00:00' WHERE item_id=1")
+        self.db.commit()
+        coordinator = Coordinator(self.db, self.config, {}, categories=('retry',), max_jobs=2)
+        try:
+            self.assertEqual(coordinator._claim()['item_id'], 2)
+            with patch('newsroom.core.similarity', return_value=0):
+                self.assertEqual(coordinator._claim()['item_id'], 1)
+        finally:
+            coordinator.pool.shutdown()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -233,6 +356,7 @@ class WorkflowTests(unittest.TestCase):
             Coordinator(self.db, self.config, counts).close()
         self.assertEqual(counts, {'NOISE': 1})
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM processing_jobs').fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM processing_job_events WHERE status='LEASE_EXPIRED'").fetchone()[0], 1)
 
     def test_an_active_lease_cannot_be_claimed_by_another_coordinator(self):
         enqueue(self.db, None, self.item(), self.source, self.options)
@@ -376,6 +500,7 @@ class WorkflowTests(unittest.TestCase):
             coordinator.abort()
             self.assertEqual(snapshot(self.db)['pending'], 1)
             self.assertEqual(self.db.execute('SELECT COUNT(*) FROM item_analysis').fetchone()[0], 0)
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM processing_job_events WHERE status='CYCLE_ABORTED'").fetchone()[0], 1)
             counts = {}
             Coordinator(self.db, self.config, counts).close()
         self.assertEqual(counts, {'NOISE': 1})

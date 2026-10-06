@@ -29,6 +29,19 @@ class AutomaticReviewTests(unittest.TestCase):
         self.db.close()
         self.temp.cleanup()
 
+    def test_agent_fact_correction_uses_actual_post_schema_and_is_idempotent(self):
+        from newsroom.review import enqueue_agent_fact_correction
+        self.db.execute("UPDATE posts SET status='PUBLISHED' WHERE post_id=1")
+        self.db.execute("INSERT INTO sources(name,type,url) VALUES('Источник','rss','https://example.org/feed')")
+        self.db.execute("INSERT INTO items(source_id,url,canonical_url,title,discovered_at,content_hash,title_hash) VALUES(1,'https://example.org/a','https://example.org/a','Дополнение','2026-10-06','a','a')")
+        for supplement in (False, True):
+            kwargs = dict(item_id=1, story_id=1, post_id=1, owner_chat_id='42', supplement=supplement)
+            first = enqueue_agent_fact_correction(self.db, **kwargs)
+            self.assertIsNotNone(first)
+            self.assertEqual(first, enqueue_agent_fact_correction(self.db, **kwargs))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM telegram_feedback_corrections').fetchone()[0], 2)
+        self.assertEqual(self.db.execute('SELECT text FROM posts WHERE post_id=1').fetchone()[0], 'Тестовый пост')
+
     def test_old_approval_buttons_are_acknowledged_but_do_not_change_post(self):
         update = {"callback_query": {
             "id": "callback-1", "data": "approve:1",
@@ -121,10 +134,10 @@ class AutomaticReviewTests(unittest.TestCase):
         handle_update(self.config, self.db, update)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM editorial_feedback WHERE feedback_type='TELEGRAM_EDIT'").fetchone()[0], 0)
 
-    def test_legacy_auto_publish_false_is_normalized_to_true(self):
+    def test_auto_publish_false_is_preserved(self):
         path = Path(self.temp.name) / "config.toml"
         path.write_text('[newsroom]\nauto_publish = false\n', encoding="utf-8")
-        self.assertTrue(load_config(str(path))["newsroom"]["auto_publish"])
+        self.assertFalse(load_config(str(path))["newsroom"]["auto_publish"])
 
     def test_direct_manual_publish_call_is_blocked_before_database_access(self):
         with self.assertRaisesRegex(RuntimeError, "Ручная публикация отключена"):

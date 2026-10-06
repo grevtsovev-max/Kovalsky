@@ -60,5 +60,11 @@ def snapshot(db, config):
                             for name in ('workflow.py','runtime.py','core.py','cli.py','diagnostics.py')},
             'processing_workers': max(1, min(8, int(config.get('newsroom', {}).get('processing_workers', 2)))),
             'api_concurrency': max(1, min(8, int(config.get('ai', {}).get('api_concurrency', 2)))),
+            'processing_limits': {key: int(config.get('newsroom', {}).get(key, default))
+                                  for key, default in (('analysis_per_cycle', 25), ('triage_per_cycle', 12),
+                                                       ('retry_items_per_cycle', 2), ('processing_cycle_seconds', 150))},
+            'api_limits': {key: int(config.get('ai', {}).get(key, default))
+                           for key, default in (('api_requests_per_window', 50), ('api_budget_window_seconds', 180),
+                                                ('api_retry_reserve', 4), ('timeout_seconds', 45))},
             'schemas': schemas, 'queue': queue(db), 'usage': usage(db), 'web_search': search,
             'job_errors': errors, 'state': state}

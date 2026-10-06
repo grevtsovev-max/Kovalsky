@@ -53,15 +53,17 @@ def _log_timing(event: str, **fields) -> None:
             pass
 
 
-def _development_date_issue(result: dict, source: dict | None, freshness_hours: int) -> tuple[str, str] | None:
-    """Require a dated, source-grounded event before treating a fresh article as fresh news."""
+def _development_date_issue(result: dict, source: dict | None, freshness_hours: int, publication_date: str | None = None) -> tuple[str, str] | None:
+    """Check established event dates without requiring an exact date for every event before treating a fresh article as fresh news."""
     if result.get("publication_recommendation") != "AUTO_PUBLISH":
         return None
     raw_date = str(result.get("development_date") or "").strip()
     evidence = str(result.get("development_date_evidence") or "").strip()
     content = str((source or {}).get("content") or "")
-    if not raw_date or not evidence or not content:
-        return ("unverified", "Не установлена подтверждённая дата самого события; дата свежей статьи не заменяет её.")
+    if not raw_date:
+        return None  # Unknown event day is not evidence that the report is stale.
+    if not evidence or not content:
+        return ("unverified", "Указанная дата события не подтверждена прочитанным материалом.")
     try:
         event_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
     except ValueError:
@@ -88,7 +90,26 @@ def _development_date_issue(result: dict, source: dict | None, freshness_hours: 
     )[event_date.month - 1]
     date_tokens.update(f"{event_date.day} {month} {event_date.year}" for month in russian_months)
     evidence_norm = normalize(evidence)
-    if not any(normalize(token) in evidence_norm for token in date_tokens):
+    confirmed = any(normalize(token) in evidence_norm for token in date_tokens)
+    try:
+        anchor = datetime.fromisoformat(str(publication_date or (source or {}).get('published_at') or '').replace('Z', '+00:00')).date()
+    except ValueError:
+        anchor = None
+    if anchor:
+        # Resolve incomplete and relative dates against the source publication,
+        # never against discovery time or the time of this retry.
+        inferred_year = anchor.year - int(event_date.month == 12 and anchor.month == 1)
+        short_dates = {f'{event_date.day} {month}' for month in russian_months}
+        short_dates.add(event_date.strftime('%d.%m'))
+        if (not re.search(r'\b(?:19|20)\d{2}\b', evidence_norm) and event_date.year == inferred_year) and any(
+                re.search(r'(?<!\w)' + re.escape(normalize(token)) + r'(?![\w.])', evidence_norm)
+                for token in short_dates):
+            confirmed = True
+        if re.search(r'\bсегодня\b', evidence_norm) and event_date == anchor:
+            confirmed = True
+        if re.search(r'\bвчера\b', evidence_norm) and event_date == anchor - timedelta(days=1):
+            confirmed = True
+    if not confirmed:
         return ("unverified", "Цитата источника не подтверждает указанную календарную дату события.")
     today = datetime.now(timezone.utc).date()
     if event_date > today:
@@ -178,7 +199,10 @@ class _PublicHttpsConnection(http.client.HTTPSConnection):
             if remaining <= 0:
                 raise TimeoutError("PUBLIC_CONNECTION_TIMEOUT")
             try:
-                sock = socket.create_connection((address, self.port), remaining, self.source_address)
+                # Reserve part of the same request deadline for the other
+                # checked addresses; one unreachable IP must not consume it all.
+                connect_timeout = remaining / (len(addresses) - index)
+                sock = socket.create_connection((address, self.port), connect_timeout, self.source_address)
             except OSError:
                 if index == len(addresses) - 1:
                     raise
@@ -194,8 +218,11 @@ class _PublicHttpsConnection(http.client.HTTPSConnection):
 
 class _PublicHttpsHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
-        return self.do_open(_PublicHttpsConnection, req, context=self._context,
-                            check_hostname=self._check_hostname)
+        kwargs = {'context': self._context}
+        # Python 3.12+ moved hostname verification entirely into SSLContext.
+        if hasattr(self, '_check_hostname'):
+            kwargs['check_hostname'] = self._check_hostname
+        return self.do_open(_PublicHttpsConnection, req, **kwargs)
 
 
 class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -310,7 +337,7 @@ def _extract_pdf_text(payload: bytes, timeout: int = 15) -> str:
     if PdfReader is not None:
         import io
         reader = PdfReader(io.BytesIO(payload), strict=False)
-        text = "\n".join((page.extract_text() or "") for page in reader.pages[:80])
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
     else:
         text = ""
     ocr_used = False
@@ -336,7 +363,7 @@ def _extract_pdf_text(payload: bytes, timeout: int = 15) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) < 80:
         raise ValueError("PDF_HAS_NO_READABLE_TEXT")
-    return PDFText(text[:12000], ocr_used=ocr_used)
+    return PDFText(text, ocr_used=ocr_used)
 
 
 class GoogleArticleParamsParser(HTMLParser):
@@ -713,12 +740,44 @@ def _fetch_bybit_restricted_counterparty_pdf(url: str, publisher_name: str,
 def fetch_publisher_article(url: str, publisher_name: str, published_at: str | None,
                             discover_primary: bool = True, timeout: int = 20,
                             public_only: bool = False) -> dict:
+    from .material_store import save, settings
+    options = settings()
+    try:
+        article = _fetch_publisher_article_native(url, publisher_name, published_at,
+            discover_primary=discover_primary, timeout=timeout, public_only=public_only)
+    except (TimeoutError, socket.timeout):
+        # A timeout has already spent the source's network allowance.
+        raise
+    except Exception as exc:
+        if not options.get('jina_enabled') or not _jina_retryable(exc):
+            raise
+        from .jina_reader import read_article
+        article = read_article(url, publisher_name, published_at, options, timeout, discover_primary=discover_primary)
+    else:
+        if article.get('material_read') is False and options.get('jina_enabled'):
+            from .jina_reader import read_article
+            article = read_article(url, publisher_name, published_at, options, timeout, discover_primary=discover_primary)
+    article.setdefault('reading_method', 'native')
+    return save(article)
+
+
+def _jina_retryable(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in {403, 406, 429, 503}
+    return isinstance(exc, ValueError) and str(exc) in {
+        'PUBLISHER_BROWSER_CHALLENGE', 'Publisher page has no readable article text'}
+
+
+def _fetch_publisher_article_native(url: str, publisher_name: str, published_at: str | None,
+                            discover_primary: bool = True, timeout: int = 20,
+                            public_only: bool = False, _rendered_response=None) -> dict:
     parsed_url = urllib.parse.urlsplit(url)
     if (not public_only and (parsed_url.hostname or "").lower().removeprefix("www.") == "bybit.com"
             and parsed_url.path.rstrip("/").lower() ==
             "/en/legal/additional-terms-and-disclosures/restricted-counterparty-list"):
         return _fetch_bybit_restricted_counterparty_pdf(url, publisher_name, published_at, timeout)
-    payload, final_url, content_type = _request_with_url(url, timeout=timeout, public_only=public_only)
+    payload, final_url, content_type = (_rendered_response if _rendered_response is not None else
+                                      _request_with_url(url, timeout=timeout, public_only=public_only))
     final_host = urllib.parse.urlsplit(final_url).hostname or ""
     if final_host.endswith("google.com") or "news.google" in final_host:
         raise ValueError("Publisher link still points to Google News")
@@ -730,9 +789,10 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
         ocr_used = bool(getattr(content, "ocr_used", False))
         article = {"url": final_url, "title": title, "description": "", "content": content,
                    "author": None, "published_at": published_at, "updated_at": None,
+                   "material_read": True, "material_url": final_url,
                    "publisher_name": publisher_name or host,
                    "primary_source_url": final_url, "primary_source_title": title,
-                   "primary_source_content": str(content)[:12000],
+                   "primary_source_content": str(content),
                    "primary_source_type": "OFFICIAL" if _is_official_source_host(host) else "LINKED_DOCUMENT",
                    "primary_source_publisher": publisher_name or host,
                    "primary_source_status": "OCR_REVIEW" if ocr_used else "READ"}
@@ -766,7 +826,7 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
     if canonical_host.endswith("google.com") or "news.google" in canonical_host:
         canonical_url = final_url
     article = {"url": canonical_url, "title": title, "description": description,
-               "content": content[:12000], "author": None, "published_at": parser.published_at or published_at,
+               "content": content, "author": None, "published_at": parser.published_at or published_at,
                "updated_at": parser.updated_at, "publisher_name": publisher_name or canonical_host,
                "material_read": article_body_read, "material_url": canonical_url,
                "primary_source_url": None, "primary_source_title": None,
@@ -775,7 +835,7 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
     if discover_primary and _is_official_source_host(canonical_host) and not embedded_candidates:
         article["primary_source_url"] = canonical_url
         article["primary_source_title"] = title
-        article["primary_source_content"] = content[:12000]
+        article["primary_source_content"] = content
         article["primary_source_type"] = "OFFICIAL"
         article["primary_source_publisher"] = publisher_name or canonical_host
         article["primary_source_status"] = "READ"
@@ -805,12 +865,12 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
                 break
             article["primary_source_url"] = primary.get("primary_source_url") or primary["url"]
             article["primary_source_title"] = primary["title"]
-            article["primary_source_content"] = primary["content"][:12000]
+            article["primary_source_content"] = primary["content"]
             article["primary_source_type"] = candidate["kind"]
             article["primary_source_publisher"] = primary["publisher_name"]
             article["primary_source_status"] = ("OCR_REVIEW" if primary.get("primary_source_status") == "OCR_REVIEW" else "READ")
             if len(content) < 100 and primary.get("content"):
-                article["content"] = primary["content"][:12000]
+                article["content"] = primary["content"]
                 article["title"] = primary.get("title") or title
             break
     # A document remains preferred. If unavailable, original reporting can support
@@ -818,7 +878,7 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
     kind = _original_reporting_kind(final_url, content) if article_body_read else None
     if discover_primary and article["primary_source_status"] != "READ" and kind:
         article.update(primary_source_url=final_url, primary_source_title=title,
-                       primary_source_content=content[:12000], primary_source_type=kind,
+                       primary_source_content=content, primary_source_type=kind,
                        primary_source_publisher=publisher_name or final_host,
                        primary_source_status="READ")
     return article
@@ -977,6 +1037,8 @@ def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
             scope_exclusions = []
         if scope_query:
             scopes.append({"query": scope_query, "interest_exclusions": scope_exclusions})
+    if not scopes and "_topic_registry" in ai_settings:
+        return FetchedItems([], ["TOPIC_SEARCH_SCOPE_EMPTY"])
     scopes = scopes or [{"query": "cryptocurrency digital assets Russia CIS regulation exchange stablecoin",
                          "interest_exclusions": []}]
     query_text = "\n".join(
@@ -1515,6 +1577,22 @@ def _restore_exact_social_headline_evidence(ai_result: dict, item: dict,
     return ai_result
 
 
+def _source_evidence_issues(result: dict, content: str) -> list[str]:
+    audit = result.get('original_reporting_check') or {}
+    quote = str(audit.get('evidence') or '')
+    issues = []
+    if audit.get('central_claim_supported') is not True:
+        issues.append('Не подтверждено центральное утверждение прочитанным материалом.')
+    if len(quote.strip()) < 24 or ' '.join(quote.casefold().split()) not in ' '.join(content.casefold().split()):
+        issues.append('Нужна дословная подтверждающая выдержка из прочитанного материала длиной не менее 24 символов.')
+    if audit.get('attribution_preserved') is not True:
+        issues.append('Не подтверждено сохранение атрибуции автора сообщения.')
+    claims = result.get('facts') or []
+    if not claims or any(f.get('claim_type') not in {'CLAIM', 'REPORT', 'OPINION'} for f in claims):
+        issues.append('Сообщения, заявления и мнения должны оставаться REPORT, CLAIM или OPINION; не повышайте их до FACT.')
+    return issues
+
+
 def require_primary_source_review(ai_result: dict | None, source_status: str, primary_source: dict | None = None,
                                   publisher_report: dict | None = None) -> dict | None:
     if ai_result is None or ai_result.get("action") == "DUPLICATE" or ai_result.get("publication_recommendation") == "DO_NOT_PUBLISH":
@@ -1523,6 +1601,7 @@ def require_primary_source_review(ai_result: dict | None, source_status: str, pr
     if publisher_report:
         supported = attributed_report_supported(publisher_report, result)
         if not supported or result.get("publication_recommendation") == "WAIT_FOR_AUTOMATION":
+            result['source_review_issues'] = _source_evidence_issues(result, publisher_report.get('content', ''))
             result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
             result["source_review_required"] = True
             return result
@@ -1530,6 +1609,7 @@ def require_primary_source_review(ai_result: dict | None, source_status: str, pr
         result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
         result["source_review_required"] = True
         result["primary_source_missing"] = True
+        result['source_review_issues'] = ['Нет сохранённого прочитанного материала с URL и текстом для проверки.']
         return result
     if primary_source and primary_source.get("type", "").startswith(("ORIGINAL_MEDIA_", "ORIGINAL_SOCIAL_")):
         # Require an explicit editorial decision about the central claim, with a
@@ -1543,6 +1623,7 @@ def require_primary_source_review(ai_result: dict | None, source_status: str, pr
                      and result.get("facts")
                      and all(f.get("claim_type") in {"CLAIM", "REPORT", "OPINION"} for f in result["facts"]))
         if not supported or result.get("publication_recommendation") == "WAIT_FOR_AUTOMATION":
+            result['source_review_issues'] = _source_evidence_issues(result, primary_source['content'])
             result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
             result["source_review_required"] = True
             return result
@@ -1989,11 +2070,7 @@ def _editor_history_revision(db, item):
     related = [dict(row) for row in db.execute("SELECT * FROM stories")
                if similarity(candidate, row['canonical_topic'] + ' ' + row['headline'] + ' ' + row['latest_information']) >= .12]
     ids = [row['story_id'] for row in related]
-    snapshots = {"stories": related,
-                 'story_registry': [tuple(row) for row in db.execute(
-                     'SELECT story_id,version,publication_count,last_updated_at,last_published_at FROM stories ORDER BY story_id')],
-                 'publication_registry': [tuple(row) for row in db.execute(
-                     'SELECT post_id,status,post_hash FROM posts ORDER BY post_id')]}
+    snapshots = {"stories": related}
     for table in ("posts", "story_facts", "publication_coverage"):
         marks = ','.join('?' for _ in ids) or 'NULL'
         snapshots[table] = [tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE story_id IN ({marks})", ids)]
@@ -2278,6 +2355,14 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         # for the cheap topic prefilter; the normal AI triage and full checks still decide relevance.
         excerpt_limit = 12000 if item.get("screening_primary_source") is True else 2200
         relevance_text += " " + str(item.get("screening_excerpt") or "")[:excerpt_limit]
+    thematic = (ai_settings or {}).get('_topic_registry')
+    if thematic is not None:
+        relevance_terms = []  # Ignore legacy terms embedded in persisted jobs.
+        if not thematic.get('topics'):
+            _trace_item(item, "Тематический фильтр", "Отсеян", "В таблице нет включённых тем мониторинга.")
+            db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
+            db.commit()
+            return "NOISE"
     if relevance_terms and not is_relevant(relevance_text, relevance_terms):
         _trace_item(item, "Тематический фильтр", "Отсеян",
                     "В заголовке и описании не найдено совпадений с темами мониторинга.")
@@ -2423,6 +2508,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                           "publication_count": s["publication_count"],
                           "last_published_at": s["last_published_at"]} for s in shortlist]
         ai_options = dict(ai_settings)
+        ai_options['_analysis_only'] = True
         ai_options["max_post_length"] = max_length
         try:
             ai_input = {key: value for key, value in item.items()
@@ -2440,18 +2526,30 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 ai_input["knowledge_context"] = context(db, [s['story_id'] for s in shortlist])
             ai_input["editorial_examples"] = _editorial_examples(
                 db, item, item_id, story_id=best["story_id"] if best else None)
+            if "_editorial_registry" in ai_options:
+                ai_input["editorial_examples"] = ai_options["_editorial_registry"]["examples"]
             previous_analysis = db.execute("SELECT result_json FROM item_analysis WHERE item_id=?", (item_id,)).fetchone()
             ai_input['editorial_feedback'] = []
             if previous_analysis:
                 previous_result = json.loads(previous_analysis["result_json"])
                 ai_input["editorial_feedback"] = [
-                    issue for key in ("editorial_issues", "memory_issues")
+                    issue for key in ("editorial_issues", "memory_issues", "source_review_issues")
                     for issue in (previous_result.get(key) if isinstance(previous_result.get(key), list) else [])
                     if isinstance(issue, str)
                 ]
+                evidence_source = primary_source or publisher_report or {}
+                if (previous_result.get('source_review_required') is True
+                        and not previous_result.get('source_review_issues')
+                        and (publisher_report or str(evidence_source.get('type', '')).startswith(('ORIGINAL_MEDIA_', 'ORIGINAL_SOCIAL_')))):
+                    ai_input['editorial_feedback'].extend(_source_evidence_issues(
+                        previous_result, str(evidence_source.get('content') or '')))
+                date_check = previous_result.get("development_date_check")
+                if isinstance(date_check, dict) and isinstance(date_check.get("reason"), str):
+                    ai_input["editorial_feedback"].append("Проверка даты события: " + date_check["reason"])
             stage_started = time.perf_counter()
             history_revision = _editor_history_revision(db, item)
-            rules = (Path(__file__).resolve().parent.parent / "EDITORIAL_RULES.md").read_text()
+            from .ai import _load_editorial_rules
+            rules = _load_editorial_rules(ai_options)
             logic = (Path(__file__).resolve().parent.parent / "AGENT_LOGIC.md").read_text()
             semantic_settings = {key: value for key, value in ai_options.items()
                                  if key in {"model", "max_output_tokens", "max_post_length", "memory_mode"}}
@@ -2526,7 +2624,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 ai_result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
             # Reject irrelevant entries even when their source cannot be read.
             if not missing_local_source and ai_result.get("action") != "DUPLICATE" and (ai_result.get("is_relevant") is False or ai_result.get("action") == "NOISE"
-                    or (ai_result.get("geographic_scope") in {"OTHER", "GLOBAL"}
+                    or ("_topic_registry" not in ai_settings and ai_result.get("geographic_scope") in {"OTHER", "GLOBAL"}
                         and ai_result.get("russia_cis_impact") in {"NONE", "INDIRECT"})):
                 ai_result["action"] = "NOISE"
                 ai_result["publication_recommendation"] = "DO_NOT_PUBLISH"
@@ -2554,7 +2652,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                         json.dumps({**ai_result, "_filter_version": FILTER_VERSION,
                                     "_independent_sources": independent_audit}, ensure_ascii=False)))
             date_issue = _development_date_issue(ai_result, primary_source or publisher_report,
-                                                 freshness_hours)
+                                                 freshness_hours, item.get('published_at'))
             if date_issue:
                 severity, reason = date_issue
                 ai_result["development_date_check"] = {"status": severity.upper(), "reason": reason}
@@ -2629,14 +2727,20 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         outside_target_market = geographic_scope not in {"RUSSIA", "CIS", "RUSSIA_CIS"}
         evidence_source = primary_source or publisher_report
         direct_impact = ai_result.get("russia_cis_impact") == "DIRECT" and _impact_evidence_is_grounded(ai_result, evidence_source)
-        if (not ai_result.get("is_relevant") or not direct_impact or action == "NOISE" or category == "PRICE_FORECAST"
+        if '_topic_registry' in ai_settings:
+            from .topic_registry import grounded_match
+            direct_impact = grounded_match(ai_result, ai_settings['_topic_registry'], evidence_source)
+            tech_not_in_scope = False
+            outside_target_market = False
+        legacy_price_excluded = '_topic_registry' not in ai_settings and category == 'PRICE_FORECAST'
+        if (not ai_result.get("is_relevant") or not direct_impact or action == "NOISE" or legacy_price_excluded
                 or tech_not_in_scope or outside_target_market):
             filter_reasons = []
             if not ai_result.get("is_relevant") or action == "NOISE":
                 filter_reasons.append("ИИ не подтвердил тематическую значимость")
             if not direct_impact:
-                filter_reasons.append("не подтверждено прямое влияние на Россию/СНГ")
-            if category == "PRICE_FORECAST":
+                filter_reasons.append("не подтверждена связь с включённой темой таблицы" if "_topic_registry" in ai_settings else "не подтверждено прямое влияние на Россию/СНГ")
+            if legacy_price_excluded:
                 filter_reasons.append("ценовой прогноз исключён редакционными правилами")
             if tech_not_in_scope:
                 filter_reasons.append("техническая новость не прошла требования к конкретности, географии или стадии")
@@ -2825,6 +2929,25 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (disposition, now, item_id))
             db.commit()
             return disposition
+        if ai_result.get('_needs_post_draft'):
+            from .ai import draft_post
+            try:
+                draft = yield Work('editor', draft_post,
+                    (ai_result, primary_source or publisher_report, ai_options))
+            except Exception as exc:
+                from .runtime import BudgetDeferred
+                item['_retry_without_count'] = isinstance(exc, BudgetDeferred)
+                item['_retry_reason'] = 'Написание поста отложено: ' + getattr(exc, 'code', type(exc).__name__)
+                _trace_item(item, 'Написание поста', 'AI_RETRY', item['_retry_reason'])
+                db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
+                db.commit()
+                return 'AI_RETRY'
+            ai_result.update(draft)
+            ai_result['_needs_post_draft'] = False
+            headline = ai_result['headline_ru']
+            _trace_item(item, 'Написание поста', 'Завершён', 'Текст подготовлен после проверки актуальности и новизны.')
+            db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
+                (json.dumps({**ai_result, '_filter_version': FILTER_VERSION}, ensure_ascii=False), item_id))
         quality_body = ai_result.get("what_is_new") if status == "UPDATE_CANDIDATE" and has_previous_publication else ai_result.get("summary_ru", "")
         citation_url = primary_source["url"] if primary_source else (publisher_report or {}).get("url", item["url"])
         citation_name = (primary_source.get("publisher") or "Первоисточник") if primary_source else (publisher_report or {}).get("publisher", publisher_name)
@@ -2852,6 +2975,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             primary_source_record = {key: value for key, value in primary_source.items() if key != "content"}
             primary_source_record["content_sha256"] = digest(primary_source["content"])
         facts_json = json.dumps({"mode": "AI", "_filter_version": FILTER_VERSION,
+                                 "topic_registry": {"version": ai_settings["_topic_registry"].get("version"), "match": ai_result.get("topic_match"), "checked": True} if "_topic_registry" in ai_settings else None,
                                  "memory_mode": memory_mode, "story_diff": memory_diff,
                                  "primary_source": primary_source_record,
                                  "primary_source_status": source_status,
@@ -3165,14 +3289,39 @@ def run_cycle(config: dict) -> dict[str, int]:
     from .agent_control import require_enabled
     require_enabled(config)
     from contextlib import ExitStack
-    with ExitStack() as cleanup:
-        db = connect(config["newsroom"]["database"])
-        cleanup.callback(db.close)
-        return _run_cycle(config, db, cleanup)
+    try:
+        with ExitStack() as cleanup:
+            db = connect(config["newsroom"]["database"])
+            cleanup.callback(db.close)
+            return _run_cycle(config, db, cleanup)
+    except Exception as exc:
+        # Record after all coordinators have rolled back and released work.
+        # Never retain the exception text: it may contain URLs or credentials.
+        from contextlib import suppress
+        from .diagnostics import error_location
+        with suppress(Exception):
+            evidence_db = connect(config["newsroom"]["database"])
+            try:
+                evidence_db.execute("INSERT INTO app_state(key,value) VALUES('diagnostic_last_error',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (json.dumps({'at': NOW(), 'code': type(exc).__name__, 'location': error_location(exc)}),))
+                evidence_db.commit()
+            finally:
+                evidence_db.close()
+        raise
 
 
 def _run_cycle(config, db, cleanup):
     config = {**config, "ai": {k: v for k, v in config.get("ai", {}).items() if k not in {"_disabled_for_cycle", "_triage_disabled"}}}
+    from .source_registry import sync
+    from .topic_registry import sync as sync_topics, learn_cycle
+    sync_topics(db, config)
+    sync(db, config)
+    sync_topics(db, config)
+    learn_cycle(db, config)
+    from .editorial_registry import sync as sync_editorial, learn_cycle as learn_editorial
+    sync_editorial(db, config)
+    learn_editorial(db, config)
     owner_ids = config.get("telegram", {}).get("interest_owner_user_ids") or []
     if owner_ids:
         config["ai"]["_correction_owner_chat_id"] = str(owner_ids[0])
@@ -3216,10 +3365,12 @@ def _run_cycle(config, db, cleanup):
         0 if entry[1] == "google_news" else
         1 if entry[1] == "web_search" else 2,
         -int(entry[0].get("priority", 1))))
-    active_urls = [cfg["url"] for cfg, _ in active_configs]
+    processing_urls = config.get('_registry_processing_urls', [])
+    active_urls = list(dict.fromkeys([cfg["url"] for cfg, _ in active_configs] + processing_urls))
     if active_urls:
         placeholders = ",".join("?" for _ in active_urls)
         db.execute(f"UPDATE sources SET active=0 WHERE url NOT IN ({placeholders})", active_urls)
+        db.execute(f"UPDATE sources SET active=1 WHERE url IN ({placeholders})", active_urls)
     else:
         db.execute("UPDATE sources SET active=0")
     for source_cfg, source_type in active_configs:
@@ -3236,6 +3387,10 @@ def _run_cycle(config, db, cleanup):
         sources.append((source_cfg, source, first_check, source_type))
     db.commit()
     source_by_id = {source["source_id"]: source for _, source, _, _ in sources}
+    if processing_urls:
+        marks = ','.join('?' for _ in processing_urls)
+        source_by_id.update({row['source_id']: row for row in db.execute(
+            f'SELECT * FROM sources WHERE active=1 AND url IN ({marks})', processing_urls)})
     manual_retry_sources = db.execute(
         "SELECT DISTINCT s.* FROM sources s JOIN items i USING(source_id) "
         "WHERE s.type='manual' AND i.disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION')"
@@ -3488,9 +3643,11 @@ def _run_cycle(config, db, cleanup):
         config['ai']['_triage_budget'] += retry_reserve
     retry_started = time.perf_counter()
     retry_counts = {}
-    retry_coordinator = Coordinator(db, config, retry_counts, categories=('retry',), max_jobs=retry_reserve)
+    retry_config = {**config, 'ai': {key: value for key, value in config['ai'].items()
+                                   if key not in {'_disabled_for_cycle', '_triage_disabled'}}}
+    retry_coordinator = Coordinator(db, retry_config, retry_counts, categories=('retry',), max_jobs=retry_reserve)
     cleanup.callback(retry_coordinator.abort)
-    for outcome, count in _retry_ai_held_items(db, source_by_id, config, coordinator=retry_coordinator).items():
+    for outcome, count in _retry_ai_held_items(db, source_by_id, retry_config, coordinator=retry_coordinator).items():
         counts[outcome] = counts.get(outcome, 0) + count
     retry_coordinator.close()
     for outcome, count in retry_counts.items():

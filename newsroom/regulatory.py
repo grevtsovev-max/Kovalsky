@@ -83,6 +83,19 @@ def official(url, domain=None):
             parsed.port in {None, 80, 443} and any(host == d or host.endswith('.' + d) for d in domains))
 
 
+def monitoring_sources(config):
+    """Adapters describe how to read; the shared registry decides what to read."""
+    from .source_registry import cached_authority
+    snapshot = cached_authority(config)
+    if snapshot is None:
+        return SOURCES
+    domains = {(urlsplit(row.get('url', '')).hostname or '').lower()
+               for row in snapshot.get('rows', [])
+               if row.get('enabled', True) and row.get('url_allowed')}
+    return [source for source in SOURCES
+            if any(host == source[2] or host.endswith('.' + source[2]) for host in domains)]
+
+
 def output_text(response):
     if response.get('status') == 'incomplete':
         raise AIResponseError('REG_INCOMPLETE')
@@ -109,7 +122,7 @@ def discover(source, config):
             'tools': [{'type': 'web_search', 'filters': {'allowed_domains': [domain]}}],
             'input': ('Найди на официальном сайте ' + domain +
                       ' актуальные документы и изменения за последние 30 дней, а также ранее принятые'
-                      ' акты с будущими сроками. Темы крипторынка России/СНГ: ' + ', '.join(terms) +
+                      ' акты с будущими сроками. Темник: ' + (json.dumps(config['ai']['_topic_registry'],ensure_ascii=False) if '_topic_registry' in config.get('ai',{}) else ', '.join(terms)) +
                       '. Нужны конкретные карточки законопроектов, тексты актов, проектов и официальные'
                       ' разъяснения, не главные страницы. Верни ссылки с цитированием источников.'),
         }, {**config['ai'],'timeout_seconds':120, '_work_role':'collector', '_work_stage':'regulatory_search'})
@@ -121,7 +134,7 @@ def discover(source, config):
                         result.append({'url': annotation.get('url', ''), 'title': annotation.get('title', '')})
     return [item for item in result if official(item['url'], None if key=='cbr' else domain)
             and len(urlsplit(item['url']).path.strip('/')) > 2
-            and (not rss or is_relevant(item.get('title', '') + ' ' + item.get('content', ''),
+            and ('_topic_registry' in config.get('ai', {}) or not rss or is_relevant(item.get('title', '') + ' ' + item.get('content', ''),
                                        config['newsroom'].get('relevance_terms', []))
                  or re.search(r'внесении изменен|признании.+утративш',item.get('title',''),re.I))]
 
@@ -223,7 +236,7 @@ def process_document(db, document, config):
                     dependencies.append((source['url'],current))
     # Revisit dependencies weekly even when the root text has not changed.
     week = datetime.now(timezone.utc).strftime('%G-%V')
-    checksum = hashlib.sha256((normalized(text)+json.dumps([VERSION,week,sorted(dependencies)])).encode()).hexdigest()
+    checksum = hashlib.sha256((normalized(text)+json.dumps([VERSION,week,sorted(dependencies),config.get("ai",{}).get("_topic_registry",{}).get("version")])).encode()).hexdigest()
     previous = db.execute('SELECT * FROM reg_versions WHERE document_id=? AND content_hash=?',
                           (document['id'], checksum)).fetchone()
     if previous:
@@ -262,7 +275,8 @@ def run_cycle(config, discover_limit=None):
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
         due = {row['id'] for row in db.execute('SELECT id FROM reg_sources WHERE checked_at IS NULL OR checked_at<?', (cutoff,))}
-        sources = [s for s in SOURCES if s[0] in due]
+        allowed = monitoring_sources(config)
+        sources = [s for s in allowed if s[0] in due]
         if discover_limit is not None:
             sources = sources[:discover_limit]
         for source in sources:
@@ -278,9 +292,11 @@ def run_cycle(config, discover_limit=None):
                 counts['SOURCE_ERROR'] = counts.get('SOURCE_ERROR', 0) + 1
             db.commit()
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
-        docs = db.execute('SELECT * FROM reg_documents WHERE checked_at IS NULL OR checked_at<? '
+        ids = [s[0] for s in allowed]
+        placeholders = ','.join('?' for _ in ids) or 'NULL'
+        docs = db.execute(f'SELECT * FROM reg_documents WHERE source_id IN ({placeholders}) AND (checked_at IS NULL OR checked_at<?) '
                           "ORDER BY checked_at IS NOT NULL, COALESCE(checked_at,discovered_at),id LIMIT ?",
-                          (cutoff, int(settings.get('documents_per_cycle', 3)))).fetchall()
+                          (*ids, cutoff, int(settings.get('documents_per_cycle', 3)))).fetchall()
         for document in docs:
             try:
                 outcome = process_document(db, document, config)
@@ -316,7 +332,8 @@ def snapshot(config):
                                for r in db.execute('SELECT observed_at,analysis FROM reg_versions WHERE document_id=? ORDER BY id DESC LIMIT 10', (row['id'],))]
             items.append(item)
         last = db.execute("SELECT value FROM reg_state WHERE key='last_cycle'").fetchone()
-        return {'items': items, 'sources': [dict(r) for r in db.execute('SELECT * FROM reg_sources')],
+        allowed = {source[0] for source in monitoring_sources(config)}
+        return {'items': items, 'sources': [dict(r) for r in db.execute('SELECT * FROM reg_sources') if r['id'] in allowed],
                 'last_cycle': last[0] if last else None,
                 'researched': db.execute("SELECT count(*) FROM reg_documents WHERE status!='FILTERED' AND current_version IS NOT NULL").fetchone()[0],
                 'total': db.execute("SELECT count(*) FROM reg_documents WHERE status!='FILTERED'").fetchone()[0]}

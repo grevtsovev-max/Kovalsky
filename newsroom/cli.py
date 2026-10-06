@@ -275,9 +275,9 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
         for row in rows:
             post_text = row["text"] or ""
             headline = post_text.splitlines()[0].strip() if post_text.splitlines() else "Новость"
-            if row["test_publication"] or row["geographic_scope"] in {"OTHER", "GLOBAL"}:
+            if row["test_publication"] or ("_topic_registry" not in config.get("ai",{}) and row["geographic_scope"] in {"OTHER", "GLOBAL"}):
                 continue
-            if re.search(r"(?i)\b(США|американ\w*|ФРС|SEC|Евросоюз|ЕС|Великобритани\w*|британск\w*)\b", headline):
+            if "_topic_registry" not in config.get("ai",{}) and re.search(r"(?i)\b(США|американ\w*|ФРС|SEC|Евросоюз|ЕС|Великобритани\w*|британск\w*)\b", headline):
                 continue
             headline = re.sub(r"\*\*(.*?)\*\*", r"\1", headline)
             from .core import _limit_headline
@@ -375,7 +375,7 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
     return True, news_count
 
 
-def is_eligible_for_auto_publish(post, cutoff: str) -> bool:
+def is_eligible_for_auto_publish(post, cutoff: str, thematic=None) -> bool:
     """Recheck publication eligibility at the send boundary, not only in SQL."""
     if not cutoff:
         return False
@@ -387,10 +387,18 @@ def is_eligible_for_auto_publish(post, cutoff: str) -> bool:
             return False
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
+    if thematic is not None:
+        proof = facts.get('topic_registry') or {}
+        match = proof.get('match') or {}
+        topical = (proof.get('checked') is True and proof.get('version') == thematic.get('version')
+                   and match.get('name') in {t['name'] for t in thematic.get('topics',[])}
+                   and len(str(match.get('evidence') or '').strip()) >= 24)
+    else:
+        topical = (facts.get('geographic_scope') in {'RUSSIA','CIS','RUSSIA_CIS'}
+                   and facts.get('russia_cis_impact') == 'DIRECT'
+                   and bool(str(facts.get('impact_evidence') or '').strip()))
     return (facts.get("mode") == "AI" and facts.get("_filter_version") == FILTER_VERSION
-            and facts.get("geographic_scope") in {"RUSSIA", "CIS", "RUSSIA_CIS"}
-            and facts.get("russia_cis_impact") == "DIRECT"
-            and bool(str(facts.get("impact_evidence") or "").strip())
+            and topical
             and (facts.get("publisher_report_exception") is True or facts.get("primary_source_status") not in {"UNREADABLE", "ARTICLE_UNREADABLE", "OCR_REVIEW"})
             and facts.get("source_review_required") is not True
             and facts.get("independent_check") != "CONFLICT"
@@ -427,7 +435,7 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
         if delivery and delivery['status'] in {'SENDING', 'UNKNOWN'}:
             failed += 1
             continue
-        if not is_eligible_for_auto_publish(row, cutoff):
+        if not is_eligible_for_auto_publish(row, cutoff, config.get("ai", {}).get("_topic_registry")):
             db.execute("UPDATE posts SET status='REJECTED',editor_decision='AUTO_REJECTED',auto_last_error='AUTO_PUBLISH_GATE_FAILED' WHERE post_id=?",
                        (post_id,))
             db.commit()
@@ -766,7 +774,7 @@ def build_health_report(db, config: dict, now: datetime | None = None) -> str:
         except (TypeError, json.JSONDecodeError):
             mode = "OTHER"
         modes[mode if mode in {"AI", "RULE_BASED"} else "OTHER"] += 1
-        eligible += int(is_eligible_for_auto_publish(row, cutoff))
+        eligible += int(is_eligible_for_auto_publish(row, cutoff, config.get("ai", {}).get("_topic_registry")))
     held_items = Counter({row["disposition"]: row["n"] for row in db.execute(
         "SELECT disposition,COUNT(*) AS n FROM items WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION','AGENT_CORRECTION_QUEUED') GROUP BY disposition")})
     baseline_missed_at_discovery = db.execute(
@@ -990,7 +998,7 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         report = facts.get("publisher_report") or {}
     except (TypeError, json.JSONDecodeError):
         facts, primary, report = {}, {}, {}
-    if not is_eligible_for_auto_publish(post, config["newsroom"].get("auto_publish_since")):
+    if not is_eligible_for_auto_publish(post, config["newsroom"].get("auto_publish_since"), config.get("ai", {}).get("_topic_registry")):
         raise RuntimeError("Публикация остановлена: пост не прошёл условия автопубликации")
     confidence = facts.get("confidence")
     if not isinstance(confidence, (int, float)) or confidence < 0.72:
@@ -1017,7 +1025,7 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
                 or audit.get("attribution_preserved") is not True or len(audit.get("evidence", "").strip()) < 24
                 or not claims or any(f.get("claim_type") not in {"CLAIM", "REPORT", "OPINION"} for f in claims)):
             raise RuntimeError("Публикация остановлена: происхождение и атрибуция сообщения СМИ не проверены")
-    if automatic and not is_eligible_for_auto_publish(post, config["newsroom"].get("auto_publish_since")):
+    if automatic and not is_eligible_for_auto_publish(post, config["newsroom"].get("auto_publish_since"), config.get("ai", {}).get("_topic_registry")):
         raise RuntimeError("Публикация остановлена: пост не прошёл условия автопубликации")
     _attach_previous_story_link(db, config, post)
     post = db.execute("SELECT * FROM posts WHERE post_id=?", (post_id,)).fetchone()

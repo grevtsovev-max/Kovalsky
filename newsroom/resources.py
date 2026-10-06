@@ -102,10 +102,10 @@ def _empty():
                 reference_usd=0., priced_calls=0, reference_calls=0, unpriced_calls=0)
 
 
-def snapshot(db, config, hours=24, now=None, item_id=None):
+def snapshot(db, config, hours=24, now=None, item_id=None, start=None):
     now = now or datetime.now(timezone.utc)
     hours = hours if hours in (1, 24, 168) else 24
-    cutoff = (now - timedelta(hours=hours)).isoformat()
+    cutoff = (start or (now - timedelta(hours=hours))).isoformat()
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     settings = config.get('ai', {})
     started_row = db.execute("SELECT value FROM app_state WHERE key='resource_accounting_started_at'").fetchone() if 'app_state' in tables else None

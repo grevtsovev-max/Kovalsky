@@ -192,10 +192,13 @@ Summary и affected должны обобщать подтверждённые s
 Заголовок черновика начинается 🇷🇺, называет кто что сделал/предлагает, до 115 символов. 2–5 коротких абзацев с понятным статусом документа. Не выдавай исторический документ за новость сегодняшнего дня.
 Релевантность: цифровые валюты/права/ЦФА/рубль, майнинг и непосредственно обслуживающая инфраструктура с влиянием на Россию/СНГ. Общие банковские и налоговые нормы без связи нерелевантны.
 '''+rules
+    if '_topic_registry' in config.get('ai', {}):
+        from .topic_registry import MATCHING
+        instructions = instructions.replace('Релевантность: цифровые валюты/права/ЦФА/рубль, майнинг и непосредственно обслуживающая инфраструктура с влиянием на Россию/СНГ. Общие банковские и налоговые нормы без связи нерелевантны.', MATCHING)
     settings={**config['ai'],'timeout_seconds':180, '_work_role':'editor', '_work_stage':'regulatory_analysis'}
     response=request_response({'model':settings.get('model','gpt-6-luna'),'store':False,'max_output_tokens':10000,
         'instructions':instructions,'input':json.dumps({'title':title,'sources':inputs,'known_gaps':gaps,
-        'profile':config['newsroom'].get('relevance_terms',[])},ensure_ascii=False),
+        'profile':config['newsroom'].get('relevance_terms',[]), 'thematic_policy':config.get('ai', {}).get('_topic_registry')},ensure_ascii=False),
         'text':{'format':{'type':'json_schema','name':'regulatory_research','strict':True,'schema':SCHEMA}}},settings)
     report=json.loads(output_text(response))
     Path(archive).mkdir(parents=True,exist_ok=True)

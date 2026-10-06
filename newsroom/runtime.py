@@ -262,8 +262,11 @@ class Runtime:
             row = db.execute("SELECT result_json FROM stage_cache WHERE cache_key=? AND expires_at>?", (key, stamp())).fetchone()
             if not row:
                 return None
+            result = json.loads(row[0])
+            if stage == 'editor' and isinstance(result, dict) and result.get('publication_recommendation') == 'WAIT_FOR_AUTOMATION':
+                return None
             db.execute("INSERT INTO cache_events(stage,item_id,created_at) VALUES(?,?,?)", (stage, SCOPE.get().get("item_id"), stamp()))
-        return json.loads(row[0])
+        return result
 
     def store(self, key, stage, result, ttl):
         with self.db() as db:
@@ -274,6 +277,10 @@ class Runtime:
 
 def attach(config):
     """Share one ledger across the main cycle, manual intake and review process."""
+    from .material_store import configure
+    configure(config)
+    from .topic_registry import attach_cached
+    attach_cached(config)
     settings = config.setdefault("ai", {})
     settings["_agent_control_config"] = {"newsroom": dict(config.get("newsroom", {}))}
     settings['web_search_enabled'] = config.get('web_search', {}).get('enabled', False) is True

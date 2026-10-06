@@ -76,7 +76,8 @@ class Work:
                 (result.get('item') or result).get('material_read') is True or
                 (result.get('item') or result).get('primary_source_status') == 'READ'))
             structured = self.role != 'editor' or (isinstance(result, dict) and
-                result.get('action') in {'NEW_STORY', 'UPDATE', 'DUPLICATE', 'NOISE'})
+                result.get('action') in {'NEW_STORY', 'UPDATE', 'DUPLICATE', 'NOISE'}
+                and result.get('publication_recommendation') != 'WAIT_FOR_AUTOMATION')
             if runtime and self.key and result is not None and readable and structured:
                 runtime.store(self.key, self.role, result, self.ttl)
             return result
@@ -168,6 +169,9 @@ class Coordinator:
             })
 
     def _resume_expired(self):
+        self.db.execute("INSERT INTO processing_job_events(job_id,role,status,created_at) "
+                        "SELECT job_id,role,'LEASE_EXPIRED',? FROM processing_jobs "
+                        "WHERE status='RUNNING' AND lease_until<?", (stamp(), stamp()))
         self.db.execute("UPDATE processing_jobs SET status='PENDING',owner=NULL,lease_until=NULL "
                         "WHERE status='RUNNING' AND lease_until<?", (stamp(),))
         self.db.execute("UPDATE processing_jobs SET status='DONE',finished_at=?,outcome=(SELECT disposition FROM items WHERE items.item_id=processing_jobs.item_id) "
@@ -197,9 +201,13 @@ class Coordinator:
                               "AND (s.active=1 OR s.type='manual' OR s.url LIKE 'story-watch://%') "
                               f"AND j.category IN ({marks}) "
                               "AND NOT EXISTS(SELECT 1 FROM processing_jobs busy WHERE busy.item_id=j.item_id AND busy.status='RUNNING') "
-                              "ORDER BY CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN 0 ELSE 1 END,"
+                              # Alternate a completed-editor retry with the
+                              # oldest due work. Both keep the existing budget.
+                              "ORDER BY CASE WHEN ?=1 AND i.disposition='WAITING_CONFIRMATION' THEN 0 ELSE 1 END,"
+                              "CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN 0 ELSE 1 END,"
                               "CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN j.next_at ELSE NULL END,"
-                              "j.priority DESC,j.next_at,j.created_at,j.job_id", (stamp(), *self.categories))
+                              "j.priority DESC,j.next_at,j.created_at,j.job_id", (stamp(), *self.categories,
+                              int(self.categories == ('retry',) and self.claimed % 2 == 0)))
         busy = self.db.execute("SELECT j.payload_json,i.story_id FROM processing_jobs j JOIN items i USING(item_id) WHERE j.status='RUNNING'").fetchall()
         def related(candidate):
             from .core import canonicalize, similarity
@@ -249,6 +257,9 @@ class Coordinator:
             self.counts[outcome] = self.counts.get(outcome, 0) + 1
             held = outcome in {"AI_RETRY", "PRIMARY_RETRY", "WAITING_CONFIRMATION"}
             capacity = bool(job.get("_item", {}).get("_retry_without_count"))
+            if capacity and job.get('_editor_retry_incremented'):
+                self.db.execute("UPDATE app_state SET value=CAST(MAX(0,CAST(value AS INTEGER)-1) AS TEXT) WHERE key=?",
+                                (f"editor_retry:{job['item_id']}",))
             next_at = stamp()
             if held:
                 retry = self.db.execute("SELECT value FROM app_state WHERE key=?", (f"selection_retry:{job['item_id']}",)).fetchone()
@@ -325,6 +336,7 @@ class Coordinator:
                     self.db.execute("INSERT INTO app_state(key,value) VALUES(?,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
                                     (f"editor_retry:{job['item_id']}",))
                     self.db.commit()
+                    job['_editor_retry_incremented'] = True
             generator = process_item_steps(self.db, payload["source"], job["_item"],
                 **payload["options"], ai_settings=self.config.get("ai", {}), existing_item_id=job["item_id"],
                 post_ready_callback=self.config.get("_publish_ready_callback"))
@@ -353,6 +365,9 @@ class Coordinator:
                 generator.close()
         finally:
             self.db.rollback()
+            self.db.execute("INSERT INTO processing_job_events(job_id,role,status,created_at) "
+                            "SELECT job_id,role,'CYCLE_ABORTED',? FROM processing_jobs "
+                            "WHERE status='RUNNING' AND owner=?", (stamp(), self.owner))
             self.db.execute("UPDATE processing_jobs SET status='PENDING',owner=NULL,lease_until=NULL "
                             "WHERE status='RUNNING' AND owner=?", (self.owner,))
             self.db.commit()

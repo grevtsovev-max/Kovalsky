@@ -20,6 +20,21 @@ class RuntimeRepairTests(unittest.TestCase):
     item = workflow_tests.WorkflowTests.item
     noise = workflow_tests.WorkflowTests.noise
 
+    def test_previous_date_failure_reaches_editor_on_retry(self):
+        item = self.item()
+        item_id = _save_item(self.db, self.source, item)
+        reason = 'Цитата источника не подтверждает указанную календарную дату события.'
+        self.db.execute('INSERT INTO item_analysis(item_id,model,created_at,result_json) VALUES(?,?,?,?)',
+                        (item_id, 'test', self.now, json.dumps({'development_date_check':
+                         {'status': 'UNVERIFIED', 'reason': reason}})))
+        self.db.commit()
+        with patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.analyze_with_ai', side_effect=self.noise) as editor:
+            process_item(self.db, self.source, item, **self.options,
+                         existing_item_id=item_id, ai_settings=self.config['ai'])
+        self.assertIn('Проверка даты события: ' + reason,
+                      editor.call_args.args[0]['editorial_feedback'])
+
     def test_null_previous_feedback_does_not_stop_editor_or_consume_error_retry(self):
         item = self.item()
         item_id = _save_item(self.db, self.source, item)

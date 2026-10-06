@@ -55,6 +55,15 @@ api_account_cooldown_seconds = 900
 # output_per_million = <цена USD за миллион выходных токенов>
 # ai.search_price_per_call задаётся в [ai], когда используется Web Search.
 
+[billing]
+# Отдельный административный ключ OpenAI для чтения Costs API.
+# Обычный ключ модели не используется для доступа к расходам.
+admin_api_key_env = "OPENAI_ADMIN_KEY"
+# admin_api_key_file = "<файл административного ключа вне репозитория>"
+# project_ids = ["<идентификатор проекта OpenAI>"]
+# true только для проекта, который используется исключительно Kovalsky.
+dedicated_project = false
+
 [telegram]
 bot_token_env = "TELEGRAM_BOT_TOKEN"
 chat_id_env = "TELEGRAM_CHAT_ID"
@@ -98,3 +107,19 @@ active = false
 priority = 2
 reputation = "unknown"
 source_role = "discovery"
+
+[reader]
+# Собственный сервис; включать после проверки чтения и сетевой изоляции.
+jina_enabled = false
+jina_endpoint = "http://127.0.0.1:3000"
+# Облако выключено до настройки отдельного ключа в закрытом серверном файле.
+jina_cloud_enabled = false
+jina_api_key_env = "JINA_API_KEY"
+# jina_api_key_file = "PRIVATE_KEY_FILE"
+jina_cloud_daily_requests = 10
+jina_cloud_request_tokens = 20000
+jina_cloud_proxy = false
+# После неудачи обычного извлечения: эти сайты сразу читаются облаком.
+jina_cloud_hosts = []
+# По умолчанию: папка materials рядом с newsroom.database.
+# archive_directory = "data/materials"

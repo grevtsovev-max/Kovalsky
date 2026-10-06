@@ -10,6 +10,18 @@ from newsroom.core import (_PublicHttpsConnection, _PublicHttpsRedirectHandler,
 
 
 class AgentSafetyTests(unittest.TestCase):
+    def test_unreachable_address_leaves_time_for_another_checked_address(self):
+        context = Mock()
+        connection = _PublicHttpsConnection('source.example', timeout=8, context=context)
+        sock = Mock()
+        with patch('newsroom.core._public_host_addresses', return_value=['8.8.8.8', '1.1.1.1']), \
+             patch('newsroom.core.time.monotonic', side_effect=[0, 0, 4, 4]), \
+             patch('newsroom.core.socket.create_connection', side_effect=[TimeoutError(), sock]) as connect_socket:
+            connection.connect()
+        self.assertEqual([call.args[1] for call in connect_socket.call_args_list], [4, 4])
+        self.assertEqual(connect_socket.call_args.args[0], ('1.1.1.1', 443))
+        self.assertEqual(context.wrap_socket.call_args.kwargs['server_hostname'], 'source.example')
+
     def test_private_and_non_https_targets_are_rejected_before_network_request(self):
         urls = ("https://127.0.0.1/", "https://10.1.2.3/", "https://169.254.169.254/",
                 "https://[::1]/", "http://example.org/", "https://user:pass@example.org/",
