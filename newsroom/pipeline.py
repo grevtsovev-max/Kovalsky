@@ -4,12 +4,12 @@ from datetime import datetime, timedelta, timezone
 from .triage import MAX_AUTOMATIC_RETRIES
 
 STAGES = [
-    ('received', 'Ждут обработки'), ('primary', 'Чтение источника'),
-    ('ai', 'Ждут анализа'), ('confirmation', 'Автоматическая перепроверка'),
-    ('drafting', 'Написание'), ('technical', 'Технические ошибки'),
+    ('received', 'Ожидают обработки'), ('primary', 'Читаются'),
+    ('ai', 'Разбираются'), ('confirmation', 'Требуют уточнения'),
+    ('drafting', 'Готовятся посты'), ('technical', 'Остановлены ошибкой'),
     ('correction', 'Правки опубликованных постов'),
-    ('review', 'Автоматическая публикация'), ('published', 'Опубликованы'),
-    ('filtered', 'Отфильтрованы'), ('processed', 'Завершены без публикации'),
+    ('review', 'Проверяются перед отправкой'), ('published', 'Опубликованы'),
+    ('filtered', 'Отклонены'), ('processed', 'Сохранены без публикации'),
 ]
 REASONS = {
     'TECHNICAL_ERROR': 'Обработка остановлена технической ошибкой; требуется исправление обработчика.',
@@ -239,7 +239,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     for post in posts:
         by_story.setdefault(post['story_id'], []).append(post)
     counts = dict.fromkeys(dict(STAGES), 0)
-    totals = dict(received=0, analyzed=0, primary_read=0, drafted=0, published=0)
+    totals = dict(received=0, analyzed=0, primary_read=0, selected=0, drafted=0, checked=0, published=0)
     output = []
     for row in rows:
         item = dict(row)
@@ -322,7 +322,12 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         counts[category] += 1
         totals['received'] += 1
         totals['analyzed'] += bool(item['analyzed_at'])
-        totals['primary_read'] += primary.get('status') == 'READ'
+        totals['primary_read'] += primary.get('status') == 'READ' or primary.get('_material_read') is True
+        totals['selected'] += analysis.get('is_relevant') is True or post is not None
+        if post:
+            import hashlib
+            proof = (post.get('facts') or {}).get('final_text_check') or {}
+            totals['checked'] += bool(proof.get('assembled_sha256') and proof['assembled_sha256'] == hashlib.sha256((post.get('text') or '').encode()).hexdigest())
         totals['drafted'] += post is not None
         totals['published'] += category == 'published'
         item.update(stage=category, reason=reason,
@@ -383,6 +388,13 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         if history and history[-1].get('reason') and item['disposition'] in {'NOISE','DUPLICATE','REJECTED','EDITOR_REJECTED'}:
             if history[-1]['reason'] != 'Подробная причина в этой исторической записи не сохранена.':
                 item['reason'] = history[-1]['reason']
-    return {'stages':[{'key':k,'label':v,'count':counts[k]} for k,v in STAGES],
+    funnel = [('received', 'Получено материалов', 'Уникальные материалы, сохранённые за выбранный период.'),
+              ('primary_read', 'Прочитано', 'Сохранён прочитанный текст источника или пересказа.'),
+              ('selected', 'Прошли отбор по теме', 'Тематическое соответствие подтверждено анализом либо сохранён связанный пост; остальные проверки могут ещё идти.'),
+              ('drafted', 'Подготовлено постов', 'Материалы, для которых сохранён связанный пост, включая впоследствии отклонённые.'),
+              ('checked', 'Прошли проверку текста', 'Есть сохранённая проверка именно текущего текста поста.'),
+              ('published', 'Опубликовано', 'Материалы со связанным опубликованным постом.')]
+    return {'funnel': [{'key': key, 'label': label, 'count': totals[key], 'description': description} for key, label, description in funnel],
+            'stages':[{'key':k,'label':v,'count':counts[k]} for k,v in STAGES],
             'totals':totals,'total':len(output),'items':visible,
             'offset':offset,'limit':30,'period':period,'updated_at':now.isoformat()}

@@ -62,6 +62,25 @@ class PipelineTests(unittest.TestCase):
             published_at=created if status=='PUBLISHED' else None, facts={'primary_source':{'url':url}},
             auto_reason='Ожидает решения'))
 
+    def test_funnel_counts_saved_progress_not_retry_or_current_queue_totals(self):
+        import hashlib
+        self.add(1, 'NEW_STORY', primary={'_material_read': True, '_material_url': 'https://source/1'})
+        self.add(2, 'NOISE')
+        self.add(3, 'PRIMARY_RETRY')
+        for item_id, relevant in [(1, True), (2, False)]:
+            self.db.execute('INSERT INTO item_analysis VALUES(?,?,?)', (item_id, '2026-09-28T11:00:00+00:00', json.dumps({'is_relevant': relevant})))
+        self.post(status='PENDING')
+        self.posts[0].update(origin_item_id=1, text='Проверенный текст')
+        self.posts[0]['facts']['final_text_check'] = {'assembled_sha256': hashlib.sha256('Проверенный текст'.encode()).hexdigest()}
+        result = self.snapshot(stage='filtered')
+        counts = {step['key']: step['count'] for step in result['funnel']}
+        self.assertEqual(counts, {'received': 3, 'primary_read': 1, 'selected': 1, 'drafted': 1, 'checked': 1, 'published': 0})
+        self.assertEqual(result['total'], 1)
+        self.assertEqual(sum(step['count'] for step in result['stages']), 3)
+        self.posts[0]['text'] = 'Изменённый непроверенный текст'
+        self.assertEqual(self.snapshot()['totals']['checked'], 0)
+        self.assertEqual(self.snapshot(q='Материал 3')['totals']['received'], 1)
+
     def test_partition_counts_and_pagination_cover_more_than_100(self):
         for i in range(105): self.add(i, 'NOISE' if i%2 else 'PRIMARY_RETRY')
         first=self.snapshot(period='all');second=self.snapshot(period='all',offset=30)
