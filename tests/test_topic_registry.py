@@ -97,6 +97,14 @@ class TopicsTests(unittest.TestCase):
         result['topic_match']['name']='Выключена'
         self.assertFalse(topics.grounded_match(result,topics.policy(snapshot()),{'content':quote}))
 
+    def test_topic_quote_saves_source_span_without_extra_terminal_punctuation(self):
+        source = 'Компания наняла сотрудников для работы с платежными агентами, расширяя отдел.'
+        result = {'topic_match': {'name': 'Работа', 'evidence': 'Компания наняла сотрудников для работы с платежными агентами.'}}
+        self.assertTrue(topics.grounded_match(result, topics.policy(snapshot()), {'content': source}))
+        self.assertEqual(result['topic_match']['evidence'], source.split(',')[0])
+        result['topic_match']['evidence'] = 'Компания уволила сотрудников для работы с платежными агентами.'
+        self.assertFalse(topics.grounded_match(result, topics.policy(snapshot()), {'content': source}))
+
     def test_old_learning_database_is_not_a_second_thematic_authority(self):
         from newsroom.interests import learning_context, expand_search_queries
         self.db.execute("INSERT INTO monitoring_topics(topic,search_terms,examples,updated_at) VALUES('Hidden','[]','[]','2026')")

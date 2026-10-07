@@ -68,6 +68,13 @@ class KnowledgeTests(unittest.TestCase):
         result['memory']['claims'][0]['post_quote'] = 'Несвязанный фрагмент'
         self.assertEqual(draft_post_claims(result['memory'], diff, {'content': original}), diff['post_claims'])
 
+    def test_typographic_quote_shapes_return_exact_read_span(self):
+        from newsroom.knowledge import grounded_span
+        source = '"Доступ к торговле для инвесторов через "ВТБ Мои инвестиции" откроется в ноябре", - сообщил участник.'
+        proposed = '«Доступ к торговле для инвесторов через "ВТБ Мои инвестиции" откроется в ноябре», - сообщил участник.'
+        self.assertEqual(grounded_span(proposed, source), source)
+        self.assertIsNone(grounded_span(proposed.replace('ноябре', 'декабре'), source))
+
     def test_three_articles_share_event_and_multiple_evidence(self):
         first=self.add(1);self.post(first)
         for i in (2,3):
