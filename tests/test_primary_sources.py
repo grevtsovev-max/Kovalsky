@@ -23,6 +23,12 @@ from newsroom.cli import is_eligible_for_auto_publish
 
 
 class PrimarySourceExtractionTests(unittest.TestCase):
+    def setUp(self):
+        from policy_fixtures import final_check
+        checker = patch('newsroom.ai.validate_draft', side_effect=final_check)
+        checker.start()
+        self.addCleanup(checker.stop)
+
     def test_zoom_modified_metadata_is_not_invented_publication_time(self):
         parser = PublisherArticleParser()
         parser.feed('<meta name="zoom:last-modified" content="Tue, 06 Oct 2026 15:16:00 GMT">')
@@ -198,7 +204,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
         sent_item = json.loads(sent["input"][0]["content"])["item"]
         self.assertEqual(sent_item["primary_source_status"], "READ")
         self.assertEqual(sent_item["primary_source"]["content"], "Текст решения.")
-        self.assertIn("primary_source_status равен UNREADABLE", sent["instructions"])
+        self.assertIn("Используй только прочитанные сведения", sent["instructions"])
 
     def test_relevant_rss_item_reads_article_before_ai_and_records_primary_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -320,8 +326,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
                  patch("newsroom.core.get_api_key", return_value="test-key"), \
                  patch("newsroom.core.analyze_with_ai", return_value=ai_result) as analyze:
                 process_item(db, source, item, 0.35, 700, 48, ai_settings={"model": "test"})
-            analyze.assert_called_once()
-            self.assertIsNone(analyze.call_args.args[0]["primary_source"])
+            analyze.assert_not_called()
             held = db.execute("SELECT disposition,primary_source_json FROM items").fetchone()
             self.assertEqual(held["disposition"], "PRIMARY_RETRY")
             self.assertEqual(json.loads(held["primary_source_json"])["status"], "ARTICLE_UNREADABLE")

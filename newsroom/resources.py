@@ -23,11 +23,11 @@ STAGES = {
     'regulatory_repair': 'Исправление нормативного разбора',
     'regulatory_review': 'Проверка нормативного разбора',
     'telegram_delivery': 'Обращения к Telegram', 'digest': 'Подготовка и доставка дайджеста',
-    'drafting': 'Написание поста', 'unattributed': 'Этап не записан',
+    'verification': 'Проверка готового текста', 'drafting': 'Написание поста', 'unattributed': 'Этап не записан',
 }
 FUNCTION_STAGES = {
     '_read_material_work': 'source_read', 'fetch_publisher_article': 'source_read',
-    'classify': 'triage', 'analyze': 'editorial', 'draft_post': 'drafting', 'request_response': 'research_agent',
+    'classify': 'triage', 'analyze': 'editorial', 'draft_post': 'drafting', 'validate_draft': 'verification', 'request_response': 'research_agent',
     'fetch_web_search': 'recovery_search', 'fetch_google_news': 'source_google_news',
 }
 PRICING_URL = 'https://developers.openai.com/api/docs/pricing'

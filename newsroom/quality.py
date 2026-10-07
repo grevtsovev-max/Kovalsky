@@ -5,6 +5,7 @@ import hashlib
 
 def attributed_report_supported(report, facts, *, stored=False, analysis_only=False):
     """Check the read account and its attribution without requiring an original."""
+    from .knowledge import grounded_span
     audit = facts.get('original_reporting_check') or {}
     quote = audit.get('evidence', '')
     content = report.get('content', '')
@@ -14,8 +15,7 @@ def attributed_report_supported(report, facts, *, stored=False, analysis_only=Fa
                  and bool(report.get('url')) and bool(report.get('publisher'))
                  and audit.get('central_claim_supported') is True
                  and ((analysis_only and not stored) or audit.get('attribution_preserved') is True)
-                 and len(quote.strip()) >= 24
-                 and ' '.join(quote.casefold().split()) in ' '.join(content.casefold().split())
+                 and grounded_span(quote, content, min_length=1) is not None
                  and bool(claims)
                  and all(c.get('claim_type') in {'CLAIM', 'REPORT', 'OPINION'} for c in claims))
     if stored:
@@ -89,28 +89,15 @@ def editorial_issues(headline, body, facts, *, final_post=False, source_name=Non
     issues = []
     if facts.get('geographic_scope') == 'RUSSIA' and not headline.startswith('🇷🇺'):
         issues.append('RUSSIA_FLAG_MISSING')
-    if len(headline) > 115:
-        issues.append('HEADLINE_TOO_LONG')
     if not body.strip() or not re.search('[а-яА-ЯёЁ]', headline + body):
         issues.append('RUSSIAN_TEXT_REQUIRED')
     if re.search(r'https?://', headline):
         issues.append('URL_IN_HEADLINE')
-    if GENERIC_UPDATE_LABEL.search(headline):
-        issues.append('GENERIC_UPDATE_LABEL')
-    if _source_attribution_is_redundant(body, facts, source_name, source_is_report):
-        issues.append('REDUNDANT_SOURCE_ATTRIBUTION')
     audit = facts.get('editorial_check') or {}
     for key in ('source_matches_event', 'attribution_preserved', 'stage_preserved',
-                'headline_main_event', 'lead_event_first', 'paragraphs_concise_distinct'):
+                'headline_main_event', 'lead_event_first'):
         if audit.get(key) is not True:
             issues.append(key.upper())
-    from .digest_language import has_finite_action
-    if not ACTION.search(headline) and not has_finite_action(headline):
-        issues.append('HEADLINE_NOT_EVENT_LED')
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
-    prose = [p for p in paragraphs if not p.startswith(('Источник:', 'Источники:', 'Ранее:', '**', '➠ '))]
-    if not prose or len(prose) > 5 or any(len(p) > 700 for p in prose):
-        issues.append('PARAGRAPH_STRUCTURE')
     if PROCESS_META.search(headline + '\n' + body):
         issues.append('EDITORIAL_PROCESS_NOTE')
     if audit.get('history_required'):

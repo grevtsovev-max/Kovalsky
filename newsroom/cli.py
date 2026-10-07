@@ -407,7 +407,9 @@ def is_eligible_for_auto_publish(post, cutoff: str, thematic=None) -> bool:
 
 def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
                       exclude_post_ids=None) -> tuple[int, int, int]:
-    """Publish qualified recent posts; retry Telegram errors three times, then close them."""
+    """Deliver checked posts; resource waits and source updates are separate states."""
+    from .runtime import BudgetDeferred
+    from .source_recheck import SourceUpdateRequired
     if not agent_enabled(config) or config["newsroom"].get("auto_publish", True) is not True:
         return 0, 0, 0
     cutoff = config["newsroom"].get("auto_publish_since")
@@ -427,6 +429,9 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
         if not agent_enabled(config):
             break
         post_id = row["post_id"]
+        if row['auto_last_error'] == 'DELIVERY_RETRY_EXHAUSTED':
+            failed += 1
+            continue
         if post_id in excluded_ids:
             continue
         if selected_ids is not None and post_id not in selected_ids:
@@ -454,6 +459,12 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
             db.execute("UPDATE posts SET auto_attempts=? WHERE post_id=?", (attempt - 1, post_id))
             db.commit()
             break
+        except SourceUpdateRequired:
+            _log_timing('source_update_reprocessing', post_id=post_id)
+        except BudgetDeferred:
+            db.execute('UPDATE posts SET auto_attempts=?,auto_last_error=? WHERE post_id=?',
+                       (attempt - 1, 'RESOURCE_WAIT', post_id))
+            db.commit()
         except DeliveryUncertain:
             failed += 1
             db.execute("UPDATE posts SET auto_last_error='DELIVERY_UNKNOWN' WHERE post_id=?", (post_id,))
@@ -461,14 +472,18 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
         except Exception as exc:
             failed += 1
             error_code = type(exc).__name__
-            if attempt >= 3:
-                db.execute("UPDATE posts SET status='REJECTED',editor_decision='AUTO_REJECTED',auto_last_error=? WHERE post_id=?",
-                           (error_code, post_id))
-                rejected += 1
-                print(f"Пост #{post_id} автоматически отклонён после трёх неудачных попыток ({error_code}).", file=sys.stderr)
+            exhausted = db.execute("SELECT 1 FROM publication_attempts WHERE post_id=? AND status='FAILED' AND attempt_count>=4 LIMIT 1", (post_id,)).fetchone()
+            if exhausted:
+                db.execute("UPDATE posts SET auto_last_error='DELIVERY_RETRY_EXHAUSTED' WHERE post_id=?", (post_id,))
+                if row['origin_item_id']:
+                    from .material_flow import mark
+                    mark(db, row['origin_item_id'], 'delivery', 'ERROR',
+                         'Доставка технически заблокирована: повторы исчерпаны; материал и ответы сохранены.',
+                         block_kind='technical')
+                print(f'Доставка поста #{post_id} технически заблокирована после исчерпания повторов.', file=sys.stderr)
             else:
                 db.execute("UPDATE posts SET auto_last_error=? WHERE post_id=?", (error_code, post_id))
-                print(f"Публикация поста #{post_id} не удалась ({error_code}); автоматическая попытка {attempt}/3.", file=sys.stderr)
+                print(f"Доставка поста #{post_id} не завершена ({error_code}); история попыток сохранена.", file=sys.stderr)
             db.commit()
     db.close()
     return published, failed, rejected
@@ -1003,9 +1018,6 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         facts, primary, report = {}, {}, {}
     if not is_eligible_for_auto_publish(post, config["newsroom"].get("auto_publish_since"), config.get("ai", {}).get("_topic_registry")):
         raise RuntimeError("Публикация остановлена: пост не прошёл условия автопубликации")
-    confidence = facts.get("confidence")
-    if not isinstance(confidence, (int, float)) or confidence < 0.72:
-        raise RuntimeError("Автопубликация остановлена: уверенность ниже автоматического порога")
     report_ok = (facts.get("publisher_report_exception") is True
                  and attributed_report_supported(report, facts, stored=True)
                  and report.get("url") in post["text"])
@@ -1017,7 +1029,7 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         audit = facts.get("original_reporting_check") or {}
         claims = facts.get("facts") or []
         if (facts.get("source_review_required") or audit.get("central_claim_supported") is not True
-                or audit.get("attribution_preserved") is not True or len(audit.get("evidence", "").strip()) < 24
+                or audit.get("attribution_preserved") is not True or not audit.get("evidence", "").strip()
                 or report.get("evidence") != audit.get("evidence")
                 or not claims or any(f.get("claim_type") not in {"CLAIM", "REPORT", "OPINION"} for f in claims)):
             raise RuntimeError("Публикация остановлена: сообщение источника должно быть точно подтверждено прочитанным текстом и атрибутировано")
@@ -1025,13 +1037,21 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         audit = facts.get("original_reporting_check") or {}
         claims = facts.get("facts") or []
         if (facts.get("source_review_required") or audit.get("central_claim_supported") is not True
-                or audit.get("attribution_preserved") is not True or len(audit.get("evidence", "").strip()) < 24
+                or audit.get("attribution_preserved") is not True or not audit.get("evidence", "").strip()
                 or not claims or any(f.get("claim_type") not in {"CLAIM", "REPORT", "OPINION"} for f in claims)):
             raise RuntimeError("Публикация остановлена: происхождение и атрибуция сообщения СМИ не проверены")
     if automatic and not is_eligible_for_auto_publish(post, config["newsroom"].get("auto_publish_since"), config.get("ai", {}).get("_topic_registry")):
         raise RuntimeError("Публикация остановлена: пост не прошёл условия автопубликации")
-    _attach_previous_story_link(db, config, post)
+    # New-policy text is final: no heuristic links or edits at the send boundary.
     post = db.execute("SELECT * FROM posts WHERE post_id=?", (post_id,)).fetchone()
+    if facts.get('policy') or '_policy_baseline' in config.get('ai', {}):
+        from .policy import publication_issues
+        proof_issues = publication_issues(post['text'], facts, config.get('ai', {}))
+        if proof_issues:
+            if 'POLICY_CHANGED' in proof_issues and post['origin_item_id']:
+                from .policy import requeue_changed_policy
+                requeue_changed_policy(db, config, post)
+            raise RuntimeError('Публикация остановлена: ' + ', '.join(proof_issues))
     headline, _, body = post["text"].partition("\n")
     issues = editorial_issues(headline, body, facts, final_post=True)
     if issues:
@@ -1044,13 +1064,17 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         if memory_issues:
             raise RuntimeError('Publication memory gate: ' + ', '.join(memory_issues))
     if post['origin_item_id']:
+        from .source_recheck import verify
+        verify(db, config, post, facts)
         from .material_flow import mark
         mark(db, post['origin_item_id'], 'gate', 'DONE', 'Проверки текста, доказательств и опубликованной истории выполнены.')
         mark(db, post['origin_item_id'], 'delivery', 'RUNNING', 'Отправка через штатный журнал доставки.')
         db.commit()
     publish_started = time.perf_counter()
     try:
-        external_id = deliver(db, config, f"post:{post_id}", post["text"], telegram_send, post_id=post_id)
+        from .news_series import deliver_series
+        external_id = deliver_series(db, config, post_id, post['text'], telegram_send,
+                                     config['newsroom'].get('max_post_length', 3500))
     except Exception as exc:
         if post['origin_item_id']:
             from .material_flow import mark
@@ -1229,6 +1253,11 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     control = sub.add_parser("agent", help="Постоянное включение/отключение всего агента")
     control.add_argument("action", choices=["disable", "enable", "status"])
+    policy_command = sub.add_parser('policy', help='Версия правил и безопасная миграция')
+    policy_command.add_argument('action', choices=['show', 'activate'])
+    recovery = sub.add_parser('recover-material', help='Возобновить технически заблокированный материал после устранения причины')
+    recovery.add_argument('--item-id', type=int, required=True)
+    recovery.add_argument('--evidence', required=True, help='Подтверждение устранённой причины; сохраняется в истории')
     sub.add_parser("init", help="Создать/обновить локальную базу")
     sub.add_parser("once", help="Проверить все активные RSS-источники один раз")
     sub.add_parser("run", help="Постоянный цикл мониторинга")
@@ -1259,7 +1288,7 @@ def main() -> None:
         print("Агент включён" if agent_enabled(config) else "Агент отключён")
         return
     config = load_config(args.config)
-    if args.command not in {"dashboard", "health", "pending", "init"}:
+    if args.command not in {"dashboard", "health", "pending", "init", "policy"}:
         require_enabled(config)
     db_path = config["newsroom"]["database"]
     database_path = Path(db_path).expanduser()
@@ -1267,7 +1296,19 @@ def main() -> None:
         database_path = Path.cwd() / database_path
     configure_runtime_log(database_path.parent / "newsroom-runtime.log")
     _log_timing("runtime_loaded", build="kovalsky-v2-20260929-r1", command=args.command, pid=os.getpid())
-    if args.command == "init":
+    if args.command == 'policy':
+        from . import policy
+        if args.action == 'activate':
+            policy.activate(db_path)
+        from .editorial_registry import attach_cached
+        attach_cached(config)
+        policy.attach(config)
+        print(json.dumps(policy.snapshot(config.get('ai', {})), ensure_ascii=False))
+    elif args.command == 'recover-material':
+        from .material_flow import recover_technical
+        with connect(db_path) as db:
+            print(json.dumps(recover_technical(db, config, args.item_id, args.evidence), ensure_ascii=False))
+    elif args.command == "init":
         connect(db_path).close()
         print(f"База готова: {db_path}")
     elif args.command == "dashboard":

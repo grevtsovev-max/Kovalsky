@@ -34,9 +34,11 @@ class TriageTests(unittest.TestCase):
     def process(self):
         return process_item(self.db,self.source,dict(self.item),.35,3500,48,ai_settings=self.settings)
 
-    def test_rejection_happens_before_source_and_editor(self):
-        with patch('newsroom.triage.classify',return_value=decision('NOISE',what_is_new='')),patch('newsroom.core._read_feed_article') as read,patch('newsroom.core.analyze_with_ai') as editor:
-            self.assertEqual(self.process(),'NOISE');read.assert_not_called();editor.assert_not_called()
+    def test_unreadable_summary_is_not_rejected_by_early_triage(self):
+        with patch('newsroom.triage.classify') as triage, patch('newsroom.core.fetch_publisher_article', side_effect=TimeoutError), patch('newsroom.core._recover_primary', return_value=None), patch('newsroom.core.analyze_with_ai') as editor:
+            self.assertEqual(self.process(), 'PRIMARY_RETRY')
+            triage.assert_not_called()
+            editor.assert_not_called()
 
     def test_interesting_missing_source_is_held_without_generating_post(self):
         with patch('newsroom.triage.classify',return_value=decision()),patch('newsroom.core.fetch_publisher_article',side_effect=TimeoutError),patch('newsroom.core._recover_primary',return_value=None),patch('newsroom.core.analyze_with_ai') as editor:
@@ -45,18 +47,20 @@ class TriageTests(unittest.TestCase):
         row=self.db.execute("select value from app_state where key='selection_retry:1'").fetchone()
         self.assertEqual(json.loads(row[0])['attempts'],0)
 
-    def test_unknown_missing_source_does_not_repeat_forever(self):
-        with patch('newsroom.triage.classify',return_value=decision('UNKNOWN')),patch('newsroom.core.fetch_publisher_article',side_effect=TimeoutError),patch('newsroom.core._recover_primary') as recover:
-            self.assertEqual(self.process(),'WAITING_CONFIRMATION');recover.assert_not_called()
+    def test_missing_source_waits_for_reading_without_spending_analysis(self):
+        with patch('newsroom.core.fetch_publisher_article', side_effect=TimeoutError), patch('newsroom.core._recover_primary', return_value=None), patch('newsroom.core.analyze_with_ai') as editor:
+            self.assertEqual(self.process(), 'PRIMARY_RETRY')
+            editor.assert_not_called()
         with patch('newsroom.core.process_item') as process:
-            self.assertEqual(_retry_ai_held_items(self.db,{1:self.source},{'newsroom':{},'ai':self.settings}),{})
+            self.assertEqual(_retry_ai_held_items(self.db, {1: self.source}, {'newsroom': {}, 'ai': self.settings}), {})
             process.assert_not_called()
 
-    def test_budget_or_service_failure_defers_without_reading(self):
-        for settings in ({'triage_enabled':True,'_triage_budget':0},{'triage_enabled':True}):
-            self.item['url']+='x';self.item['title']+='x';self.settings=settings
-            with patch('newsroom.triage.classify',side_effect=TimeoutError),patch('newsroom.core._read_feed_article') as read:
-                self.assertEqual(self.process(),'AI_RETRY');read.assert_not_called()
+    def test_obsolete_triage_budget_does_not_skip_reading(self):
+        self.settings['_triage_budget'] = 0
+        with patch('newsroom.triage.classify') as triage, patch('newsroom.core.fetch_publisher_article', side_effect=TimeoutError) as read, patch('newsroom.core._recover_primary', return_value=None):
+            self.assertEqual(self.process(), 'PRIMARY_RETRY')
+            self.assertTrue(read.called)
+            triage.assert_not_called()
 
     def test_due_filter_is_before_limit(self):
         for i in (1,2):
@@ -68,7 +72,7 @@ class TriageTests(unittest.TestCase):
 
     def test_backoff_grows_and_caps(self):
         now=datetime.now(timezone.utc)
-        for expected in (1,2,3,3,3,3):
+        for expected in (3,10,10,10,10,10):
             schedule_retry(self.db,1,'PRIMARY_RETRY',now)
             data=json.loads(self.db.execute("select value from app_state where key='selection_retry:1'").fetchone()[0])
             self.assertEqual(datetime.fromisoformat(data['next_at'])-now,timedelta(minutes=expected))
@@ -140,8 +144,9 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(self.process(),'DUPLICATE')
         self.assertEqual(self.db.execute("select value from app_state where key='selection_retry:1'").fetchone()[0],before)
 
-    def test_valid_duplicate_stops_before_source_read(self):
+    def test_unreadable_material_is_not_a_duplicate_based_on_summary(self):
         self.db.execute("INSERT INTO stories(story_id,canonical_topic,headline,first_seen_at,last_updated_at) VALUES(55,'topic','headline','now','now')")
-        with patch('newsroom.triage.classify',return_value=decision('DUPLICATE',story_id='55',what_is_new='')),patch('newsroom.core._read_feed_article') as read:
-            self.assertEqual(self.process(),'DUPLICATE');read.assert_not_called()
-        self.assertEqual(self.db.execute('select story_id from items').fetchone()[0],55)
+        with patch('newsroom.triage.classify', return_value=decision('DUPLICATE', story_id='55', what_is_new='')) as triage, patch('newsroom.core.fetch_publisher_article', side_effect=TimeoutError), patch('newsroom.core._recover_primary', return_value=None):
+            self.assertEqual(self.process(), 'PRIMARY_RETRY')
+            triage.assert_not_called()
+        self.assertIsNone(self.db.execute('select story_id from items').fetchone()[0])

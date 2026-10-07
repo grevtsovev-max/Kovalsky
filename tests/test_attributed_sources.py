@@ -101,6 +101,8 @@ class AttributedSourceTests(integration.MemoryIntegrationTests):
         with patch('newsroom.core.fetch_publisher_article', side_effect=AssertionError('Already read')), \
              patch('newsroom.core.get_api_key', return_value='test'), \
              patch('newsroom.core.analyze_with_ai', return_value=result):
+            self.db.execute("UPDATE app_state SET value=json_set(value,'$.next_at','2000-01-01T00:00:00+00:00') WHERE key LIKE 'selection_retry:%'")
+            self.db.commit()
             outcome = _retry_ai_held_items(self.db, {self.source['source_id']: self.source}, self.config)
         self.assertEqual(outcome, {'NEW_STORY': 1})
         facts = json.loads(self.db.execute('SELECT fact_check_result FROM posts').fetchone()[0])

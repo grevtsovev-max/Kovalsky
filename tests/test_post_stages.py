@@ -16,7 +16,7 @@ class PostStagesTests(unittest.TestCase):
         self.assertIn('только анализ до написания поста', request.call_args.args[0]['instructions'])
 
     def test_drafting_cannot_replace_factual_decision(self):
-        draft = {'headline_ru': 'Заголовок', 'summary_ru': 'Текст', 'what_is_new': 'Изменение', 'editorial_check': {}}
+        draft = {'headline_ru': 'Заголовок', 'summary_ru': 'Текст', 'what_is_new': 'Изменение', 'editorial_check': {key: '' if key == 'history_note' else False for key in ai.SCHEMA['properties']['editorial_check']['required']}}
         decision = {'facts': [{'text': 'Подтверждённый факт', 'claim_type': 'REPORT'}], 'publication_recommendation': 'AUTO_PUBLISH'}
         with patch.object(ai, 'request_response', return_value=response(draft)) as request:
             self.assertEqual(ai.draft_post(decision, {'content': 'Прочитанный текст'}, {}), draft)
@@ -36,7 +36,7 @@ class PostStagesTests(unittest.TestCase):
         self.assertEqual(result['action'], 'NEW_STORY')
 
     def test_nullable_nonmessage_content_does_not_break_drafting(self):
-        draft = {'headline_ru': 'Заголовок', 'summary_ru': 'Текст', 'what_is_new': 'Изменение', 'editorial_check': {}}
+        draft = {'headline_ru': 'Заголовок', 'summary_ru': 'Текст', 'what_is_new': 'Изменение', 'editorial_check': {key: '' if key == 'history_note' else False for key in ai.SCHEMA['properties']['editorial_check']['required']}}
         r = response(draft)
         r['output'].insert(0, {'type': 'reasoning', 'content': None})
         with patch.object(ai, 'request_response', return_value=r):

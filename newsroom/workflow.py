@@ -68,7 +68,7 @@ class Work:
     def _execute(self, runtime, scope, measured):
         token = SCOPE.set({**SCOPE.get(), **(scope or {}), "role": self.role, "runtime": runtime})
         try:
-            stage_name = 'drafting' if getattr(self.function, '__name__', '') == 'draft_post' else 'screening' if self.role == 'filter' else 'analysis' if self.role == 'editor' else 'reading'
+            stage_name = 'drafting' if getattr(self.function, '__name__', '') in {'draft_post', 'validate_draft'} else 'screening' if self.role == 'filter' else 'analysis' if self.role == 'editor' else 'reading'
             if runtime and self.key:
                 cached = runtime.cached(self.key, self.role)
                 if cached is None and SCOPE.get().get('item_id') is not None:
@@ -86,6 +86,8 @@ class Work:
             structured = self.role != 'editor' or (isinstance(result, dict) and
                 result.get('action') in {'NEW_STORY', 'UPDATE', 'DUPLICATE', 'NOISE'}
                 and result.get('publication_recommendation') != 'WAIT_FOR_AUTOMATION')
+            if getattr(self.function, '__name__', '') == 'validate_draft':
+                structured = isinstance(result, dict) and isinstance(result.get('issues'), list)
             if self.role == 'filter':
                 structured = isinstance(result, dict) and result.get('decision') in {'KEEP','NOISE','DUPLICATE'}
             if getattr(self.function, '__name__', '') == 'draft_post':
@@ -185,7 +187,7 @@ class StageExecutor:
     def submit(self, function, *args):
         work = function.__self__
         name = getattr(work.function, '__name__', '')
-        stage = 'drafting' if name == 'draft_post' else 'screening' if work.role == 'filter' else 'analysis' if name in {'analyze', 'analyze_with_ai'} else 'reading'
+        stage = 'drafting' if name in {'draft_post', 'validate_draft'} else 'screening' if work.role == 'filter' else 'analysis' if name in {'analyze', 'analyze_with_ai'} else 'reading'
         def invoke():
             runtime, scope = args
             def record(status, reason='', **details):
@@ -236,7 +238,6 @@ class Coordinator:
     def _seed_pending(self):
         from .core import _saved_material
         rows = self.db.execute("SELECT i.* FROM items i JOIN sources s USING(source_id) WHERE i.disposition='PENDING' "
-                               "AND (s.active=1 OR s.type='manual') "
                                "AND NOT EXISTS(SELECT 1 FROM processing_jobs j WHERE j.item_id=i.item_id "
                                "AND j.revision=i.ingest_revision AND j.status<>'SUPERSEDED') LIMIT 1000").fetchall()
         for row in rows:
@@ -310,7 +311,9 @@ class Coordinator:
         # Aging is a separate FIFO lane, not an arbitrary relevance score.
         marks = ','.join('?' for _ in self.categories)
         preferred = ('WAITING_CONFIRMATION', '', 'PRIMARY_RETRY', '', 'AI_RETRY', '')[self.claimed % 6] if 'retry' in self.categories else ''
-        preferred_category = ('fresh', 'retry', 'fresh', 'watch')[self.claimed % 4] if self.continuous else ''
+        preferred_category = ('fresh', 'fresh', 'retry')[self.claimed % 3] if self.continuous else ''
+        if self.continuous and self.claimed % 12 == 10 and 'watch' in self.categories:
+            preferred_category = 'watch'
         # Hold a stage preference for a complete category rotation. Using
         # the same modulo for both permanently assigned drafting to fresh
         # slots, so drafting retries never received their intended priority.
@@ -318,26 +321,28 @@ class Coordinator:
         candidates = self.db.execute("SELECT j.*,i.story_id AS current_story_id FROM processing_jobs j JOIN items i ON i.item_id=j.item_id "
                               "JOIN sources s ON s.source_id=i.source_id "
                               "WHERE j.status IN ('PENDING','WAITING') AND j.next_at<=? AND i.disposition<>'TECHNICAL_ERROR' "
-                              "AND (s.active=1 OR s.type='manual' OR s.url LIKE 'story-watch://%') "
+                              # Monitoring controls new intake, not accepted work.
                               f"AND j.category IN ({marks}) "
                               "AND NOT EXISTS(SELECT 1 FROM processing_jobs busy WHERE busy.item_id=j.item_id AND busy.status='RUNNING') "
                               # Rotate reading, analysis and confirmation;
                               # every other slot remains oldest-due FIFO.
                               "ORDER BY CASE WHEN j.category=? THEN 0 ELSE 1 END,"
+                              "CASE WHEN ?='retry' AND j.category='retry' THEN j.next_at ELSE NULL END,"
+                              "CASE WHEN ?='retry' AND j.category='retry' THEN j.created_at ELSE NULL END,"
+                              "CASE WHEN ?='retry' AND j.category='retry' THEN j.job_id ELSE NULL END,"
                               "CASE WHEN (SELECT stage FROM material_stage_state st WHERE st.item_id=i.item_id AND st.revision=i.ingest_revision AND st.status IN ('READY','WAITING') ORDER BY updated_at DESC LIMIT 1)=? THEN 0 ELSE 1 END,"
                               "CASE WHEN i.disposition=? THEN 0 ELSE 1 END,"
                               "CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN 0 ELSE 1 END,"
                               "CASE WHEN julianday(j.created_at)<julianday('now','-10 minutes') THEN j.next_at ELSE NULL END,"
                               "j.priority DESC,j.next_at,j.created_at,j.job_id", (stamp(), *self.categories,
-                              preferred_category, preferred_stage, preferred))
+                              preferred_category, preferred_category, preferred_category, preferred_category,
+                              preferred_stage, preferred))
         busy = self.db.execute("SELECT j.payload_json,i.story_id FROM processing_jobs j JOIN items i USING(item_id) WHERE j.status='RUNNING'").fetchall()
         def related(candidate):
             from .core import canonicalize, similarity
             item = json.loads(candidate['payload_json'])['item']
             for active in busy:
                 other = json.loads(active['payload_json'])['item']
-                if candidate['current_story_id'] and candidate['current_story_id'] == active['story_id']:
-                    return True
                 own_url, other_url = item.get('primary_source_url'), other.get('primary_source_url')
                 if own_url and other_url and canonicalize(own_url) == canonicalize(other_url):
                     return True
@@ -413,8 +418,6 @@ class Coordinator:
                     next_at = stamp()
                 # Ordinary retries keep the established bounded retry lane.
                 # Jobs deferred only by capacity are resumed by this queue.
-                if outcome == 'WAITING_CONFIRMATION' and not capacity:
-                    next_at = max(next_at, (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
             self._finish_job(job, "WAITING" if held else "DONE",
                              job['category'] if capacity or not held else 'retry',
                              outcome, next_at, None if held else stamp())
@@ -430,34 +433,24 @@ class Coordinator:
                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             (json.dumps({'at': stamp(), 'code': type(exc).__name__,
                                          'location': error_location(exc)}),))
-            from .material_flow import technical_error, mark
-            if technical_error(exc):
-                self.counts['ERROR'] -= 1
-                if not self.counts['ERROR']:
-                    del self.counts['ERROR']
-                self.counts['TECHNICAL_ERROR'] = self.counts.get('TECHNICAL_ERROR', 0) + 1
-                self.db.execute("UPDATE items SET disposition='TECHNICAL_ERROR',processed_at=? WHERE item_id=?",
-                                (stamp(), job['item_id']))
-                mark(self.db, job['item_id'], job.get('_stage', 'screening'), 'ERROR',
-                     'Техническая ошибка обработчика: ' + type(exc).__name__, block_kind='technical')
-                self.db.execute("UPDATE processing_jobs SET status='DONE',outcome='TECHNICAL_ERROR',error_code=?,"
-                                "finished_at=?,owner=NULL,lease_until=NULL WHERE job_id=?",
-                                (type(exc).__name__, stamp(), job['job_id']))
-                self.db.commit()
-                return
-            from .triage import schedule_retry
-            attempts = schedule_retry(self.db, job["item_id"], "ERROR")
-            status = "DONE" if attempts >= 3 else "WAITING"
-            if attempts >= 3:
-                self.db.execute("UPDATE items SET disposition='REJECTED',processed_at=? WHERE item_id=?", (stamp(), job["item_id"]))
-            retry = self.db.execute("SELECT value FROM app_state WHERE key=?", (f"selection_retry:{job['item_id']}",)).fetchone()
-            due = json.loads(retry[0])["next_at"]
-            self._finish_job(job, status, 'retry', 'ERROR', due,
-                             stamp() if status == "DONE" else None, type(exc).__name__)
+            # An unclassified exception is a processor failure, not evidence
+            # that the story deserves an editorial rejection.
+            from .material_flow import mark
+            self.counts['ERROR'] -= 1
+            if not self.counts['ERROR']:
+                del self.counts['ERROR']
+            self.counts['TECHNICAL_ERROR'] = self.counts.get('TECHNICAL_ERROR', 0) + 1
+            self.db.execute("UPDATE items SET disposition='TECHNICAL_ERROR',processed_at=? WHERE item_id=?",
+                            (stamp(), job['item_id']))
+            mark(self.db, job['item_id'], job.get('_stage', 'screening'), 'ERROR',
+                 'Техническая ошибка обработчика: ' + type(exc).__name__, block_kind='technical')
+            self.db.execute("UPDATE processing_jobs SET status='DONE',outcome='TECHNICAL_ERROR',error_code=?,"
+                            "finished_at=?,owner=NULL,lease_until=NULL WHERE job_id=?",
+                            (type(exc).__name__, stamp(), job['job_id']))
             self.db.commit()
             return
         from .material_flow import mark
-        stage = 'drafting' if getattr(work.function, '__name__', '') == 'draft_post' else 'screening' if work.role == 'filter' else 'analysis' if getattr(work.function, '__name__', '') in {'analyze', 'analyze_with_ai'} else 'reading'
+        stage = 'gate' if getattr(work.function, '__name__', '') == 'validate_draft' else 'drafting' if getattr(work.function, '__name__', '') == 'draft_post' else 'screening' if work.role == 'filter' else 'analysis' if getattr(work.function, '__name__', '') in {'analyze', 'analyze_with_ai'} else 'reading'
         mark(self.db, job['item_id'], stage, 'READY' if self.continuous else 'RUNNING')
         job['_stage'] = stage
         self.db.execute("UPDATE processing_jobs SET role=?,lease_until=? WHERE job_id=?", (work.role, self._lease(), job["job_id"]))

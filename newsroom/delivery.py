@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS publication_attempts (
@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS digest_batches (
  batch_key TEXT PRIMARY KEY, messages_json TEXT NOT NULL, news_count INTEGER NOT NULL,
  period_end TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS news_series (
+ post_id INTEGER PRIMARY KEY REFERENCES posts(post_id), channel_id TEXT NOT NULL,
+ original_text TEXT NOT NULL, parts_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS news_series_no_update BEFORE UPDATE ON news_series
+BEGIN SELECT RAISE(ABORT, 'news series is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS news_series_no_delete BEFORE DELETE ON news_series
+BEGIN SELECT RAISE(ABORT, 'news series is immutable'); END;
 CREATE TABLE IF NOT EXISTS digest_batch_revisions (
  revision_id INTEGER PRIMARY KEY, batch_key TEXT NOT NULL,
  previous_messages_json TEXT NOT NULL, previous_news_count INTEGER NOT NULL,
@@ -110,7 +118,7 @@ def replace_unsent_digest_batch(db, batch_key, messages, news_count, period_end)
             part = int(row['delivery_key'].rsplit(':', 1)[1])
             if part < len(messages):
                 message = messages[part]
-                db.execute('UPDATE publication_attempts SET text=?,content_hash=?,updated_at=? WHERE attempt_id=?',
+                db.execute("UPDATE publication_attempts SET text=?,content_hash=?,updated_at=CASE WHEN status='FAILED' THEN updated_at ELSE ? END WHERE attempt_id=?",
                            (message, hashlib.sha256(message.encode()).hexdigest(), now(), row['attempt_id']))
                 event(db, row['attempt_id'], row['status'], {'digest_batch_revision_id': revision})
         db.commit()
@@ -124,7 +132,7 @@ def event(db, attempt_id, status, detail=None):
                (attempt_id, status, json.dumps(detail or {}, ensure_ascii=False), now()))
 
 
-def deliver(db, config, operation, text, send, post_id=None):
+def deliver(db, config, operation, text, send, post_id=None, verified_text=None):
     """Called only AFTER the editorial gate. Commits intent before invoking send."""
     from .agent_control import require_enabled
     require_enabled(config)
@@ -132,6 +140,21 @@ def deliver(db, config, operation, text, send, post_id=None):
     key = target + ':' + operation
     db.commit()
     db.execute('BEGIN IMMEDIATE')
+    if post_id is not None:
+        destination = db.execute('SELECT channel_id FROM publication_attempts WHERE post_id=? AND channel_id<>? LIMIT 1', (post_id, target)).fetchone()
+        if destination:
+            db.commit()
+            raise DeliveryRejected('Delivery destination changed; explicit reassignment required')
+    if verified_text is not None:
+        series = db.execute('SELECT * FROM news_series WHERE post_id=?', (post_id,)).fetchone()
+        prefix = f'post:{post_id}:part:'
+        part_index = operation[len(prefix):] if operation.startswith(prefix) else ''
+        parts = json.loads(series['parts_json']) if series else []
+        if (not series or series['channel_id'] != target or series['original_text'] != verified_text
+                or not part_index.isdigit() or int(part_index) >= len(parts)
+                or parts[int(part_index)] != text):
+            db.commit()
+            raise DeliveryRejected('NEWS_SERIES_PROOF_MISMATCH')
     row = db.execute('SELECT * FROM publication_attempts WHERE delivery_key=?', (key,)).fetchone()
     if row and row['status'] in {'SENT', 'CONFIRMED'}:
         db.commit()
@@ -139,17 +162,46 @@ def deliver(db, config, operation, text, send, post_id=None):
     if row and row['status'] in {'SENDING', 'UNKNOWN'}:
         db.commit()
         raise DeliveryUncertain('Delivery outcome requires reconciliation; resend blocked')
-    if row and row['attempt_count'] >= 3:
+    if row and row['attempt_count'] >= 4:
         db.commit()
         raise DeliveryRejected('Delivery retry limit reached')
+    if row and row['status'] == 'FAILED' and row['attempt_count']:
+        from .runtime import BudgetDeferred
+        delay = (30, 120, 300)[min(row['attempt_count'] - 1, 2)]
+        due = datetime.fromisoformat(row['updated_at']) + timedelta(seconds=delay)
+        remaining = (due - datetime.fromisoformat(now())).total_seconds()
+        if remaining > 0:
+            db.commit()
+            raise BudgetDeferred('delivery', max(1, int(remaining + .999)))
     if row and row['text'] != text:
         db.commit()
         raise DeliveryRejected('Prepared publication changed; original intent retained')
+    if post_id is not None:
+        current_post = db.execute('SELECT text,fact_check_result,origin_item_id FROM posts WHERE post_id=?', (post_id,)).fetchone()
+        checked_text = verified_text if verified_text is not None else text
+        if not current_post or current_post['text'] != checked_text:
+            db.commit()
+            raise DeliveryRejected('Final publication changed before reservation')
+        facts = json.loads(current_post['fact_check_result'] or '{}')
+        if facts.get('material_revision') and current_post['origin_item_id']:
+            material = db.execute('SELECT ingest_revision FROM items WHERE item_id=?', (current_post['origin_item_id'],)).fetchone()
+            if not material or material[0] != facts['material_revision']:
+                db.commit()
+                raise DeliveryRejected('Source version changed before reservation')
+        if facts.get('policy') or db.execute("SELECT 1 FROM app_state WHERE key='policy_v1_cutover'").fetchone():
+            from .policy import publication_issues as policy_issues, attach
+            from .editorial_registry import attach_cached
+            policy_config = {**config, 'ai': dict(config.get('ai', {}))}
+            attach_cached(policy_config)
+            attach(policy_config)
+            if policy_issues(checked_text, facts, policy_config.get('ai', {})):
+                db.commit()
+                raise DeliveryRejected('Final policy or text proof changed before reservation')
     if post_id is not None and db.execute('SELECT 1 FROM post_memory WHERE post_id=?', (post_id,)).fetchone():
         # Recheck under the same write lock that reserves the send: two different
         # drafts with the same fact cannot both pass an earlier unlocked check.
         from .knowledge import publication_issues
-        issues = publication_issues(db, post_id, text)
+        issues = publication_issues(db, post_id, verified_text if verified_text is not None else text)
         if issues:
             db.commit()
             raise DeliveryRejected('Publication memory gate: ' + ', '.join(issues))
@@ -215,17 +267,39 @@ def confirm(db, config, operation):
 
 
 def reconcile_posts(db, config):
-    """Replay durable successful receipts, atomically, without sending anything."""
+    """Replay durable receipts; a series is published only when every part arrived."""
     db.commit()
     db.execute('BEGIN IMMEDIATE')
-    rows = db.execute("SELECT a.*,p.status AS post_status,p.story_id,p.post_hash FROM publication_attempts a JOIN posts p USING(post_id) WHERE a.channel_id=? AND a.status='SENT'", (channel(config),)).fetchall()
+    target = channel(config)
+    rows = db.execute("SELECT a.*,p.status AS post_status,p.story_id,p.post_hash FROM publication_attempts a JOIN posts p USING(post_id) WHERE a.channel_id=? AND a.status='SENT'", (target,)).fetchall()
+    handled = set()
+    completed = 0
     for row in rows:
+        if row['post_id'] in handled:
+            continue
+        handled.add(row['post_id'])
+        series = db.execute('SELECT * FROM news_series WHERE post_id=?', (row['post_id'],)).fetchone()
+        operations = ['post:' + str(row['post_id'])]
+        first_receipt = row['telegram_message_id']
+        completed_at = row['updated_at']
+        if series:
+            if series['channel_id'] != target:
+                continue
+            operations = [f"post:{row['post_id']}:part:{i}" for i in range(len(json.loads(series['parts_json'])))]
+            receipts = [db.execute('SELECT * FROM publication_attempts WHERE delivery_key=?',
+                                   (target + ':' + operation,)).fetchone() for operation in operations]
+            if any(not receipt or receipt['status'] not in {'SENT', 'CONFIRMED'} for receipt in receipts):
+                continue
+            first_receipt = receipts[0]['telegram_message_id']
+            completed_at = max(receipt['updated_at'] for receipt in receipts)
         if row['post_status'] != 'PUBLISHED':
-            db.execute("UPDATE posts SET status='PUBLISHED',published_at=?,external_id=?,editor_decision='APPROVED' WHERE post_id=?", (row['updated_at'], row['telegram_message_id'], row['post_id']))
-            db.execute('UPDATE stories SET last_published_at=?,version=version+1,publication_count=publication_count+1,last_content_hash=? WHERE story_id=?', (row['updated_at'], row['post_hash'], row['story_id']))
-        confirm(db, config, 'post:' + str(row['post_id']))
+            db.execute("UPDATE posts SET status='PUBLISHED',published_at=?,external_id=?,editor_decision='APPROVED' WHERE post_id=?", (completed_at, first_receipt, row['post_id']))
+            db.execute('UPDATE stories SET last_published_at=?,version=version+1,publication_count=publication_count+1,last_content_hash=? WHERE story_id=?', (completed_at, row['post_hash'], row['story_id']))
+        for operation in operations:
+            confirm(db, config, operation)
+        completed += 1
     db.commit()
-    return len(rows)
+    return completed
 
 
 def observe_channel_post(db, message, comparable_text):

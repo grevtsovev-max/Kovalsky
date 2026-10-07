@@ -64,7 +64,7 @@ def stamp():
 
 
 def account_unavailable(code):
-    return code in {'HTTP_429:credit_balance_exhausted', 'HTTP_429:insufficient_quota',
+    return code in {'CREDENTIALS_MISSING', 'HTTP_429:credit_balance_exhausted', 'HTTP_429:insufficient_quota',
                     'HTTP_429:billing_hard_limit_reached', 'HTTP_401:invalid_api_key'}
 
 

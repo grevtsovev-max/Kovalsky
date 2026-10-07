@@ -190,8 +190,8 @@ def flush_edit_acknowledgements(config, db, update_id=None):
     for ack in rows:
         owner_id = ack['telegram_user_id']
         title = ack['edited_text'].splitlines()[0][:140]
-        notice = (f"Пост «{title}» скорректирован в канале — учёл эту правку для будущих публикаций:\n"
-                  f"{ack['learning_summary']}\n\nЕсли вывод верный, ответьте «Верно». Если я понял правку неточно, ответьте на это сообщение и напишите, что именно нужно изменить.")[:3900]
+        notice = (f"Пост «{title}» скорректирован в канале. Сохранил пример; предлагаю общее уточнение:\n"
+                  f"{ack['learning_summary']}\n\nДо подтверждения общее правило не меняется. Если вывод верный, ответьте «Верно». Если я понял правку неточно, ответьте на это сообщение и напишите, что именно нужно изменить.")[:3900]
         delivery_config = {**config, 'telegram': {**config.get('telegram',{}),
                            'chat_id': owner_id, 'chat_id_env': '_KOVALSKY_EDIT_ACK_TARGET'}}
         def send_notice(send_config, text):
@@ -243,7 +243,7 @@ def _handle_edit_ack_reply(config: dict, db, update: dict, message: dict, user_i
     if is_confirmation:
         feedback_type = "TELEGRAM_EDIT_CONFIRMATION"
         reason = "Владелец подтвердил вывод бота о редакторской правке:\n" + ack["learning_summary"]
-        response = "Спасибо, отметил, что понял правку верно. Буду использовать это правило в следующих подходящих разборах."
+        response = "Подтверждение сохранено. Правило будет зарегистрировано; результат записи и действующая версия появятся в кабинете."
     else:
         feedback_type = "TELEGRAM_EDIT_REFINEMENT"
         reason = ("Владелец уточнил вывод бота о редакторской правке. Вывод бота:\n" + ack["learning_summary"] +
@@ -1242,8 +1242,20 @@ def run_review_bot(config: dict) -> None:
         print(f"Не удалось дополнить старые примеры ({type(exc).__name__}).", file=sys.stderr, flush=True)
     print("Бот сбора редакционных примеров и интересов запущен.", flush=True)
     from .edit_sync import handle_persisted_update, sync_recent_channel_edits
+    policy_checked = 0.0
     while True:
         require_enabled(config)
+        if time.monotonic() - policy_checked >= 180:
+            try:
+                from .editorial_registry import sync as sync_rules, learn_cycle as learn_rules
+                sync_rules(db, config)
+                from .policy import attach as attach_policy
+                attach_policy(config)
+                learn_rules(db, config)
+            except Exception as exc:
+                db.rollback()
+                print(f'Обновление правил отложено ({type(exc).__name__}).', file=sys.stderr, flush=True)
+            policy_checked = time.monotonic()
         payload = {"timeout": 30, "allowed_updates": REVIEW_ALLOWED_UPDATES}
         if offset is not None:
             payload["offset"] = offset

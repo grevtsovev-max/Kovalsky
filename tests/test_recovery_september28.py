@@ -8,6 +8,12 @@ from newsroom.core import TelegramPreviewParser, _read_telegram_primary, is_rele
 from newsroom.db import connect
 
 class RecoverySeptember28Tests(unittest.TestCase):
+    def setUp(self):
+        from policy_fixtures import final_check
+        checker = patch('newsroom.ai.validate_draft', side_effect=final_check)
+        checker.start()
+        self.addCleanup(checker.stop)
+
     def test_tass_digital_currency_declensions(self):
         terms = ['цифровая валюта', 'цифровые активы', 'цифровой рубль']
         for text in ['В СФ предложили использовать цифровую валюту в качестве предмета залога',
@@ -68,6 +74,8 @@ class RecoverySeptember28Tests(unittest.TestCase):
             result={'action':'NEW_STORY','is_relevant':True,'geographic_scope':'RUSSIA','confidence':0.9,'russia_cis_impact':'DIRECT','impact_evidence':evidence,'publication_recommendation':'AUTO_PUBLISH','editorial_check':{"source_matches_event": True, "attribution_preserved": True, "stage_preserved": True, "history_required": False, "history_explained": False, "history_note": "", "headline_main_event": True, "lead_event_first": True, "paragraphs_concise_distinct": True, "no_editorial_process_notes": True},'headline_ru':'🇷🇺 Банк России установил новые правила','summary_ru':evidence}
             result.update(development_date=now[:10], development_date_evidence=evidence)
             with patch('newsroom.core.fetch_publisher_article',return_value=article) as fetch, patch('newsroom.core.get_api_key',return_value='test'), patch('newsroom.core.analyze_with_ai',return_value=result):
+                db.execute("UPDATE app_state SET value=json_set(value,'$.next_at','2000-01-01T00:00:00+00:00') WHERE key LIKE 'selection_retry:%'")
+                db.commit()
                 outcomes=_retry_ai_held_items(db,{source['source_id']:source},{'newsroom':{},'ai':{}})
             self.assertEqual(outcomes,{'NEW_STORY':1});fetch.assert_called_once()
             self.assertEqual(db.execute('select count(*) from items').fetchone()[0],1)
@@ -89,6 +97,10 @@ class AITransportRecoveryTests(unittest.TestCase):
         from test_ai_credentials_and_responses import FakeResponse
         body=json.dumps({'output':[{'content':[{'type':'output_text','text':'{"action":"NOISE"}'}]}]}).encode()
         with patch('newsroom.ai.get_api_key',return_value='test'), patch('newsroom.ai.time.sleep'), patch('newsroom.ai.urllib.request.urlopen',side_effect=[http.client.RemoteDisconnected(),FakeResponse(body)]) as opener:
+            from newsroom.ai import AIResponseError
+            with self.assertRaises(AIResponseError):
+                self.analyze()
+            self.assertEqual(opener.call_count, 1)
             self.assertEqual(self.analyze()['action'],'NOISE')
             self.assertEqual(opener.call_count,2)
 
@@ -96,7 +108,7 @@ class AITransportRecoveryTests(unittest.TestCase):
         from newsroom.ai import AIResponseError
         with patch('newsroom.ai.get_api_key',return_value='test'), patch('newsroom.ai.time.sleep'), patch('newsroom.ai.urllib.request.urlopen',side_effect=TimeoutError('secret payload')) as opener:
             with self.assertRaises(AIResponseError) as raised: self.analyze()
-        self.assertEqual(opener.call_count,2)
+        self.assertEqual(opener.call_count,1)
         self.assertEqual(str(raised.exception),'NETWORK_TIMEOUT')
 
     def test_auth_error_does_not_retry(self):

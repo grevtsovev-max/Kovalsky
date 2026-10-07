@@ -108,8 +108,12 @@ class ResourceTests(unittest.TestCase):
         with patch('newsroom.ai.get_api_key', return_value='private-key'), \
              patch('newsroom.ai.urllib.request.urlopen', side_effect=[error, Response(json.dumps(self.receipt).encode())]), \
              patch('newsroom.ai.time.sleep'):
+            from newsroom.ai import AIResponseError
+            with self.assertRaises(AIResponseError):
+                request_response({'model': 'gpt-6-luna', 'input': 'private-text'},
+                                 {'_runtime': self.runtime, '_work_stage': 'triage'})
             request_response({'model': 'gpt-6-luna', 'input': 'private-text'},
-                             {'_runtime': self.runtime, '_work_stage': 'triage'})
+                             {'_runtime': self.runtime, '_work_stage': 'triage', '_transport_attempt': 1})
         report = snapshot(self.db, self.config)
         self.assertEqual(report['total']['calls'], 2)
         self.assertEqual(report['total']['retries'], 1)
@@ -252,6 +256,27 @@ class ResourceTests(unittest.TestCase):
                     page = response.read().decode()
                 self.assertIn('id="view-resources" class="view active"', page)
                 self.assertIn('<h1 id="heading">Расход ресурсов</h1>', page)
+                with urllib.request.urlopen(base+'/?view=policy', timeout=3) as response:
+                    policy_page = response.read().decode()
+                self.assertIn('id="view-policy" class="view active"', policy_page)
+                with urllib.request.urlopen(base+'/api/policy', timeout=3) as response:
+                    policy_report = json.load(response)
+                self.assertEqual(policy_report['version'], '1.0')
+                self.assertIn('## 12 Исправления и замечания владельца', policy_report['document'])
+                self.assertEqual(len(policy_report['sha256']), 64)
+                from newsroom.source_registry import save
+                save(self.db, 'editorial_learning:999', {'status': 'NEEDS_CLARIFICATION',
+                     'question': 'Только этот пост?', 'signal': {'reason': 'Здесь сократи'}})
+                self.db.commit()
+                import re
+                dashboard_token = re.search(r"const TOKEN='([^']+)'", policy_page)[1]
+                request = urllib.request.Request(base+'/api/policy/clarify', method='POST',
+                    headers={'Content-Type': 'application/json', 'X-Dashboard-Token': dashboard_token},
+                    data=json.dumps({'key': 'editorial_learning:999', 'answer': 'Для следующих тоже'}).encode())
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    self.assertGreater(json.load(response)['feedback_id'], 0)
+                with urllib.request.urlopen(base+'/api/policy', timeout=3) as response:
+                    self.assertEqual(json.load(response)['questions'], [])
                 version = self.db.execute('PRAGMA schema_version').fetchone()[0]
                 with urllib.request.urlopen(base+'/api/resources?hours=1', timeout=3) as response:
                     report = json.load(response)

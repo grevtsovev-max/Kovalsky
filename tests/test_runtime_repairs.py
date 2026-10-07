@@ -16,6 +16,12 @@ from newsroom.ai import request_response, AIResponseError
 
 
 class RuntimeRepairTests(unittest.TestCase):
+    def setUp(self):
+        from policy_fixtures import final_check
+        checker = patch('newsroom.ai.validate_draft', side_effect=final_check)
+        checker.start()
+        self.addCleanup(checker.stop)
+
     setUp = workflow_tests.WorkflowTests.setUp
     item = workflow_tests.WorkflowTests.item
     noise = workflow_tests.WorkflowTests.noise
@@ -62,8 +68,8 @@ class RuntimeRepairTests(unittest.TestCase):
                                   ai_settings=self.config['ai'])
         self.assertEqual(result, 'NOISE')
         examples = editor.call_args.args[0]['editorial_examples']
-        self.assertEqual([entry['feedback_type'] for entry in examples],
-                         ['TELEGRAM_EDIT_REFINEMENT', 'TELEGRAM_LINK_FEEDBACK', 'OTHER'])
+        self.assertEqual(examples, [])
+        self.assertEqual(self.db.execute('SELECT count(*) FROM editorial_feedback').fetchone()[0], 3)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM errors').fetchone()[0], 0)
 
     def test_diagnostics_read_existing_schema_and_hide_private_settings(self):

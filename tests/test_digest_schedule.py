@@ -62,6 +62,8 @@ class DigestScheduleTests(unittest.TestCase):
     def test_failed_send_does_not_mark_day_complete(self):
         self.post(1);self.run_at(18,fail=True)
         self.assertIsNone(self.db.execute("SELECT value FROM app_state WHERE key='digest_last_local_date'").fetchone())
+        self.db.execute("UPDATE publication_attempts SET updated_at='2020-01-01T00:00:00+00:00' WHERE status='FAILED'")
+        self.db.commit()
         result,send=self.run_at(18);self.assertEqual(result,(True,1));send.assert_called_once()
 
     def test_unknown_delivery_blocks_next_cycle_and_freezes_digest(self):

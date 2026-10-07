@@ -6,6 +6,12 @@ from newsroom.core import process_item
 from newsroom.cli import publish
 
 class StoryFollowupTests(unittest.TestCase):
+    def setUp(self):
+        from policy_fixtures import final_check
+        checker = patch('newsroom.ai.validate_draft', side_effect=final_check)
+        checker.start()
+        self.addCleanup(checker.stop)
+
     setUp = recovery.RecoveryIntegrationTests.setUp
     process = recovery.RecoveryIntegrationTests.process
 
@@ -34,9 +40,9 @@ class StoryFollowupTests(unittest.TestCase):
                 publish(self.db,self.config,number,automatic=True)
                 text=send.call_args.args[1]
                 self.assertIn(f'Дополнение номер {number}',text)
-                self.assertIn(f'https://t.me/test_channel/{99+number}',text)
+                self.assertNotIn('Ранее:', text)
                 self.assertNotIn(f'https://t.me/test_channel/{100+number}',text)
-                self.assertEqual(text.count('Ранее:'),1)
+                self.assertEqual(text.count('Ранее:'),0)
                 self.assertIn('https://www.cbr.ru/crypto',text)
         self.assertEqual(self.next_item('DUPLICATE',story,4),'DUPLICATE')
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0],3)

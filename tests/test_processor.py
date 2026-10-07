@@ -57,11 +57,10 @@ class ProcessorTests(unittest.TestCase):
         with patch('newsroom.core.get_api_key', return_value='test'), \
              patch('newsroom.core.analyze_with_ai', return_value=result):
             outcome = process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=self.config['ai'])
-        self.assertEqual(outcome, 'WAITING_CONFIRMATION')
-        analysis = json.loads(self.db.execute('SELECT result_json FROM item_analysis ORDER BY item_id DESC LIMIT 1').fetchone()[0])
-        self.assertIn('REDUNDANT_SOURCE_ATTRIBUTION', analysis['editorial_issues'])
-        self.assertTrue(analysis['_needs_post_draft'])
-        self.assertEqual(self.db.execute('SELECT count(*) FROM posts').fetchone()[0], 0)
+        self.assertEqual(outcome, 'NEW_STORY')
+        post = self.db.execute('SELECT text FROM posts').fetchone()[0]
+        self.assertIn('DeCenter сообщает:', post)
+        self.assertIn('https://t.me/DeCenter/903', post)
 
     def test_collection_does_not_wait_for_editor(self):
         from newsroom.core import run_cycle
@@ -233,7 +232,9 @@ class ProcessorTests(unittest.TestCase):
             self.assertNotIn('HEADLINE_NOT_EVENT_LED', editorial_issues(headline, facts['summary_ru'], facts))
         for headline in ('🇷🇺 Новые счета цифрового рубля', '🇷🇺 Новые правила цифровых активов',
                          '🇷🇺 Открыть счёт цифрового рубля', '🇷🇺 Откройте счёт цифрового рубля'):
-            self.assertIn('HEADLINE_NOT_EVENT_LED', editorial_issues(headline, facts['summary_ru'], facts))
+            invalid = copy.deepcopy(facts)
+            invalid['editorial_check']['headline_main_event'] = False
+            self.assertIn('HEADLINE_MAIN_EVENT', editorial_issues(headline, facts['summary_ru'], invalid))
 
     def test_legacy_migration_preserves_attempts_and_read_source(self):
         from newsroom.material_flow import migrate, snapshot
@@ -322,7 +323,7 @@ class ProcessorTests(unittest.TestCase):
         from newsroom.core import process_item
         source = dict(self.source, type='web_search')
         old = (datetime.now(timezone.utc)-timedelta(hours=48)).isoformat()
-        for number, date, expected in ((100, self.fixture.now, 'NOISE'), (101, old, 'STALE'), (102, None, 'UNDATED')):
+        for number, date, expected in ((100, self.fixture.now, 'NOISE'), (101, old, 'STORE_ONLY'), (102, None, 'STORE_ONLY')):
             with self.subTest(date=date):
                 article = dict(self.fixture.item(number), published_at=date)
                 item = {key: article[key] for key in ('url', 'title')}

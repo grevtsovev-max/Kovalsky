@@ -115,6 +115,8 @@ class IndependentDigestTests(unittest.TestCase):
     def test_rebuild_known_unsent_batch_keeps_old_text_and_attempt_count(self):
         original = self.unsent_batch()
         self.post(1, '2026-10-05T15:00:00+00:00')
+        self.db.execute("UPDATE publication_attempts SET updated_at='2020-01-01T00:00:00+00:00' WHERE status='FAILED'")
+        self.db.commit()
         result, send = self.publish(rebuild_unsent=True)
         self.assertEqual(result, (True, 1))
         self.assertIn('/1)', send.call_args.args[1])

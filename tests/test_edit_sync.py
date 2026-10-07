@@ -38,6 +38,8 @@ class EditRecoveryTests(unittest.TestCase):
             self.capture()
         self.assertEqual(self.db.execute('SELECT count(*) FROM editorial_feedback').fetchone()[0],1)
         self.assertEqual(self.db.execute('SELECT status FROM telegram_edit_acknowledgements').fetchone()[0],'SEND_FAILED')
+        self.db.execute("UPDATE publication_attempts SET updated_at='2020-01-01T00:00:00+00:00' WHERE status='FAILED'")
+        self.db.commit()
         with patch('newsroom.review.telegram_api',return_value={'message_id':901}) as api:
             flush_edit_acknowledgements(self.config,self.db)
             flush_edit_acknowledgements(self.config,self.db)
