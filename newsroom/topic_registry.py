@@ -28,6 +28,9 @@ ATTEMPT = 'topic_registry_attempt'
 ERROR = 'topic_registry_error'
 LEARNING = 'topic_registry_learning'
 PUBLIC_ACTIVITY = 'Публичные активности брендов и лиц'
+FILTER_RULES = 'Правила первого фильтра'
+FILTER_HEADERS = ['Правило', 'Обязательные условия', 'Необязательные условия', 'Мониторинг', 'Объяснение']
+KEYWORD_ROLES = {'Профильный', 'Требует уточнения', 'Контекстный'}
 HEADERS = {
     'Темы': ['Тема', 'Что отслеживать', 'Мониторинг'],
     'Ключевые слова': ['Тема', 'Слово или фраза', 'Мониторинг'],
@@ -94,6 +97,7 @@ def parse_tab(body, name):
         raise ValueError('TOPIC_REGISTRY_HEADER_OR_SIZE')
     result = []
     for number, row in enumerate(rows[1:], 2):
+        extra = (row + [''] * 5)[3:5]
         row = (row + ['', '', ''])[:3]
         if row == HEADERS[name]:
             continue  # Pasted table headers are metadata, not keyword entries.
@@ -105,12 +109,46 @@ def parse_tab(body, name):
         enabled = normalize(flag)
         if enabled not in {'true', 'false', 'истина', 'ложь', 'да', 'нет', '1', '0', ''}:
             raise ValueError('TOPIC_REGISTRY_FLAG')
-        result.append({'title': title, 'description': description, 'enabled': enabled in {'true','истина','да','1'}, 'row': number})
+        entry = {'title': title, 'description': description, 'enabled': enabled in {'true','истина','да','1'}, 'row': number}
+        if name == 'Ключевые слова' and len(rows[0]) > 3:
+            if rows[0][3:5] != ['Роль', 'Уточнение']:
+                raise ValueError('KEYWORD_ROLE_HEADERS')
+            role, refinement = [v.strip() for v in extra]
+            role = role or 'Контекстный'
+            if role not in KEYWORD_ROLES or len(refinement) > 2000 or (entry['enabled'] and role == 'Требует уточнения' and not refinement):
+                raise ValueError('KEYWORD_ROLE_OR_REFINEMENT')
+            entry.update(role=role, refinement=refinement)
+        result.append(entry)
     if len({normalize(r['title'] if name != 'Ключевые слова' else r['title']+'\0'+r['description']) for r in result}) != len(result):
         # e/ё keyword variants are intentionally allowed in the owner's sheet.
         if name != 'Ключевые слова':
             raise ValueError('TOPIC_REGISTRY_DUPLICATE')
     return result
+
+
+def parse_filter_rules(body):
+    rows = list(csv.reader(io.StringIO(body.decode('utf-8-sig'))))
+    if not rows or rows[0] != FILTER_HEADERS or len(rows) > 101:
+        raise ValueError('INTAKE_RULE_HEADERS_OR_SIZE')
+    rules = []
+    allowed = {'Бренд', 'Профильный', 'Требует уточнения', 'Уточнение', 'Лицо в заголовке', 'Контекстный'}
+    for row in rows[1:]:
+        name, required, optional, enabled, note = (row + [''] * 5)[:5]
+        if not name and not required:
+            continue
+        parts = [v.strip() for v in required.split('+')]
+        extras = [v.strip() for v in optional.split('+') if v.strip()]
+        flag = normalize(enabled)
+        if (not name.strip() or not set(parts) <= allowed or not set(extras) <= allowed
+                or flag not in {'true','false','истина','ложь','да','нет','1','0',''}
+                or not ('Профильный' in parts or 'Лицо в заголовке' in parts
+                        or {'Бренд','Требует уточнения','Уточнение'} <= set(parts))):
+            raise ValueError('INTAKE_RULE_INVALID')
+        rules.append({'name':name.strip(), 'required':parts, 'optional':extras,
+                      'enabled':flag in {'true','истина','да','1'}, 'note':note})
+    if len({r['name'] for r in rules}) != len(rules):
+        raise ValueError('INTAKE_RULE_DUPLICATE')
+    return rules
 
 
 def read_registry(settings):
@@ -121,6 +159,14 @@ def read_registry(settings):
         return tab['name'], parse_tab(body, tab['name'])
     with ThreadPoolExecutor(max_workers=4) as pool:
         sections = dict(pool.map(read, settings['tabs']))
+    if settings.get('filter_rules_gid'):
+        if not re.fullmatch(r'\d{1,12}', str(settings['filter_rules_gid'])):
+            raise ValueError('INTAKE_RULE_GID')
+        url = f"https://docs.google.com/spreadsheets/d/{settings['spreadsheet_id']}/export?format=csv&gid={settings['filter_rules_gid']}"
+        body, _, _ = _request_with_url(url, timeout=8, public_only=True)
+        sections[FILTER_RULES] = parse_filter_rules(body)
+        if any('role' not in r for r in sections['Ключевые слова']):
+            raise ValueError('INTAKE_KEYWORD_ROLES_MISSING')
     titles = {r['title'] for r in sections['Темы']}
     if any(r['title'] not in titles for r in sections['Ключевые слова']):
         raise ValueError('TOPIC_REGISTRY_UNKNOWN_TOPIC')
@@ -143,7 +189,7 @@ def policy(snapshot, entities=()):
     activity_keywords = list(dict.fromkeys(r['description'] for r in sections.get('Ключевые слова', [])
         if r['enabled'] and r['title'] in names and r['title'] != PUBLIC_ACTIVITY
         and normalize(r['description']) not in entity_names))
-    return {'version': snapshot.get('version'),
+    result = {'version': snapshot.get('version'),
             'people': list(dict.fromkeys(people)), 'organizations': list(dict.fromkeys(organizations)),
             'activity_keywords': activity_keywords,
             'topics': [{'name': r['title'], 'scope': r['description']} for r in topics],
@@ -151,6 +197,9 @@ def policy(snapshot, entities=()):
             'exclusions': [{'name': r['title'], 'scope': r['description']} for r in sections.get('Исключения', []) if r['enabled']],
             'geography': [{'name': r['title'], 'scope': r['description']} for r in sections.get('География', []) if r['enabled']],
             'entities': list(dict.fromkeys(r['name'] for r in entities if r.get('enabled', True)))}
+    if FILTER_RULES in sections:
+        result.update(selection_mode='intake_rules', intake_rules=[r for r in sections[FILTER_RULES] if r['enabled']])
+    return result
 
 
 def apply_snapshot(config, snapshot, entities=()):
@@ -168,6 +217,14 @@ def apply_snapshot(config, snapshot, entities=()):
         config['ai']['_keyword_prefilter'].update(
             brands=thematic['organizations'], people=thematic['people'],
             topic_keywords=thematic['activity_keywords'])
+    if thematic.get('selection_mode') == 'intake_rules':
+        names = {t['name'] for t in thematic['topics']}
+        entries = [r for r in snapshot['sections']['Ключевые слова'] if r['enabled'] and r['title'] in names]
+        config['ai']['_keyword_prefilter'] = {
+            'mode':'intake_rules', 'version':snapshot.get('version'), 'entries':entries,
+            'brands':thematic['organizations'], 'people':thematic['people'],
+            'rules':thematic['intake_rules'],
+        }
     config.setdefault('newsroom', {})['relevance_terms'] = []
     for source in config.get('sources', []):
         source.pop('interest_exclusions', None)
@@ -223,11 +280,13 @@ def configure(db, payload):
     settings = validate_settings(payload)
     if {t['name'] for t in settings['tabs']} != set(HEADERS) or len(settings['tabs']) != 4:
         raise ValueError('Нужны вкладки Темы, Ключевые слова, Исключения и География')
-    snapshot = read_registry(settings)
     previous = state(db, SETTINGS, {})
     if previous.get('spreadsheet_id') == settings['spreadsheet_id']:
-        for key in ('credentials_file', 'service_account_email', 'write_verified_at', 'apps_script_file'):
+        for key in ('credentials_file', 'service_account_email', 'write_verified_at', 'apps_script_file', 'filter_rules_gid'):
             if key in previous: settings[key] = previous[key]
+    if payload.get('filter_rules_gid') is not None:
+        settings['filter_rules_gid'] = str(payload['filter_rules_gid'])
+    snapshot = read_registry(settings)
     save(db, SETTINGS, settings); save(db, SNAPSHOT, snapshot)
     save(db, ATTEMPT, snapshot['checked_at']); save(db, ERROR, None)
     # Old comments were already handled under a different authority. Start

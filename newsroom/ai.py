@@ -83,7 +83,7 @@ SCHEMA = {
     "required": ["action", "story_id", "is_relevant", "topic_category", "is_concrete", "implementation_stage", "geographic_scope", "russia_cis_impact", "impact_evidence", "importance", "freshness", "development_date", "development_date_evidence", "confidence", "headline_ru", "summary_ru", "what_is_new", "event_status", "publication_recommendation", "independent_check", "independent_check_note", "facts", "original_reporting_check", "editorial_check"]
 }
 
-FILTER_VERSION = 26
+FILTER_VERSION = 27
 
 
 def _load_editorial_rules(settings=None, stage='analysis') -> str:
@@ -219,7 +219,8 @@ def analysis_input(item, source, candidates, settings):
                  "primary_source": item.get("primary_source"), "primary_source_status": item.get("primary_source_status"),
                  "publisher_report_exception": item.get("publisher_report_exception", False),
                  "publisher_report": item.get("publisher_report"), "independent_sources": item.get("independent_sources", [])},
-        "thematic_policy": settings.get("_topic_registry"),
+        "thematic_policy": None if settings.get('_keyword_prefilter', {}).get('mode') == 'intake_rules' else settings.get("_topic_registry"),
+        "intake_selection": item.get('_intake_filter'),
         "editorial_policy": policy.snapshot(settings),
         "editorial_examples": [], "interest_profile": {},
         "editorial_feedback": item.get("editorial_feedback", []), "history_context": item.get("history_context", []),
@@ -244,7 +245,19 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
         }],
         "text": {"format": {"type": "json_schema", "name": "newsroom_editor_decision", "strict": True, "schema": SCHEMA}}
     }
-    if '_topic_registry' in settings:
+    if settings.get('_keyword_prefilter', {}).get('mode') == 'intake_rules':
+        import copy
+        schema = copy.deepcopy(SCHEMA)
+        schema['properties'].pop('is_relevant')
+        schema['required'].remove('is_relevant')
+        schema['properties']['action']['enum'] = [a for a in schema['properties']['action']['enum'] if a != 'NOISE']
+        request_data['text']['format']['schema'] = schema
+        request_data['instructions'] += ('\nТематический допуск окончательно принят первым локальным фильтром и сохранён в intake_selection. '
+            'Не проверяй соответствие теме, криптосвязь, ключевые слова, географический интерес или тип участника повторно. '
+            'Не отклоняй материал из-за тематики или отсутствия криптотемы; не запрашивай тематическую перепроверку. '
+            'Проверь факты, прочитанный источник, новизну относительно публикаций и подготовь редакционное решение. '
+            'DO_NOT_PUBLISH и WAIT_FOR_AUTOMATION допустимы только по этим редакционным основаниям, с конкретной причиной.')
+    elif '_topic_registry' in settings:
         import copy
         from .topic_registry import MATCHING
         request_data['instructions'] += '\n' + MATCHING
@@ -293,6 +306,10 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
             if block.get("type") == "output_text":
                 try:
                     decision = json.loads(block["text"])
+                    if settings.get('_keyword_prefilter', {}).get('mode') == 'intake_rules':
+                        if decision.get('action') == 'NOISE':
+                            raise AIResponseError('UNEXPECTED_THEMATIC_REJECTION')
+                        decision['is_relevant'] = True  # Saved intake decision, never a model judgment.
                     if settings.get('_analysis_only'):
                         decision['_needs_post_draft'] = True
                     return decision

@@ -2395,6 +2395,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
     if keyword_outcome:
         _trace_item(item, 'Первый фильтр', keyword_outcome, item['_retry_reason'])
         return keyword_outcome
+    intake_authoritative = (ai_settings or {}).get('_keyword_prefilter', {}).get('mode') == 'intake_rules'
     if is_non_news_telegram_format(source, item):
         _trace_item(item, "Формат материала", "Отсеян", "Сообщение не является новостной публикацией.")
         db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
@@ -2683,6 +2684,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 item['_retry_delay_seconds'] = getattr(ai_settings.get('_runtime'), 'account_cooldown_seconds', 900)
             _trace_item(item, "Редакторский ИИ-разбор", "Ошибка", item["_retry_reason"])
         if ai_result is not None:
+            if intake_authoritative:
+                ai_result['is_relevant'] = True
             _trace_item(item, "Редакторский ИИ-разбор", "Завершён",
                         "ИИ подготовил результат редакторского разбора.",
                         action=ai_result.get("action"), recommendation=ai_result.get("publication_recommendation"))
@@ -2697,7 +2700,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 ai_result["is_relevant"] = True
                 ai_result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
             # Reject irrelevant entries even when their source cannot be read.
-            if not missing_local_source and ai_result.get("action") != "DUPLICATE" and (ai_result.get("is_relevant") is False or ai_result.get("action") == "NOISE"
+            if not intake_authoritative and not missing_local_source and ai_result.get("action") != "DUPLICATE" and (ai_result.get("is_relevant") is False or ai_result.get("action") == "NOISE"
                     or ("_topic_registry" not in ai_settings and ai_result.get("geographic_scope") in {"OTHER", "GLOBAL"}
                         and ai_result.get("russia_cis_impact") in {"NONE", "INDIRECT"})):
                 ai_result["action"] = "NOISE"
@@ -2797,13 +2800,16 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         outside_target_market = geographic_scope not in {"RUSSIA", "CIS", "RUSSIA_CIS"}
         evidence_source = primary_source or publisher_report
         direct_impact = ai_result.get("russia_cis_impact") == "DIRECT" and _impact_evidence_is_grounded(ai_result, evidence_source)
-        if '_topic_registry' in ai_settings:
+        if intake_authoritative:
+            direct_impact = item.get('_intake_filter', {}).get('passed') is True
+            tech_not_in_scope = outside_target_market = False
+        elif '_topic_registry' in ai_settings:
             from .topic_registry import grounded_match
             direct_impact = grounded_match(ai_result, ai_settings['_topic_registry'], evidence_source)
             tech_not_in_scope = False
             outside_target_market = False
         legacy_price_excluded = '_topic_registry' not in ai_settings and category == 'PRICE_FORECAST'
-        if (not ai_result.get("is_relevant") or not direct_impact or action == "NOISE" or legacy_price_excluded
+        if ((not intake_authoritative and (not ai_result.get("is_relevant") or action == "NOISE")) or not direct_impact or legacy_price_excluded
                 or tech_not_in_scope or outside_target_market):
             filter_reasons = []
             if not ai_result.get("is_relevant") or action == "NOISE":
@@ -3190,7 +3196,8 @@ def _finish_post_steps(db, item, ai_settings, context):
         facts_json = json.dumps({"mode": "AI", "_filter_version": FILTER_VERSION,
                                  "policy": __import__("newsroom.policy", fromlist=["snapshot"]).snapshot(ai_settings),
                                  "final_text_check": ai_result.get("final_text_check"),
-                                 "topic_registry": {"version": ai_settings["_topic_registry"].get("version"), "match": ai_result.get("topic_match"), "checked": True} if "_topic_registry" in ai_settings else None,
+                                 "intake_filter": item.get('_intake_filter'),
+                                 "topic_registry": {"version": ai_settings["_topic_registry"].get("version"), "match": ai_result.get("topic_match"), "checked": True} if "_topic_registry" in ai_settings and ai_settings.get('_keyword_prefilter', {}).get('mode') != 'intake_rules' else None,
                                  "memory_mode": memory_mode, "story_diff": memory_diff,
                                  "primary_source": primary_source_record,
                                  "primary_source_status": source_status,

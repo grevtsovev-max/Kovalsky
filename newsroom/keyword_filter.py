@@ -53,7 +53,9 @@ def match(text, keywords):
     return None
 
 
-def evaluate(text, spec):
+def evaluate(text, spec, title=''):
+    if spec.get('mode') == 'intake_rules':
+        return evaluate_rules(text, title, spec)
     keyword = match(text, spec.get('keywords') or [])
     brand = match(text, spec.get('brands') or [])
     person = match(text, spec.get('people') or [])
@@ -64,8 +66,58 @@ def evaluate(text, spec):
             'passed': bool(keyword) and not brand_only}
 
 
+def evaluate_rules(text, title, spec):
+    entries = spec.get('entries') or []
+    entities = {normalize(v) for v in (spec.get('brands') or []) + (spec.get('people') or [])}
+    profiles = [r for r in entries if r.get('role') == 'Профильный' and normalize(r['description']) not in entities]
+    # A thematic word inside an entity name (e.g. Crypto.com) is not evidence.
+    topical_text = normalize(text)
+    for entity in sorted(entities, key=len, reverse=True):
+        tokens = words(entity)
+        if tokens:
+            topical_text = re.sub(r'(?<!\w)' + r'\W+'.join(re.escape(t) for t in tokens) + r'(?!\w)', ' ', topical_text)
+    profile = match(topical_text, [r['description'] for r in profiles])
+    brand = match(text, spec.get('brands') or [])
+    person = match(title, spec.get('people') or [])
+    context = match(topical_text, [r['description'] for r in entries if r.get('role') == 'Контекстный'
+                           and normalize(r['description']) not in entities])
+    ambiguous = refinement = None
+    for entry in entries:
+        if entry.get('role') != 'Требует уточнения' or not match(topical_text, [entry['description']]):
+            continue
+        ambiguous = entry['description']
+        # Clarifiers belong to this exact row, never a document-wide hidden list.
+        refinement = match(topical_text, [s.strip() for s in entry.get('refinement', '').split('|') if s.strip()])
+        if refinement:
+            break
+    found = {'Бренд':brand, 'Профильный':profile, 'Лицо в заголовке':person,
+             'Контекстный':context, 'Требует уточнения':ambiguous, 'Уточнение':refinement}
+    rule = next((r for r in spec.get('rules', []) if r.get('enabled') and r.get('required')
+                 and all(found.get(part) for part in r['required'])), None)
+    configuration_error = not spec.get('rules') or not profiles
+    if configuration_error:
+        reason = 'Первый фильтр не настроен: нужны включённые правила и профильные ключевики с ролями.'
+    elif rule:
+        parts = list(dict.fromkeys(found[p] for p in rule['required']))
+        reason = 'Прошёл первый фильтр: ' + ' + '.join(parts) + '. Правило: ' + rule['name'] + '.'
+        if context and 'Контекстный' not in rule['required']:
+            reason += ' Контекст: ' + context + '.'
+    else:
+        reason = ('Первый фильтр не пройден: найден ' + brand + ', профильного ключевика или разрешённого сочетания нет.'
+                  if brand else 'Первый фильтр не пройден: профильного ключевика, разрешённого сочетания или лица в заголовке нет.')
+    selected_keyword = profile or (ambiguous if rule else None) or person
+    topic = (next((r['title'] for r in profiles if r['description'] == profile), None)
+             if profile else 'Публичные активности брендов и лиц' if person else
+             next((r['title'] for r in entries if r['description'] == ambiguous), None))
+    return {'mode':'intake_rules', 'passed':bool(rule) and not configuration_error, 'rule':rule['name'] if rule else None,
+            'matched_keyword':selected_keyword, 'matched_brand':brand, 'matched_person':person,
+            'matched_topic_keyword':profile, 'matched_context_keyword':context,
+            'matched_ambiguous_keyword':ambiguous, 'matched_refinement':refinement,
+            'topic':topic, 'reason':reason, 'configuration_error':configuration_error}
+
+
 def screen(db, item_id, item, settings):
-    from .material_flow import mark, put
+    from .material_flow import mark, put, get, revision
     from .runtime import cache_key, stamp
     spec = settings.get('_keyword_prefilter')
     if spec is None:
@@ -73,22 +125,32 @@ def screen(db, item_id, item, settings):
     keywords = spec.get('keywords') or []
     text = '\n'.join(str(item.get(field) or '') for field in ('title', 'description', 'content'))
     dependency = cache_key('keyword-prefilter-v1', {'text': text, 'keywords': spec})
+    if spec.get('mode') == 'intake_rules':
+        dependency = cache_key('intake-rules-v1', spec)
+        saved = get(db, item_id, 'screening', dependency)
+        if saved and saved.get('passed') is True:
+            item['_intake_filter'] = saved
+            return None
     mark(db, item_id, 'screening', 'RUNNING', 'Фильтр ключевых слов и словоформ; без ИИ.')
-    result = {'kind': 'keyword_prefilter', 'version': spec.get('version'), **evaluate(text, spec)}
+    result = {'kind': 'keyword_prefilter', 'version': spec.get('version'), **evaluate(text, spec, item.get('title', ''))}
+    if spec.get('mode') == 'intake_rules':
+        result.update(input_sha256=cache_key('intake-text', text), item_id=item_id, revision=revision(db, item_id))
+        item['_intake_filter'] = result
     keyword = result['matched_keyword']
     put(db, item_id, 'screening', dependency, result)
     if result['passed']:
         label = (result['matched_brand'] + ' + ' + result['matched_topic_keyword']
                  if result['matched_brand'] and result['matched_topic_keyword'] else keyword)
-        mark(db, item_id, 'screening', 'DONE', 'Первый фильтр пройден: ' + label)
+        mark(db, item_id, 'screening', 'DONE', result.get('reason') or 'Первый фильтр пройден: ' + label)
         db.commit()
         return None
-    if not keywords:
+    if result.get('configuration_error') or (spec.get('mode') != 'intake_rules' and not keywords):
         outcome, reason = 'TECHNICAL_ERROR', 'Нет включённых ключевых слов в таблице; требуется исправить настройку.'
+        reason = result.get('reason') or reason
         mark(db, item_id, 'screening', 'ERROR', reason, block_kind='technical')
     else:
         outcome = 'NOISE'
-        reason = ('Первый фильтр не пройден: найден бренд ' + result['matched_brand'] + ', но нет дополнительного тематического ключевика.'
+        reason = result.get('reason') or ('Первый фильтр не пройден: найден бренд ' + result['matched_brand'] + ', но нет дополнительного тематического ключевика.'
                   if result['brand_only'] else 'Первый фильтр не пройден: в заголовке и доступном тексте нет ключевых слов или их словоформ.')
         mark(db, item_id, 'screening', 'CLOSED', reason)
     item['_retry_reason'] = reason

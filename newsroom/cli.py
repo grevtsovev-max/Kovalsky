@@ -398,7 +398,12 @@ def is_eligible_for_auto_publish(post, cutoff: str, thematic=None) -> bool:
             return False
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    if thematic is not None:
+    if thematic is not None and thematic.get('selection_mode') == 'intake_rules':
+        proof = facts.get('intake_filter') or {}
+        topical = (proof.get('mode') == 'intake_rules' and proof.get('passed') is True
+                   and proof.get('version') == thematic.get('version') and bool(proof.get('input_sha256'))
+                   and proof.get('rule') in {r['name'] for r in thematic.get('intake_rules', []) if r.get('enabled')})
+    elif thematic is not None:
         proof = facts.get('topic_registry') or {}
         match = proof.get('match') or {}
         from .topic_registry import public_activity_allowed
