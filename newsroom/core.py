@@ -433,6 +433,10 @@ def decode_google_news_url(url: str) -> str:
 class PublisherArticleParser(HTMLParser):
     SKIP = {"script", "style", "nav", "header", "footer", "aside", "noscript", "svg", "form"}
     TEXT_TAGS = {"h1", "h2", "h3", "p", "blockquote", "li", "time"}
+    CHROME_CLASSES = {"related", "related-posts", "related-articles", "recommendations",
+                      "advertisement", "ad-banner", "ads", "view-count", "views-count",
+                      "social-share", "share-buttons", "cookie-banner", "cookie-consent"}
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -460,7 +464,10 @@ class PublisherArticleParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
-        if tag == "time" and values.get("datetime"):
+        chrome = (bool(self.CHROME_CLASSES.intersection((values.get('class') or '').lower().split()))
+                  or values.get('role', '').lower() in {'navigation', 'banner', 'contentinfo', 'complementary'}
+                  or 'hidden' in values or values.get('aria-hidden', '').lower() == 'true')
+        if tag == "time" and not self.skip_stack and not chrome and values.get("datetime"):
             date_value = parse_date(values.get("datetime"))
             class_names = (values.get("class") or "").lower().split()
             if date_value and any(token in " ".join(class_names) for token in ("updated", "modified")):
@@ -491,11 +498,10 @@ class PublisherArticleParser(HTMLParser):
                 self.meta_description = values["content"]
         elif tag == "link" and "canonical" in values.get("rel", "").lower():
             self.canonical_url = values.get("href", "")
-        related_classes = {"related", "related-posts", "related-articles", "recommendations"}
-        if (tag in self.SKIP
-                or related_classes.intersection((values.get("class") or "").lower().split())
+        if (tag in self.SKIP or chrome
                 or (self.skip_stack and tag == self.skip_stack[-1])):
-            self.skip_stack.append(tag)
+            if tag not in self.VOID_TAGS:
+                self.skip_stack.append(tag)
             return
         if self.skip_stack:
             return
@@ -3436,7 +3442,9 @@ def _reconcile_legacy_retry_loops(db) -> int:
 
 
 def _requeue_social_quote_repairs(db, ai_settings, freshness_hours: int) -> int:
-    """Re-evaluate fresh rejected exact social posts once under the current filter."""
+    """Legacy repair only: activated v1 must never reopen a final rejection."""
+    if '_policy_baseline' in (ai_settings or {}):
+        return 0
     if not get_api_key(ai_settings or {}):
         return 0
     rows = db.execute("SELECT i.*,a.result_json FROM items i JOIN item_analysis a USING(item_id) "

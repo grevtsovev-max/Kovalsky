@@ -38,11 +38,55 @@ class PrimarySourceExtractionTests(unittest.TestCase):
         self.assertTrue(article['material_read'])
         self.assertEqual(article['content'], body)
 
+    def test_manual_url_accepts_short_read_article_and_rejects_unread_preview(self):
+        from newsroom.manual_intake import _submit_locked, IntakeError
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'newsroom': {'database': str(Path(directory) / 'manual.sqlite3'), 'independent_processing': True}, 'ai': {'_policy_baseline': []}}
+            article = {'title': 'Банк получил лицензию', 'content': 'Банк получил лицензию.',
+                       'url': 'https://news.example/short', 'material_read': True, 'published_at': None}
+            with patch('newsroom.core._validate_public_http_url'), patch('newsroom.manual_intake.fetch_publisher_article', return_value=article):
+                result = _submit_locked(config, article['url'])
+            self.assertEqual(result['outcome'], 'QUEUED')
+            db = connect(config['newsroom']['database'])
+            try:
+                self.assertEqual(db.execute('SELECT content FROM items').fetchone()[0], article['content'])
+            finally:
+                db.close()
+            with patch('newsroom.core._validate_public_http_url'), patch('newsroom.manual_intake.fetch_publisher_article', return_value={**article, 'material_read': False}):
+                with self.assertRaises(IntakeError):
+                    _submit_locked(config, article['url'])
+
     def test_zoom_modified_metadata_is_not_invented_publication_time(self):
         parser = PublisherArticleParser()
         parser.feed('<meta name="zoom:last-modified" content="Tue, 06 Oct 2026 15:16:00 GMT">')
         self.assertEqual(parser.updated_at, '2026-10-06T15:16:00+00:00')
         self.assertIsNone(parser.published_at)
+
+    def test_navigation_clock_and_changing_counters_do_not_change_read_material(self):
+        def parse(views, clock):
+            parser = PublisherArticleParser()
+            parser.feed(f'<nav><time datetime="{clock}">Часы сайта</time></nav>'
+                        '<div role="navigation"><p>Меню</p></div>'
+                        '<article><p>Банк получил лицензию.</p>'
+                        f'<div class="view-count"><p>{views} просмотров</p></div>'
+                        '<div class="advertisement"><p>Реклама вклада</p></div>'
+                        '<img class="ad-banner" src="banner.jpg">'
+                        '<p>Разрешение вступает в силу 10 октября.</p></article>')
+            return parser
+        old = parse(100, '2026-10-06T10:00:00+03:00')
+        new = parse(200, '2026-10-07T10:00:00+03:00')
+        self.assertEqual(old.blocks, new.blocks)
+        self.assertEqual(len(new.blocks), 2)
+        self.assertIn('10 октября', str(new.blocks))
+        self.assertIsNone(new.published_at)
+
+    def test_hidden_ui_is_excluded_without_erasing_substantive_article_words(self):
+        parser = PublisherArticleParser()
+        parser.feed('<div hidden><p>Скрытое меню</p></div>'
+                    '<span aria-hidden="true">999</span>'
+                    '<p>Банк повысил ставки: реклама и просмотры не являются причиной решения.</p>')
+        self.assertEqual(len(parser.blocks), 1)
+        self.assertIn('реклама и просмотры', str(parser.blocks))
 
     def test_nested_related_cards_do_not_leak_links_or_hide_following_article(self):
         parser = PublisherArticleParser()

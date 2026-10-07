@@ -93,6 +93,8 @@ class SelfAuditRegressionTests(unittest.TestCase):
                         (cursor.lastrowid, "test", self.now, json.dumps(analysis)))
         self.db.commit()
         with patch("newsroom.core.get_api_key", return_value="test-key"):
+            self.assertEqual(_requeue_social_quote_repairs(self.db, {'_policy_baseline': []}, 48), 0)
+            self.assertEqual(self.db.execute("SELECT disposition FROM items WHERE item_id=?", (cursor.lastrowid,)).fetchone()[0], 'REJECTED')
             self.assertEqual(_requeue_social_quote_repairs(self.db, {}, 48), 1)
             self.assertEqual(_requeue_social_quote_repairs(self.db, {}, 48), 0)
         self.assertEqual(self.db.execute("SELECT disposition FROM items WHERE item_id=?",

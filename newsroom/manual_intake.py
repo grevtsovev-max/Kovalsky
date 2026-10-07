@@ -54,7 +54,7 @@ def _submit_locked(config: dict, url: str, retry_after_credits_restored: bool = 
                                          timeout=20, public_only=True)
     except Exception as exc:
         raise IntakeError(f"Не удалось прочитать статью ({type(exc).__name__}).") from exc
-    if not article.get("title") or len(str(article.get("content") or "").strip()) < 100:
+    if not article.get("title") or article.get("material_read") is not True or not str(article.get("content") or "").strip():
         raise IntakeError("На странице не удалось прочитать полный текст статьи.")
 
     article_url = article.get("url") or url
@@ -109,7 +109,7 @@ def _submit_locked(config: dict, url: str, retry_after_credits_restored: bool = 
         if existing_item_id is not None:
             previous = db.execute("SELECT disposition,processed_at FROM items WHERE item_id=?", (existing_item_id,)).fetchone()
             disposition = previous["disposition"]
-            recovered_date = bool(article.get("published_at") or article.get("updated_at"))
+            recovered_date = bool(article.get("published_at"))
             if disposition == "UNDATED" and recovered_date:
                 # Metadata extraction can improve without changing the article body.
                 # Re-run the original item through freshness and all later gates once
