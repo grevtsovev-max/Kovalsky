@@ -268,8 +268,10 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
             "FROM posts p LEFT JOIN stories s USING(story_id) "
             "WHERE p.status='PUBLISHED' AND p.published_at>? AND p.published_at<=? "
             "AND NOT EXISTS(SELECT 1 FROM publication_attempts d WHERE d.post_id=p.post_id "
-            "AND d.status IN ('SENDING','UNKNOWN'))",
-            (cutoff, now.isoformat(timespec="seconds")),
+            "AND d.status IN ('SENDING','UNKNOWN')) "
+            "AND NOT EXISTS(SELECT 1 FROM publication_attempts d WHERE d.post_id=p.post_id "
+            "AND d.status IN ('SENT','CONFIRMED') AND d.channel_id<>?)",
+            (cutoff, now.isoformat(timespec="seconds"), channel(config)),
         ).fetchall()
         rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
         rows = sorted(rows, key=lambda row: (rank.get(row["importance"], 2), row["published_at"] or ""))
@@ -327,7 +329,7 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
             # publication in this period may still produce a real digest.
             return False, 0
         else:
-            # Keep the approved 25 September digest format: linked headlines only, no body summaries.
+            # The canonical digest format contains links to published headlines.
             for emoji, headline, importance, post_url in selected:
                 linked_headline = _link_digest_action(headline, post_url) if post_url else headline
                 item = f"{emoji} {linked_headline}"
