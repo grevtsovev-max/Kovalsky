@@ -88,6 +88,8 @@ def parse_tab(body, name):
     result = []
     for number, row in enumerate(rows[1:], 2):
         row = (row + ['', '', ''])[:3]
+        if row == HEADERS[name]:
+            continue  # Pasted table headers are metadata, not keyword entries.
         title, description, flag = [str(v).strip() for v in row]
         if not title and not description:
             continue
@@ -135,9 +137,13 @@ def apply_snapshot(config, snapshot, entities=()):
     thematic = policy(snapshot, entities)
     config['_topic_registry_authoritative'] = True
     config.setdefault('ai', {})['_topic_registry'] = thematic
-    config['ai']['triage_enabled'] = True
-    # No hidden word prefilter: semantic selection sees the scope even when
-    # none of the illustrative keywords occurs in the headline.
+    config['ai']['triage_enabled'] = False
+    # The first filter uses every enabled row of the owner's keyword tab.
+    # Topic/geography interpretation belongs to the later read-material analysis.
+    config['ai']['_keyword_prefilter'] = {
+        'version': snapshot.get('version'),
+        'keywords': [r['description'] for r in snapshot.get('sections', {}).get('Ключевые слова', []) if r['enabled']],
+    }
     config.setdefault('newsroom', {})['relevance_terms'] = []
     for source in config.get('sources', []):
         source.pop('interest_exclusions', None)

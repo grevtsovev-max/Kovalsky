@@ -52,6 +52,12 @@ class TopicsTests(unittest.TestCase):
         with self.assertRaises(ValueError): topics.parse_tab(b'<html>login</html>','Темы')
         with self.assertRaises(ValueError): topics.parse_tab('Тема,Что отслеживать,Мониторинг\nДа,Условия,MAYBE'.encode(),'Темы')
 
+    def test_pasted_header_inside_keyword_tab_does_not_break_refresh(self):
+        body = 'Тема,Слово или фраза,Мониторинг\nРабота,платёжный агент,TRUE\nТема,Слово или фраза,Мониторинг\nРабота,цифровой депозитарий,TRUE\n'
+        result = topics.parse_tab(body.encode(), 'Ключевые слова')
+        self.assertEqual([r['description'] for r in result], ['платёжный агент', 'цифровой депозитарий'])
+        self.assertTrue(all(r['enabled'] for r in result))
+
     def test_all_tabs_are_atomic_and_unknown_keyword_parent_is_invalid(self):
         def body(tab):
             out=io.StringIO(); writer=csv.writer(out); writer.writerow(topics.HEADERS[tab['name']]);writer.writerow(['Другой' if tab['name']=='Ключевые слова' else 'Тема','Описание','TRUE']); return out.getvalue().encode(),{},''
@@ -64,6 +70,8 @@ class TopicsTests(unittest.TestCase):
         config={'newsroom':{'database':self.path,'relevance_terms':['скрытая тема']},'ai':{},'sources':[{'type':'web_search','query':'legacy','interest_exclusions':['legacy']} ]}
         topics.attach_cached(config)
         self.assertTrue(config['_topic_registry_authoritative'])
+        self.assertFalse(config['ai']['triage_enabled'])
+        self.assertEqual(config['ai']['_keyword_prefilter'], {'version': 'v1', 'keywords': ['платёжный агент', 'другой ключ']})
         self.assertEqual(config['newsroom']['relevance_terms'],[])
         self.assertNotIn('legacy',config['sources'][0]['query'])
         self.assertNotIn('interest_exclusions',config['sources'][0])

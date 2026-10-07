@@ -74,7 +74,7 @@ class PipelineTests(unittest.TestCase):
         self.posts[0]['facts']['final_text_check'] = {'assembled_sha256': hashlib.sha256('Проверенный текст'.encode()).hexdigest()}
         result = self.snapshot(stage='filtered')
         counts = {step['key']: step['count'] for step in result['funnel']}
-        self.assertEqual(counts, {'received': 3, 'primary_read': 1, 'selected': 1, 'drafted': 1, 'checked': 1, 'published': 0})
+        self.assertEqual(counts, {'received': 3, 'first_filter': 0, 'primary_read': 1, 'drafted': 1, 'checked': 1, 'published': 0})
         self.assertEqual(result['total'], 1)
         self.assertEqual(sum(step['count'] for step in result['stages']), 3)
         self.posts[0]['text'] = 'Изменённый непроверенный текст'

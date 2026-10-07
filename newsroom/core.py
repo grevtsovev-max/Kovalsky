@@ -2386,6 +2386,11 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
     if item_id is None:
         return "DUPLICATE"
     db.commit()
+    from .keyword_filter import screen as screen_keywords
+    keyword_outcome = screen_keywords(db, item_id, item, ai_settings or {})
+    if keyword_outcome:
+        _trace_item(item, 'Первый фильтр', keyword_outcome, item['_retry_reason'])
+        return keyword_outcome
     if is_non_news_telegram_format(source, item):
         _trace_item(item, "Формат материала", "Отсеян", "Сообщение не является новостной публикацией.")
         db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
@@ -2418,8 +2423,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             db.execute("UPDATE items SET disposition='TECHNICAL_ERROR',processed_at=? WHERE item_id=?", (now, item_id))
             db.commit()
             return "TECHNICAL_ERROR"
-    # Keyword matches trigger collection. Only the read material's semantic
-    # decision may reject a story for topic mismatch.
+    # Local keyword intake has already passed. The later editor evaluates the
+    # read material's meaning; no AI triage runs before reading.
     from .material_flow import load_draft_context
     resume_context = load_draft_context(db, item_id, item, ai_settings or {})
     if resume_context:

@@ -239,7 +239,14 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     for post in posts:
         by_story.setdefault(post['story_id'], []).append(post)
     counts = dict.fromkeys(dict(STAGES), 0)
-    totals = dict(received=0, analyzed=0, primary_read=0, selected=0, drafted=0, checked=0, published=0)
+    totals = dict(received=0, first_filter=0, analyzed=0, primary_read=0, selected=0, drafted=0, checked=0, published=0)
+    keyword_passed = set()
+    if 'material_stage_results' in tables:
+        keyword_passed = {r[0] for r in db.execute(
+            "SELECT DISTINCT r.item_id FROM material_stage_results r JOIN items i USING(item_id) "
+            "WHERE r.revision=i.ingest_revision AND r.stage='screening' AND json_valid(r.result_json) "
+            "AND json_extract(r.result_json,'$.kind')='keyword_prefilter' "
+            "AND json_extract(r.result_json,'$.passed')=1")}
     output = []
     for row in rows:
         item = dict(row)
@@ -321,6 +328,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                     reason = active_checkpoint['reason']
         counts[category] += 1
         totals['received'] += 1
+        totals['first_filter'] += item['item_id'] in keyword_passed
         totals['analyzed'] += bool(item['analyzed_at'])
         totals['primary_read'] += primary.get('status') == 'READ' or primary.get('_material_read') is True
         totals['selected'] += analysis.get('is_relevant') is True or post is not None
@@ -389,8 +397,8 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             if history[-1]['reason'] != 'Подробная причина в этой исторической записи не сохранена.':
                 item['reason'] = history[-1]['reason']
     funnel = [('received', 'Получено материалов', 'Уникальные материалы, сохранённые за выбранный период.'),
+              ('first_filter', 'Прошли первый фильтр', 'Есть совпадение с включённым ключевиком таблицы или его словоформой. Без ИИ.'),
               ('primary_read', 'Прочитано', 'Сохранён прочитанный текст источника или пересказа.'),
-              ('selected', 'Прошли отбор по теме', 'Тематическое соответствие подтверждено анализом либо сохранён связанный пост; остальные проверки могут ещё идти.'),
               ('drafted', 'Подготовлено постов', 'Материалы, для которых сохранён связанный пост, включая впоследствии отклонённые.'),
               ('checked', 'Прошли проверку текста', 'Есть сохранённая проверка именно текущего текста поста.'),
               ('published', 'Опубликовано', 'Материалы со связанным опубликованным постом.')]
