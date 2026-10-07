@@ -223,7 +223,7 @@ def admission(db, item_id, item, source, hours, initial_minutes=None, *, after_r
     anchor = datetime.fromisoformat((received_at or job or row['discovered_at']).replace('Z', '+00:00'))
     if anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=timezone.utc)
-    raw = item.get('published_at') or item.get('updated_at')
+    raw = item.get('published_at')
     owner = source['type'] == 'manual' or item.get('owner_requested') is True
     result = None
     if raw:

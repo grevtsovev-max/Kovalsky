@@ -2310,7 +2310,8 @@ def process_item_steps(db, source, item: dict, threshold: float, max_length: int
             item_row = None
         _log_timing("item_processing_timing", item_id=item_row["item_id"] if item_row else None,
                     source=source["name"], source_type=source["type"], outcome=outcome,
-                    source_published_at=(item.get("updated_at") or item.get("published_at")),
+                    source_published_at=item.get("published_at"),
+                    source_updated_at=item.get("updated_at"),
                     discovered_at=item_row["discovered_at"] if item_row else None,
                     processed_at=NOW(), total_seconds=round(time.perf_counter() - started, 3),
                     primary_source_read_seconds=round(timings["primary_source_read_seconds"], 3),
@@ -2348,7 +2349,9 @@ def _read_material_report(source, item: dict, body: str) -> dict | None:
     return {"publisher": item.get("publisher_name") or source["name"], "url": url,
             "title": item.get("title", ""), "content": body, "type": "ATTRIBUTED_REPORT",
             "material_read": True, "source_role": role,
-            "published_at": item.get("published_at") or item.get("updated_at"),
+            "published_at": item.get("published_at"),
+            "updated_at": item.get("updated_at"),
+            "source_timezone": item.get("source_timezone"),
             "forwarded": bool(item.get("telegram_forwarded")),
             "priority": int(source["priority"]), "reputation": source["reputation"]}
 
@@ -2382,7 +2385,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         db.commit()
         return "NOISE"
     from .policy import admission
-    date_pending = not (item.get('published_at') or item.get('updated_at'))
+    date_pending = not item.get('published_at')
     date_issue = admission(db, item_id, item, source, freshness_hours, initial_backfill_minutes)
     age_hours = 0  # Admission owns date decisions; queue waiting is never article age.
     if date_issue:

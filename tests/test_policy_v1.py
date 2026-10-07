@@ -174,6 +174,23 @@ class PolicyV1Tests(unittest.TestCase):
             self.assertIsNone(backup.execute("SELECT value FROM app_state WHERE key='policy_v1_cutover'").fetchone())
         self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'STORE_ONLY')
 
+    def test_modification_time_does_not_become_publication_date(self):
+        self.stored()
+        item = {'url': 'https://example.org/1', 'updated_at': self.now.isoformat()}
+        self.assertIsNone(policy.admission(self.db, 1, item, self.source, 24))
+        outcome = policy.admission(self.db, 1, item, self.source, 24, after_read=True)
+        self.assertEqual(outcome[0], 'STORE_ONLY')
+        self.assertIsNone(self.db.execute("SELECT value FROM app_state WHERE key='policy_admission:1:v1'").fetchone())
+        from newsroom.core import _read_material_report
+        report = _read_material_report(self.source, {**item, 'material_read': True}, 'Банк сообщил об изменении.')
+        self.assertIsNone(report['published_at'])
+        self.assertEqual(report['updated_at'], item['updated_at'])
+        item['freshness_evidence'] = {'kind': 'dated_feed_sequence', 'description': 'Current dated feed position'}
+        self.assertIsNone(policy.admission(self.db, 1, item, self.source, 24, after_read=True))
+        record = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='policy_admission:1:v1'").fetchone()[0])
+        self.assertIsNone(record['source_date'])
+        self.assertEqual(record['freshness_evidence'], item['freshness_evidence'])
+
     def test_policy_backup_precedes_schema_migration(self):
         import sqlite3
         self.stored()
