@@ -6,6 +6,23 @@ from newsroom.pipeline import pipeline_snapshot
 
 
 class PipelineTests(unittest.TestCase):
+    def test_counter_reset_keeps_history_and_limits_milestone_lists(self):
+        self.add(1, primary={'status': 'READ'})
+        self.add(2)
+        self.db.execute('CREATE TABLE app_state(key TEXT PRIMARY KEY,value TEXT)')
+        self.db.execute('ALTER TABLE sources ADD COLUMN active INTEGER DEFAULT 0')
+        epoch = {'started_at': self.now.isoformat(), 'after_item_id': 2}
+        self.db.execute('INSERT INTO app_state VALUES(?,?)',
+                        ('pipeline_counter_epoch_v2', json.dumps(epoch)))
+        self.assertEqual(self.snapshot()['totals']['received'], 0)
+        self.assertEqual(self.snapshot()['totals']['primary_read'], 0)
+        self.assertEqual(self.snapshot()['total'], 2)
+        self.add(3)
+        report = self.snapshot(milestone='received')
+        self.assertEqual(report['totals']['received'], 1)
+        self.assertEqual([i['item_id'] for i in report['items']], [3])
+        self.assertEqual(report['counter_started_at'], epoch['started_at'])
+
     def test_processing_job_exposes_queue_state_without_worker_payload(self):
         self.add(1, 'WAITING_CONFIRMATION')
         self.db.execute('CREATE TABLE processing_jobs(job_id INTEGER,item_id INTEGER,category TEXT,status TEXT,attempts INTEGER,next_at TEXT,outcome TEXT,error_code TEXT,payload_json TEXT)')

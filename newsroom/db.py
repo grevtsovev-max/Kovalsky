@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -242,6 +243,11 @@ def connect(path: str) -> sqlite3.Connection:
     from .workflow import SCHEMA as WORKFLOW_SCHEMA
     db.executescript(RUNTIME_SCHEMA)
     db.execute("INSERT OR IGNORE INTO app_state(key,value) VALUES('resource_accounting_started_at',?)", (stamp(),))
+    # Start a new, persistent cohort when the keyword-first counters ship.
+    # Keep all materials and previous processing history intact.
+    db.execute("INSERT OR IGNORE INTO app_state(key,value) VALUES('pipeline_counter_epoch_v2',?)",
+               (json.dumps({'started_at': stamp(), 'after_item_id': db.execute(
+                   'SELECT COALESCE(MAX(item_id),0) FROM items').fetchone()[0]}),))
     runtime_columns = {row[1] for row in db.execute('PRAGMA table_info(api_usage)')}
     for name, declaration in USAGE_COLUMNS:
         if name not in runtime_columns:

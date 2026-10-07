@@ -224,6 +224,11 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         where = 'WHERE julianday(i.discovered_at)>=julianday(?)'
         args = [(now - timedelta(hours=int(period))).isoformat()]
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    counter_epoch = None
+    if 'app_state' in tables:
+        epoch_row = db.execute("SELECT value FROM app_state WHERE key='pipeline_counter_epoch_v2'").fetchone()
+        if epoch_row:
+            counter_epoch = obj(epoch_row[0])
     story_join = 'LEFT JOIN stories st USING(story_id)' if 'stories' in tables else ''
     retry_join = "LEFT JOIN app_state t ON t.key='selection_retry:'||i.item_id" if 'app_state' in tables else ''
     triage_join = "LEFT JOIN app_state tr ON tr.key='triage:'||i.item_id" if 'app_state' in tables else ''
@@ -359,8 +364,9 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             'checked': bool(post and proof.get('assembled_sha256') and proof['assembled_sha256'] == hashlib.sha256((post.get('text') or '').encode()).hexdigest()),
             'published': category == 'published',
         }
+        in_counter_cohort = not counter_epoch or item['item_id'] > counter_epoch['after_item_id']
         for key, passed in progress.items():
-            totals[key] += passed
+            totals[key] += bool(passed and in_counter_cohort)
         terminal = category in {'published', 'filtered', 'processed'}
         try:
             discovered = datetime.fromisoformat(item['discovered_at'].replace('Z', '+00:00'))
@@ -400,7 +406,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                      or bucket == 'attention' and needs_attention
                      or bucket == 'published' and category == 'published'
                      or bucket == 'closed' and category in {'filtered', 'processed'})
-        if in_bucket and (milestone == 'all' or progress.get(milestone, False)) and (stage == 'all' or stage == category):
+        if in_bucket and (milestone == 'all' or in_counter_cohort and progress.get(milestone, False)) and (stage == 'all' or stage == category):
             output.append(item)
     visible = output[offset:offset+30]
     queue_positions, queue_total, queue_batch = retry_queue_positions(db, config, now)
@@ -442,7 +448,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
               ('drafted', 'Подготовлено постов', 'Материалы, для которых сохранён связанный пост, включая впоследствии отклонённые.'),
               ('checked', 'Прошли проверку текста', 'Есть сохранённая проверка именно текущего текста поста.'),
               ('published', 'Опубликовано', 'Материалы со связанным опубликованным постом.')]
-    return {'funnel': [{'key': key, 'label': label, 'count': totals[key], 'description': description} for key, label, description in funnel],
+    return {'counter_started_at': (counter_epoch or {}).get('started_at'), 'funnel': [{'key': key, 'label': label, 'count': totals[key], 'description': description} for key, label, description in funnel],
             'stages':[{'key':k,'label':v,'count':counts[k]} for k,v in STAGES],
             'totals':totals,'total':len(output),'items':visible,
             'offset':offset,'limit':30,'period':period,'bucket':bucket,'milestone':milestone,'updated_at':now.isoformat()}
