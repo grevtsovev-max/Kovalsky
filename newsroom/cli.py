@@ -298,6 +298,8 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
                 emoji = "📌"
             selected.append((emoji, headline, row["importance"] or "MEDIUM", post_url))
 
+        if not selected:
+            return False, 0
         if any(not entry[3] for entry in selected):
             raise ChannelPresenceUnavailable('DIGEST_POST_LINK_MISSING')
         observed = inspect_channel_posts(config, [entry[3].rsplit('/', 1)[1] for entry in selected], db=db)
@@ -313,10 +315,9 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
         messages = []
         current = title
         if not selected:
-            if rows:
-                current += "\n\nЗа период дайджеста нет публикаций, подходящих для включения в подборку."
-            else:
-                current += "\n\nЗа период дайджеста в канале новых публикаций не было."
+            # No delivery intent or completed-period marker: a later eligible
+            # publication in this period may still produce a real digest.
+            return False, 0
         else:
             # Keep the approved 25 September digest format: linked headlines only, no body summaries.
             for emoji, headline, importance, post_url in selected:

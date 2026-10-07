@@ -56,6 +56,16 @@ class DigestScheduleTests(unittest.TestCase):
         self.assertNotIn('Подробности новых правил', text)
         for i in (3,4,5,6):self.assertNotIn(f'https://t.me/test_channel/{i}',text)
         result,send=self.run_at(18);self.assertEqual(result,(False,0));send.assert_not_called()
+    def test_empty_digest_does_not_block_a_later_publication(self):
+        self.db.commit()
+        result, send = self.run_at(18)
+        self.assertEqual(result, (False, 0))
+        send.assert_not_called()
+        self.post(1)
+        result, send = self.run_at(18)
+        self.assertEqual(result, (True, 1))
+        send.assert_called_once()
+
     def test_first_digest_uses_last_24_hours(self):
         self.post(1);self.post(2,date='2026-09-25T16:00:00+00:00')
         result,send=self.run_at(18);self.assertEqual(result,(True,1));self.assertNotIn('/2)',send.call_args.args[1])

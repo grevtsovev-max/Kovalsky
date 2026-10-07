@@ -20,15 +20,16 @@ class DigestEmptyTests(unittest.TestCase):
             with patch('newsroom.cli.datetime') as clock, patch('newsroom.cli.telegram_send', return_value='501') as send:
                 clock.now.return_value = datetime(2026,9,26,17,5,tzinfo=timezone.utc)
                 clock.combine.side_effect = datetime.combine
-                self.assertEqual(publish_digest(path, dict(config, telegram={'chat_id': '@test_channel'})), (True, 0))
-                message = send.call_args.args[1]
-                if filtered:
-                    self.assertIn('нет публикаций, подходящих', message)
-                else:
-                    self.assertIn('в канале новых публикаций не было', message)
-                self.assertNotIn('последние сутки', message)
-                self.assertEqual(publish_digest(path, dict(config, telegram={'chat_id': '@test_channel'})), (False, 0))
-                send.assert_called_once()
+                for _ in range(2):
+                    self.assertEqual(publish_digest(path, dict(config, telegram={'chat_id': '@test_channel'})), (False, 0))
+                send.assert_not_called()
+            db = connect(path)
+            try:
+                self.assertEqual(db.execute('SELECT count(*) FROM digest_batches').fetchone()[0], 0)
+                self.assertEqual(db.execute('SELECT count(*) FROM publication_attempts').fetchone()[0], 0)
+                self.assertIsNone(db.execute("SELECT value FROM app_state WHERE key='digest_last_local_date'").fetchone())
+            finally:
+                db.close()
 
     def test_filtered_posts_are_not_reported_as_no_posts(self):
         self.check_digest(True)
