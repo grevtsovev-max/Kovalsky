@@ -499,6 +499,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(content['previous_draft']['summary_ru'], 'Old draft')
         self.assertIn('required_fact_quotes', request.call_args.args[0]['instructions'])
 
+    def test_existing_retry_job_accepts_fresh_completion_without_unique_conflict(self):
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                item = self.item(920 + int(fails))
+                enqueue(self.db, None, item, self.source, self.options)
+                item_id = self.db.execute('SELECT item_id FROM items WHERE url=?', (item['url'],)).fetchone()[0]
+                enqueue(self.db, item_id, item, self.source, self.options, category='retry')
+                self.db.execute("UPDATE processing_jobs SET status='DONE',attempts=2 WHERE item_id=? AND category='retry'", (item_id,))
+                self.db.commit()
+                coordinator = Coordinator(self.db, self.config, {}, max_jobs=1)
+                self.addCleanup(coordinator.close)
+                job = coordinator._claim()
+                self.assertEqual(job['category'], 'fresh')
+                def finish():
+                    if fails:
+                        raise RuntimeError('transport failed')
+                    return 'WAITING_CONFIRMATION'
+                    yield
+                coordinator._advance(job, finish())
+                rows = self.db.execute('SELECT category,status,attempts FROM processing_jobs WHERE item_id=? ORDER BY category', (item_id,)).fetchall()
+                self.assertEqual([(r['category'], r['status']) for r in rows], [('fresh', 'SUPERSEDED'), ('retry', 'WAITING')])
+                self.assertEqual(rows[1]['attempts'], 2)
+                self.assertEqual(self.db.execute('SELECT count(*) FROM processing_job_events WHERE job_id=?', (job['job_id'],)).fetchone()[0], 2)
+                self.db.execute("UPDATE processing_jobs SET status='DONE' WHERE item_id=?", (item_id,))
+                self.db.commit()
+
     def test_local_coordinator_type_error_is_terminal_without_retry(self):
         enqueue(self.db, None, self.item(), self.source, self.options)
         counts = {}
