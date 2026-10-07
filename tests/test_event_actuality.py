@@ -31,3 +31,11 @@ class EventActualityTests(unittest.TestCase):
         quote = f'Банк запустил сервис {old.date().isoformat()}.'
         self.assertEqual(self.check(old.date().isoformat(), quote, now.isoformat())[0], 'stale')
         self.assertEqual(self.check(now.date().isoformat(), quote, now.isoformat())[0], 'unverified')
+
+    def test_dateline_month_accepts_sentence_period_but_numeric_date_keeps_year_boundary(self):
+        now = datetime.now(timezone.utc)
+        months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря']
+        quote = f'Москва. {now.day} {months[now.month-1]}. INTERFAX.RU - Банк внесён в реестр.'
+        self.assertIsNone(self.check(now.date().isoformat(), quote, now.isoformat()))
+        wrong_year = f"Банк внесён в реестр {now.strftime('%d.%m')}.1998."
+        self.assertEqual(self.check(now.date().isoformat(), wrong_year, now.isoformat())[0], 'unverified')
