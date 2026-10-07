@@ -149,7 +149,7 @@ def enqueue(db, item_id, item, source, options, *, category="fresh"):
         if item_id is None:
             return None
     revision = cache_key("material-version", {key: item.get(key) for key in (
-        "url", "title", "description", "content", "author", "published_at", "updated_at")})
+        "url", "title", "description", "content", "author", "published_at")})
     if item_id is not None:
         db.execute("UPDATE items SET ingest_revision=? WHERE item_id=? AND ingest_revision=''", (revision, item_id))
         revision = db.execute('SELECT ingest_revision FROM items WHERE item_id=?', (item_id,)).fetchone()[0]

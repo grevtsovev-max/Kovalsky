@@ -174,6 +174,29 @@ class PolicyV1Tests(unittest.TestCase):
             self.assertIsNone(backup.execute("SELECT value FROM app_state WHERE key='policy_v1_cutover'").fetchone())
         self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'STORE_ONLY')
 
+    def test_unchanged_article_modification_clock_does_not_reopen_or_reset(self):
+        from newsroom.core import _save_item
+        item = {'url': 'https://example.org/1', 'title': 'Банк получил лицензию',
+                'content': 'Банк получил лицензию на новую деятельность.',
+                'published_at': self.now.isoformat(), 'updated_at': '2026-10-07T10:00:00+00:00'}
+        item_id = _save_item(self.db, self.source, item)
+        self.db.execute("UPDATE items SET disposition='TECHNICAL_ERROR' WHERE item_id=?", (item_id,))
+        self.db.execute("INSERT INTO app_state VALUES(?,?)", (f'selection_retry:{item_id}', json.dumps({'attempts': 3})))
+        self.db.commit()
+        original = dict(self.db.execute('SELECT * FROM items WHERE item_id=?', (item_id,)).fetchone())
+        item['updated_at'] = '2026-10-07T11:00:00+00:00'
+        self.assertIsNone(_save_item(self.db, self.source, item))
+        latest = dict(self.db.execute('SELECT * FROM items WHERE item_id=?', (item_id,)).fetchone())
+        self.assertEqual(latest['ingest_revision'], original['ingest_revision'])
+        self.assertEqual(latest['disposition'], 'TECHNICAL_ERROR')
+        self.assertEqual(latest['updated_at'], item['updated_at'])
+        self.assertEqual(json.loads(self.db.execute('SELECT value FROM app_state WHERE key=?', (f'selection_retry:{item_id}',)).fetchone()[0])['attempts'], 3)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM item_revisions').fetchone()[0], 0)
+        item['content'] += ' Разрешение распространяется на юридических лиц.'
+        self.assertEqual(_save_item(self.db, self.source, item), item_id)
+        self.assertNotEqual(self.db.execute('SELECT ingest_revision FROM items WHERE item_id=?', (item_id,)).fetchone()[0], original['ingest_revision'])
+        self.assertEqual(self.db.execute('SELECT count(*) FROM item_revisions').fetchone()[0], 1)
+
     def test_modification_time_does_not_become_publication_date(self):
         self.stored()
         item = {'url': 'https://example.org/1', 'updated_at': self.now.isoformat()}

@@ -2116,7 +2116,7 @@ def _save_item(db, source, item, existing_item_id=None):
     now = NOW()
     from .runtime import cache_key
     ingest_revision = cache_key('material-version', {key: item.get(key) for key in (
-        'url', 'title', 'description', 'content', 'author', 'published_at', 'updated_at')})
+        'url', 'title', 'description', 'content', 'author', 'published_at')})
     canonical = canonicalize(item["url"])
     body = item.get("content") or item.get("description") or item["title"]
     content_hash, title_hash = digest(body), digest(item["title"].lower().strip())
@@ -2146,17 +2146,18 @@ def _save_item(db, source, item, existing_item_id=None):
                 same_metadata = (prior["title_hash"] == title_hash
                                  and prior["description"] == item.get("description", "")
                                  and prior["author"] == item.get("author")
-                                 and prior["published_at"] == item.get("published_at")
-                                 and prior["updated_at"] == item.get("updated_at"))
+                                 and prior["published_at"] == item.get("published_at"))
                 stored_feed_hash = prior["feed_content_hash"] if "feed_content_hash" in prior.keys() else ""
                 # `items.content` is enriched with fetched article text. Compare a
                 # feed poll to its own last-seen body so enrichment cannot reset retries.
                 unchanged = (prior['ingest_revision'] == ingest_revision or
                              same_metadata and (not stored_feed_hash or stored_feed_hash == feed_content_hash))
                 if unchanged:
-                    if not stored_feed_hash:
-                        db.execute("UPDATE items SET feed_content_hash=? WHERE item_id=?",
-                                   (feed_content_hash, prior["item_id"]))
+                    # A changed modification clock alone is metadata, not a new
+                    # article version or permission to reset bounded attempts.
+                    if not stored_feed_hash or prior['updated_at'] != item.get('updated_at'):
+                        db.execute("UPDATE items SET feed_content_hash=?,updated_at=? WHERE item_id=?",
+                                   (stored_feed_hash or feed_content_hash, item.get('updated_at'), prior['item_id']))
                         db.commit()
                     return None
                 item_id = prior["item_id"]
