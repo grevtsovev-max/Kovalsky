@@ -99,6 +99,9 @@ def verify(db, config, post, facts, *, now=None):
     anchor = json.loads(admission[0])['at'] if admission else row['discovered_at']
     accepted_at = datetime.fromisoformat(anchor.replace('Z', '+00:00'))
     now = now or datetime.now(timezone.utc)
+    from .policy import relative_date_words, requeue_changed_policy
+    if relative_date_words(post['text']):
+        requeue_changed_policy(db, config, post, reason='RELATIVE_DATE_REWRITE')
     if (now - accepted_at).total_seconds() <= 86400:
         return
     key = f"pre_send_source:{post['post_id']}:{facts['final_text_check']['assembled_sha256']}"

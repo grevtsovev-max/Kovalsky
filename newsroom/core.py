@@ -3062,6 +3062,9 @@ def _finish_post_steps(db, item, ai_settings, context):
             from .material_flow import save_draft_context
             save_draft_context(db, item_id, item, ai_settings, context)
         draft = {key: ai_result.get(key, '') for key in ('headline_ru', 'summary_ru', 'what_is_new', 'editorial_check')}
+        from .policy import absolute_narration_dates
+        for key in ('headline_ru', 'summary_ru', 'what_is_new'):
+            draft[key] = absolute_narration_dates(draft.get(key, ''), ai_options['_draft_contract']['dates'])
         from .runtime import cache_key
         # Final validation checks freely written text; it does not repeat selection.
         from .ai import validate_draft
@@ -3075,6 +3078,9 @@ def _finish_post_steps(db, item, ai_settings, context):
                 'policy': __import__('newsroom.policy', fromlist=['snapshot']).snapshot(ai_options)})
             checked = yield Work('editor', validate_draft, (ai_result, draft_source, draft, ai_options),
                                  key=check_key, ttl=21600, stage='verification')
+            from .policy import relative_date_words
+            if relative_date_words(text_to_check):
+                checked['issues'].append('Относительная дата без подтверждённой даты источника: укажи проверяемый абсолютный срок или изложи событие без придуманного календарного дня.')
             from .knowledge import validate_post_bindings
             bindings = validate_post_bindings(checked, material_ids, text_to_check)
         except Exception as exc:

@@ -171,6 +171,31 @@ DRAFTING = (
 )
 
 
+def relative_date_words(text):
+    """Find calendar-relative words in narration, preserving quoted source text."""
+    unquoted = re.sub(r'«[^»]*»|“[^”]*”|"[^"\n]*"', '', text)
+    return re.findall(r'\b(?:сегодня|вчера|позавчера|завтра|послезавтра)\b', unquoted, re.I)
+
+
+def absolute_narration_dates(text, dates):
+    """Resolve narration against the read publication; never guess from receipt."""
+    from datetime import date, timedelta
+    anchor = dates.get('source_calendar_day')
+    if not anchor:
+        return text
+    day = date.fromisoformat(anchor)
+    months = ('января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+              'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря')
+    offsets = {'сегодня': 0, 'вчера': -1, 'позавчера': -2, 'завтра': 1, 'послезавтра': 2}
+    def replace(match):
+        value = day + timedelta(days=offsets[match[0].lower()])
+        return f'{value.day} {months[value.month-1]} {value.year} года'
+    segments = re.split(r'(«[^»]*»|“[^”]*”|"[^"\n]*")', text)
+    return ''.join(segment if index % 2 else re.sub(
+        r'\b(?:сегодня|вчера|позавчера|завтра|послезавтра)\b', replace, segment, flags=re.I)
+        for index, segment in enumerate(segments))
+
+
 def date_context(item, citation, source):
     """Keep the read publication's clock distinct from discovery and event dates."""
     from datetime import datetime
@@ -258,7 +283,7 @@ def admission(db, item_id, item, source, hours, initial_minutes=None, *, after_r
     return None
 
 
-def requeue_changed_policy(db, config, post):
+def requeue_changed_policy(db, config, post, *, reason="POLICY_CHANGED"):
     """Revisit only an unsent draft; never reopen a completed/uncertain send."""
     from .core import _saved_material
     from .workflow import enqueue
@@ -274,7 +299,12 @@ def requeue_changed_policy(db, config, post):
             raise ValueError('POLICY_REQUEUE_MATERIAL_MISSING')
         source = db.execute('SELECT * FROM sources WHERE source_id=?', (row['source_id'],)).fetchone()
         item = _saved_material(row, source)
-        db.execute("UPDATE posts SET status='SUPERSEDED',editor_decision='POLICY_CHANGED' WHERE post_id=? AND status='PENDING'", (post['post_id'],))
+        if reason == 'RELATIVE_DATE_REWRITE':
+            for artifact in db.execute("SELECT dependency,result_json FROM material_stage_results WHERE item_id=? AND revision=? AND stage='analysis'", (row['item_id'], row['ingest_revision'])).fetchall():
+                context = json.loads(artifact['result_json'])
+                context['_draft_policy_signature'] = None
+                db.execute("UPDATE material_stage_results SET result_json=? WHERE item_id=? AND revision=? AND stage='analysis' AND dependency=?", (json.dumps(context, ensure_ascii=False), row['item_id'], row['ingest_revision'], artifact['dependency']))
+        db.execute("UPDATE posts SET status='SUPERSEDED',editor_decision=? WHERE post_id=? AND status='PENDING'", (reason, post['post_id']))
         db.execute("UPDATE items SET disposition='PENDING' WHERE item_id=?", (row['item_id'],))
         settings = config.get('newsroom', {})
         enqueue(db, row['item_id'], item, source, {'threshold': settings.get('similarity_threshold', .35),
@@ -282,4 +312,4 @@ def requeue_changed_policy(db, config, post):
             'initial_backfill_minutes': None, 'relevance_terms': []}, category='retry')
     except Exception:
         db.rollback(); raise
-    raise SourceUpdateRequired('POLICY_CHANGED')
+    raise SourceUpdateRequired(reason)

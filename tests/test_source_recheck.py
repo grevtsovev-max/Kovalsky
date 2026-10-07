@@ -33,6 +33,32 @@ class SourceRecheckTests(unittest.TestCase):
         state['at'] = (datetime.now(timezone.utc)-timedelta(hours=25)).isoformat()
         self.db.execute('UPDATE app_state SET value=? WHERE key=?', (json.dumps(state), self.key)); self.db.commit()
 
+    def test_relative_narration_requeues_only_draft_before_any_read_or_send(self):
+        self.db.execute("UPDATE posts SET text=? WHERE post_id=?", ('🇷🇺 Банк сообщил\n\nВчера банк получил разрешение.', self.post['post_id']))
+        self.db.commit()
+        post = self.db.execute('SELECT * FROM posts').fetchone()
+        with patch('newsroom.core.fetch_publisher_article') as read:
+            with self.assertRaisesRegex(SourceUpdateRequired, 'RELATIVE_DATE_REWRITE'):
+                verify(self.db, self.config, post, self.facts)
+        read.assert_not_called()
+        self.assertEqual(self.db.execute('SELECT status FROM posts').fetchone()[0], 'SUPERSEDED')
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM publication_attempts').fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM processing_jobs WHERE status='PENDING'").fetchone()[0], 1)
+        from newsroom.material_flow import load_draft_context
+        from newsroom.core import _saved_material
+        source = self.db.execute('SELECT * FROM sources').fetchone()
+        context = load_draft_context(self.db, self.row['item_id'], _saved_material(self.row, source), self.config['ai'])
+        self.assertIsNotNone(context)
+        self.assertTrue(context['ai_result']['_needs_post_draft'])
+
+    def test_absolute_dates_preserve_quotes_and_use_source_day_across_year(self):
+        from newsroom.policy import absolute_narration_dates, relative_date_words
+        text = 'Вчера банк заявил: «Сегодня начинаем». Завтра откроется доступ.'
+        result = absolute_narration_dates(text, {'source_calendar_day': '2026-01-01'})
+        self.assertEqual(result, '31 декабря 2025 года банк заявил: «Сегодня начинаем». 2 января 2026 года откроется доступ.')
+        self.assertEqual(relative_date_words(result), [])
+        self.assertEqual(absolute_narration_dates(text, {}), text)
+
     def test_fresh_post_does_not_repeat_source_reading(self):
         with patch('newsroom.core.fetch_publisher_article') as read:
             verify(self.db, self.config, self.post, self.facts)
