@@ -401,9 +401,11 @@ def is_eligible_for_auto_publish(post, cutoff: str, thematic=None) -> bool:
     if thematic is not None:
         proof = facts.get('topic_registry') or {}
         match = proof.get('match') or {}
+        from .topic_registry import public_activity_allowed
         topical = (proof.get('checked') is True and proof.get('version') == thematic.get('version')
                    and match.get('name') in {t['name'] for t in thematic.get('topics',[])}
-                   and len(str(match.get('evidence') or '').strip()) >= 24)
+                   and len(str(match.get('evidence') or '').strip()) >= 24
+                   and public_activity_allowed(match, thematic))
     else:
         topical = (facts.get('geographic_scope') in {'RUSSIA','CIS','RUSSIA_CIS'}
                    and facts.get('russia_cis_impact') == 'DIRECT'

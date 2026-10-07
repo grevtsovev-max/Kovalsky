@@ -27,6 +27,7 @@ SNAPSHOT = 'topic_registry_snapshot'
 ATTEMPT = 'topic_registry_attempt'
 ERROR = 'topic_registry_error'
 LEARNING = 'topic_registry_learning'
+PUBLIC_ACTIVITY = 'Публичные активности брендов и лиц'
 HEADERS = {
     'Темы': ['Тема', 'Что отслеживать', 'Мониторинг'],
     'Ключевые слова': ['Тема', 'Слово или фраза', 'Мониторинг'],
@@ -47,6 +48,12 @@ MATCHING = ('Темы, исключения и география определ
             'is_relevant означает соответствие включённой теме с учётом её условий, '
             'включённых исключений и географии. Пустой список тем означает отсутствие тем мониторинга. '
             'Категория, география и стадия описывают факты и не являются самостоятельными списками запретов. '
+            'Для публичных активностей заполни subject_type (PERSON, BRAND, OTHER, UNKNOWN), subject_name, crypto_related и crypto_evidence в topic_match. '
+            'Исключение без криптотемы разрешено только людям из people. Главный предмет новости должен быть самим человеком; '
+            'цитата сотрудника о продукте или работе компании остаётся новостью бренда (BRAND). '
+            'Для бренда нужны его название и хотя бы один дополнительный тематический ключ из activity_keywords; второй необязателен. '
+            'crypto_related=true только когда главный повод реально связан с криптотемой, а не просто со словом форум, интервью или инвестиции. '
+            'Кроме словесного совпадения нужна реальная связь с криптотемой; crypto_evidence — выдержка об этой связи, не о цифровизации вообще. '
             'Не выдумывай влияние на рынок ради допуска. Требования чтения, атрибуции, новизны '
             'и достоверности остаются обязательными.')
 
@@ -125,7 +132,20 @@ def policy(snapshot, entities=()):
     sections = snapshot.get('sections', {})
     topics = [r for r in sections.get('Темы', []) if r['enabled']]
     names = {r['title'] for r in topics}
+    people, organizations = [], []
+    for entity in entities:
+        if not entity.get('enabled', True):
+            continue
+        name = re.sub(r'\s*\((?:RSS|Telegram)\)\s*$', '', entity['name'], flags=re.I)
+        target = people if entity.get('section') == 'Лица' else organizations
+        target.extend(alias.strip() for alias in re.split(r'\s+/\s+', name) if alias.strip())
+    entity_names = {normalize(name) for name in people + organizations}
+    activity_keywords = list(dict.fromkeys(r['description'] for r in sections.get('Ключевые слова', [])
+        if r['enabled'] and r['title'] in names and r['title'] != PUBLIC_ACTIVITY
+        and normalize(r['description']) not in entity_names))
     return {'version': snapshot.get('version'),
+            'people': list(dict.fromkeys(people)), 'organizations': list(dict.fromkeys(organizations)),
+            'activity_keywords': activity_keywords,
             'topics': [{'name': r['title'], 'scope': r['description']} for r in topics],
             'keywords': [{'topic': r['title'], 'concept': r['description']} for r in sections.get('Ключевые слова', []) if r['enabled'] and r['title'] in names],
             'exclusions': [{'name': r['title'], 'scope': r['description']} for r in sections.get('Исключения', []) if r['enabled']],
@@ -144,6 +164,10 @@ def apply_snapshot(config, snapshot, entities=()):
         'version': snapshot.get('version'),
         'keywords': [r['description'] for r in snapshot.get('sections', {}).get('Ключевые слова', []) if r['enabled']],
     }
+    if entities:
+        config['ai']['_keyword_prefilter'].update(
+            brands=thematic['organizations'], people=thematic['people'],
+            topic_keywords=thematic['activity_keywords'])
     config.setdefault('newsroom', {})['relevance_terms'] = []
     for source in config.get('sources', []):
         source.pop('interest_exclusions', None)
@@ -479,6 +503,44 @@ def grounded_match(result, thematic, source):
     if actual is None:
         return False
     match['evidence'] = actual
+    return public_activity_allowed(match, thematic, source)
+
+
+def public_activity_allowed(match, thematic, source=None):
+    """Owner rule: person exception, otherwise brand + a separate topic keyword."""
+    if match.get('name') != PUBLIC_ACTIVITY:
+        return True
+    from .keyword_filter import match as keyword_match
+    subject = match.get('subject_name')
+    if not isinstance(subject, str) or not subject.strip():
+        return False
+    kind = match.get('subject_type')
+    people = {normalize(name) for name in thematic.get('people', [])}
+    organizations = {normalize(name) for name in thematic.get('organizations', [])}
+    name = normalize(subject)
+    if kind == 'PERSON':
+        if name not in people or name in organizations:
+            return False
+        return source is None or bool(keyword_match(source.get('content', ''), [subject]))
+    if kind != 'BRAND' or name not in organizations or match.get('crypto_related') is not True:
+        return False
+    evidence = match.get('crypto_evidence')
+    if not isinstance(evidence, str) or len(evidence.strip()) < 24:
+        return False
+    # A brand/another entity name cannot serve as the extra thematic keyword.
+    keywords = [word for word in thematic.get('activity_keywords', [])
+                if normalize(word) not in organizations | people]
+    if not keyword_match(evidence, keywords):
+        return False
+    if source is not None:
+        from .knowledge import grounded_span
+        text = source.get('content', '')
+        if not isinstance(text, str) or not keyword_match(text, [subject]):
+            return False
+        actual = grounded_span(evidence, text, min_length=24)
+        if actual is None:
+            return False
+        match['crypto_evidence'] = actual
     return True
 
 

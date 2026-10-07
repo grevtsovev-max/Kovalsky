@@ -250,7 +250,10 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
         request_data['instructions'] += '\n' + MATCHING
         schema = copy.deepcopy(SCHEMA)
         schema['properties']['topic_match'] = {'type':'object','additionalProperties':False,
-            'properties':{'name':{'type':'string'},'evidence':{'type':'string'}},'required':['name','evidence']}
+            'properties':{'name':{'type':'string'},'evidence':{'type':'string'},
+                          'subject_type':{'type':'string','enum':['PERSON','BRAND','OTHER','UNKNOWN']},
+                          'subject_name':{'type':'string'},'crypto_related':{'type':'boolean'},'crypto_evidence':{'type':'string'}},
+            'required':['name','evidence','subject_type','subject_name','crypto_related','crypto_evidence']}
         schema['required'].append('topic_match')
         request_data['text']['format']['schema'] = schema
     if settings.get("memory_mode") in {"shadow", "enforce"}:

@@ -53,6 +53,17 @@ def match(text, keywords):
     return None
 
 
+def evaluate(text, spec):
+    keyword = match(text, spec.get('keywords') or [])
+    brand = match(text, spec.get('brands') or [])
+    person = match(text, spec.get('people') or [])
+    topic_keyword = match(text, spec.get('topic_keywords') or []) if brand else None
+    brand_only = bool(brand and not person and not topic_keyword)
+    return {'matched_keyword': keyword, 'matched_brand': brand,
+            'matched_topic_keyword': topic_keyword, 'brand_only': brand_only,
+            'passed': bool(keyword) and not brand_only}
+
+
 def screen(db, item_id, item, settings):
     from .material_flow import mark, put
     from .runtime import cache_key, stamp
@@ -63,19 +74,22 @@ def screen(db, item_id, item, settings):
     text = '\n'.join(str(item.get(field) or '') for field in ('title', 'description', 'content'))
     dependency = cache_key('keyword-prefilter-v1', {'text': text, 'keywords': spec})
     mark(db, item_id, 'screening', 'RUNNING', 'Фильтр ключевых слов и словоформ; без ИИ.')
-    keyword = match(text, keywords) if keywords else None
-    result = {'kind': 'keyword_prefilter', 'version': spec.get('version'),
-              'matched_keyword': keyword, 'passed': bool(keyword)}
+    result = {'kind': 'keyword_prefilter', 'version': spec.get('version'), **evaluate(text, spec)}
+    keyword = result['matched_keyword']
     put(db, item_id, 'screening', dependency, result)
-    if keyword:
-        mark(db, item_id, 'screening', 'DONE', 'Первый фильтр пройден: ' + keyword)
+    if result['passed']:
+        label = (result['matched_brand'] + ' + ' + result['matched_topic_keyword']
+                 if result['matched_brand'] and result['matched_topic_keyword'] else keyword)
+        mark(db, item_id, 'screening', 'DONE', 'Первый фильтр пройден: ' + label)
         db.commit()
         return None
     if not keywords:
         outcome, reason = 'TECHNICAL_ERROR', 'Нет включённых ключевых слов в таблице; требуется исправить настройку.'
         mark(db, item_id, 'screening', 'ERROR', reason, block_kind='technical')
     else:
-        outcome, reason = 'NOISE', 'Первый фильтр не пройден: в заголовке и доступном тексте нет ключевых слов или их словоформ.'
+        outcome = 'NOISE'
+        reason = ('Первый фильтр не пройден: найден бренд ' + result['matched_brand'] + ', но нет дополнительного тематического ключевика.'
+                  if result['brand_only'] else 'Первый фильтр не пройден: в заголовке и доступном тексте нет ключевых слов или их словоформ.')
         mark(db, item_id, 'screening', 'CLOSED', reason)
     item['_retry_reason'] = reason
     db.execute('UPDATE items SET disposition=?,processed_at=? WHERE item_id=?', (outcome, stamp(), item_id))
