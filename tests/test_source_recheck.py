@@ -46,6 +46,28 @@ class SourceRecheckTests(unittest.TestCase):
         read.assert_called_once(); check.assert_not_called()
         self.assertEqual(self.db.execute('SELECT status FROM posts').fetchone()[0], 'PENDING')
 
+    def test_format_revision_reuses_unchanged_source_refresh(self):
+        self.age()
+        changed_facts = {**self.facts, 'final_text_check': {
+            **self.facts['final_text_check'], 'assembled_sha256': 'another-draft-seal'}}
+        with patch('newsroom.core.fetch_publisher_article', return_value=self.current) as read, patch('newsroom.ai.validate_draft') as check:
+            verify(self.db, self.config, self.post, self.facts)
+            verify(self.db, self.config, self.post, changed_facts)
+        read.assert_called_once()
+        check.assert_not_called()
+
+    def test_new_draft_rechecks_changed_source_from_saved_refresh(self):
+        self.age()
+        current = {**self.current, 'content': self.original + '\nСправочное уточнение.'}
+        checked = {'issues': [], 'covered_claims': [], 'editorial_check': self.facts['editorial_check']}
+        changed_facts = {**self.facts, 'final_text_check': {
+            **self.facts['final_text_check'], 'assembled_sha256': 'another-draft-seal'}}
+        with patch('newsroom.core.fetch_publisher_article', return_value=current) as read, patch('newsroom.ai.validate_draft', return_value=checked) as check:
+            verify(self.db, self.config, self.post, self.facts)
+            verify(self.db, self.config, self.post, changed_facts)
+        read.assert_called_once()
+        self.assertEqual(check.call_count, 2)
+
     def test_second_executor_waits_for_the_same_source_check(self):
         from newsroom.db import connect
         self.age()

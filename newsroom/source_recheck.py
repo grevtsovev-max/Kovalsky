@@ -120,26 +120,31 @@ def verify(db, config, post, facts, *, now=None):
     original = citation.get('content') or saved_primary.get('content')
     if not original:
         raise DeliveryRejected('SAVED_READ_SOURCE_MISSING')
+    import hashlib
+    read_key = (f"pre_send_source_read:{row['item_id']}:{row['ingest_revision']}:"
+                + hashlib.sha256(citation['url'].encode()).hexdigest())
     if 'current' not in state:
-        claimed = _claim_read(db, key, now)
-        if claimed and claimed.get('status') in {'UNCHANGED', 'SUPPORTED', 'UNAVAILABLE'}:
+        claimed = _claim_read(db, read_key, now)
+        if claimed and claimed.get('status') in {'UNCHANGED', 'UNAVAILABLE'}:
             return
-        if claimed:
-            state = claimed
+        if claimed and claimed.get('current'):
+            state = {**state, 'current': claimed['current']}
+            _save(db, key, state)
     if 'current' not in state:
         try:
             current = fetch_publisher_article(citation['url'], citation.get('publisher') or '',
                 citation.get('published_at'), discover_primary=False, timeout=20, public_only=True)
         except (TimeoutError, OSError, ValueError) as exc:
-            _save(db, key, {'status': 'UNAVAILABLE', 'at': now.isoformat(), 'error': type(exc).__name__})
+            _save(db, read_key, {'status': 'UNAVAILABLE', 'at': now.isoformat(), 'error': type(exc).__name__})
             return
         if current.get('material_read') is not True or not str(current.get('content') or '').strip():
-            _save(db, key, {'status': 'UNAVAILABLE', 'at': now.isoformat()})
+            _save(db, read_key, {'status': 'UNAVAILABLE', 'at': now.isoformat()})
             return
         if norm(current['content']) == norm(original):
-            _save(db, key, {'status': 'UNCHANGED', 'at': now.isoformat()})
+            _save(db, read_key, {'status': 'UNCHANGED', 'at': now.isoformat()})
             return
         state = {'status': 'CHECKING_CHANGE', 'at': now.isoformat(), 'current': current}
+        _save(db, read_key, {'status': 'READ_CHANGED', 'at': now.isoformat(), 'current': current})
         _save(db, key, state)
     current = state['current']
     headline, _, body = post['text'].partition('\n\n')
