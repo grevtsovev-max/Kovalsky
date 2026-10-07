@@ -266,7 +266,9 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
             "ORDER BY a.created_at DESC LIMIT 1), '') AS geographic_scope, "
             "COALESCE(json_extract(p.fact_check_result,'$.test_publication'),0) AS test_publication "
             "FROM posts p LEFT JOIN stories s USING(story_id) "
-            "WHERE p.status='PUBLISHED' AND p.published_at>? AND p.published_at<=?",
+            "WHERE p.status='PUBLISHED' AND p.published_at>? AND p.published_at<=? "
+            "AND NOT EXISTS(SELECT 1 FROM publication_attempts d WHERE d.post_id=p.post_id "
+            "AND d.status IN ('SENDING','UNKNOWN'))",
             (cutoff, now.isoformat(timespec="seconds")),
         ).fetchall()
         rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
@@ -283,9 +285,7 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
         for row in rows:
             post_text = row["text"] or ""
             headline = post_text.splitlines()[0].strip() if post_text.splitlines() else "Новость"
-            if row["test_publication"] or ("_topic_registry" not in config.get("ai",{}) and row["geographic_scope"] in {"OTHER", "GLOBAL"}):
-                continue
-            if "_topic_registry" not in config.get("ai",{}) and re.search(r"(?i)\b(США|американ\w*|ФРС|SEC|Евросоюз|ЕС|Великобритани\w*|британск\w*)\b", headline):
+            if row["test_publication"]:
                 continue
             headline = re.sub(r"\*\*(.*?)\*\*", r"\1", headline)
             from .core import _limit_headline
