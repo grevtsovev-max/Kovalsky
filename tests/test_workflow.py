@@ -634,6 +634,20 @@ class WorkflowTests(unittest.TestCase):
             process_item(self.db, self.source, self.item(), **self.options, ai_settings=self.config['ai'], existing_item_id=item_id)
             self.assertEqual(analyze.call_count, 2)
 
+    def test_api_concurrency_wait_releases_stage_worker(self):
+        from newsroom.workflow import StageExecutor
+        executor = StageExecutor(1)
+        try:
+            blocked = Work('collector', Mock(side_effect=BudgetDeferred('concurrency', 1)))
+            first = executor.submit(blocked.execute, None, {})
+            with self.assertRaises(BudgetDeferred):
+                first.result(timeout=1)
+            ready = Work('collector', Mock(return_value={'content': 'Read', 'material_read': True}))
+            second = executor.submit(ready.execute, None, {})
+            self.assertEqual(second.result(timeout=1)['content'], 'Read')
+        finally:
+            executor.shutdown()
+
     def test_short_read_material_is_cached_but_snippet_is_not(self):
         from newsroom.workflow import readable_result
         read = {'content': 'Банк получил лицензию.', 'material_read': True}

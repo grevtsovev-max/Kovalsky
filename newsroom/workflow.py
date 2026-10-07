@@ -197,16 +197,17 @@ class StageExecutor:
                         if scope.get('revision') is None or revision(db, scope['item_id']) == scope['revision']:
                             mark(db, scope['item_id'], stage, status, reason, **details)
             from .runtime import BudgetDeferred
-            while not self.stopping.is_set():
-                try:
-                    record('RUNNING')
-                    return function(*args)
-                except BudgetDeferred as exc:
-                    if exc.reason != 'concurrency':
-                        raise
-                    record('READY', 'Ожидает свободного места API.', block_kind='capacity')
-                    self.stopping.wait(.5)
-            raise BudgetDeferred('shutdown', 1)
+            if self.stopping.is_set():
+                raise BudgetDeferred('shutdown', 1)
+            try:
+                record('RUNNING')
+                return function(*args)
+            except BudgetDeferred as exc:
+                record('WAITING', exc.user_reason, block_kind=exc.block_kind,
+                       next_at=(datetime.now(timezone.utc) + timedelta(seconds=exc.delay_seconds)).isoformat())
+                # The coordinator persists the wait. Never hold a worker in a
+                # polling loop while another material could use its stage.
+                raise
         return self.pools[stage].submit(invoke)
 
     def shutdown(self, wait=True):
