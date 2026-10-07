@@ -42,6 +42,32 @@ class KnowledgeTests(unittest.TestCase):
         bind_post(self.db,post_id,item_id,diff,text)
         return post_id,text
 
+    def test_supplement_requires_same_event_not_only_same_story(self):
+        from newsroom.knowledge import latest_published_event_post
+        first = self.add(1)
+        post_id, _ = self.post(first)
+        self.db.execute("UPDATE posts SET published_at=datetime('now') WHERE post_id=?", (post_id,))
+        self.assertEqual(latest_published_event_post(self.db, 1, first['event_id'], 24)['post_id'], post_id)
+        other = memory('декабрь')
+        other['memory']['event']['subject'] = 'Другой участник'
+        second = self.add(2, other)
+        self.assertIsNone(latest_published_event_post(self.db, 1, second['event_id'], 24))
+        self.db.execute("UPDATE posts SET status='REJECTED' WHERE post_id=?", (post_id,))
+        self.assertIsNone(latest_published_event_post(self.db, 1, first['event_id'], 24))
+
+    def test_draft_quote_alternative_requires_same_claim_and_actual_source_span(self):
+        from newsroom.knowledge import draft_post_claims
+        result = memory()
+        diff = self.add(1, result)
+        original = result['memory']['claims'][0]['post_quote']
+        result['memory']['claims'][0]['post_quote'] = 'Пересказчик сообщает: ' + original
+        diff['post_claims'][0]['post_quote'] = result['memory']['claims'][0]['post_quote']
+        options = draft_post_claims(result['memory'], diff, {'content': original})
+        self.assertIn({'fact_id': 1, 'post_quote': original}, options)
+        self.assertEqual(draft_post_claims(result['memory'], diff, {'content': 'Другой текст'}), diff['post_claims'])
+        result['memory']['claims'][0]['post_quote'] = 'Несвязанный фрагмент'
+        self.assertEqual(draft_post_claims(result['memory'], diff, {'content': original}), diff['post_claims'])
+
     def test_three_articles_share_event_and_multiple_evidence(self):
         first=self.add(1);self.post(first)
         for i in (2,3):

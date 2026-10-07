@@ -2953,12 +2953,9 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                   and memory_diff.get('material_unpublished_facts')
                   and (primary_source or publisher_report)):
                 correction_owner = str(ai_settings.get("_correction_owner_chat_id") or "")
-                prior_post = db.execute(
-                    "SELECT post_id FROM posts WHERE story_id=? AND status='PUBLISHED' "
-                    "AND julianday(published_at)>=julianday('now',?) "
-                    "ORDER BY published_at DESC,post_id DESC LIMIT 1",
-                    (story_id, f"-{int(freshness_hours)} hours"),
-                ).fetchone()
+                from .knowledge import latest_published_event_post
+                prior_post = latest_published_event_post(
+                    db, story_id, memory_diff['event_id'], freshness_hours)
                 if correction_owner and prior_post:
                     from .review import enqueue_agent_fact_correction
                     correction_id = enqueue_agent_fact_correction(
@@ -3054,6 +3051,10 @@ def _finish_post_steps(db, item, ai_settings, context):
     publisher_name = context['publisher_name']
     memory_mode = context['memory_mode']
     memory_diff = context['memory_diff']
+    if memory_diff:
+        from .knowledge import draft_post_claims
+        memory_diff = {**memory_diff, 'post_claims': draft_post_claims(
+            (ai_result or {}).get('memory'), memory_diff, primary_source or publisher_report)}
     memory_enforced = context['memory_enforced']
     story_id = context['story_id']
     best = context['best']
