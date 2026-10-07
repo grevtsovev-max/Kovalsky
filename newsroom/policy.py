@@ -121,8 +121,11 @@ def activate(path):
     from datetime import datetime, timezone
     from .db import connect
     path = Path(path).expanduser().resolve()
-    with closing(connect(str(path))) as db:
-        if db.execute("SELECT 1 FROM app_state WHERE key='policy_v1_cutover'").fetchone():
+    # Opening through db.connect runs schema migrations. Back up the untouched
+    # database first, through a read-only connection, including any WAL content.
+    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as original:
+        has_state = original.execute("SELECT 1 FROM sqlite_master WHERE name='app_state'").fetchone()
+        if has_state and original.execute("SELECT 1 FROM app_state WHERE key='policy_v1_cutover'").fetchone():
             return False
         backup_dir = path.parent / 'policy-backups'
         backup_dir.mkdir(mode=0o700, exist_ok=True)
@@ -131,9 +134,10 @@ def activate(path):
         fd = os.open(backup_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
         with closing(sqlite3.connect(backup_path)) as backup:
-            db.backup(backup)
+            original.backup(backup)
             if backup.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                 raise RuntimeError('POLICY_BACKUP_INTEGRITY')
+    with closing(connect(str(path))) as db:
         db.execute('BEGIN IMMEDIATE')
         changed = cutover(db)
         db.commit()

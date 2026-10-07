@@ -174,6 +174,26 @@ class PolicyV1Tests(unittest.TestCase):
             self.assertIsNone(backup.execute("SELECT value FROM app_state WHERE key='policy_v1_cutover'").fetchone())
         self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'STORE_ONLY')
 
+    def test_policy_backup_precedes_schema_migration(self):
+        import sqlite3
+        self.stored()
+        with patch('newsroom.db.connect', side_effect=RuntimeError('migration failed')):
+            with self.assertRaisesRegex(RuntimeError, 'migration failed'):
+                policy.activate(self.path)
+        backups = list((Path(self.path).parent / 'policy-backups').glob('*.sqlite3'))
+        self.assertEqual(len(backups), 1)
+        with sqlite3.connect(backups[0]) as backup:
+            self.assertEqual(backup.execute('SELECT count(*) FROM items').fetchone()[0], 1)
+            self.assertIsNone(backup.execute("SELECT value FROM app_state WHERE key='policy_v1_cutover'").fetchone())
+        self.assertIsNone(self.db.execute("SELECT value FROM app_state WHERE key='policy_v1_cutover'").fetchone())
+
+    def test_activation_does_not_create_a_database_at_a_wrong_path(self):
+        import sqlite3
+        missing = Path(self.tmp.name) / 'missing.sqlite3'
+        with self.assertRaises(sqlite3.OperationalError):
+            policy.activate(missing)
+        self.assertFalse(missing.exists())
+
     def test_style_amendment_redrafts_without_repeating_reading_or_analysis(self):
         from newsroom.material_flow import save_draft_context, load_draft_context
         self.stored()
