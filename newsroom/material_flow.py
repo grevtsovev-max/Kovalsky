@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 from .runtime import cache_key, stamp
 
 STAGES = ('intake', 'screening', 'reading', 'analysis', 'drafting', 'gate', 'delivery')
-LABELS = dict(zip(STAGES, ('Приём', 'Предварительный отбор', 'Чтение материала',
-                         'Анализ события', 'Написание', 'Допуск', 'Отправка')))
+LABELS = dict(zip(STAGES, ('Приём', 'Тематический фильтр', 'Чтение материала',
+                         'Факты и черновик', 'Оформление или исправление поста',
+                         'Проверка текста', 'Отправка и квитанция')))
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS material_stage_results (
  item_id INTEGER NOT NULL REFERENCES items(item_id), revision TEXT NOT NULL,
