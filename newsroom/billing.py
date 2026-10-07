@@ -11,14 +11,14 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlencode
 
-from .resources import snapshot
+from .resources import snapshot, counter_start
 
 _LOCK = threading.Lock()
 COSTS_URL = 'https://api.openai.com/v1/organization/costs'
 TASKS = {
     'discovery_search': 'Поиск новостей и источников', 'recovery_search': 'Поиск новостей и источников',
-    'research_agent': 'Поиск новостей и источников', 'triage': 'Отбор новостей',
-    'editorial': 'Подготовка публикаций', 'correction': 'Исправление публикаций',
+    'research_agent': 'Поиск новостей и источников', 'triage': 'Прежний ИИ-отбор',
+    'editorial': 'Разбор ИИ', 'correction': 'Исправление публикаций',
     'interest_learning': 'Обучение на редакторских сигналах',
     'archive_memory': 'Разбор архива', 'weekly_analysis': 'Недельная аналитика',
     'regulatory_search': 'Нормативные документы', 'regulatory_relations': 'Нормативные документы',
@@ -152,8 +152,10 @@ def fetch_costs(settings, begin, stop, key):
 
 
 def sync(db, config, period='month', start=None, end=None, now=None):
-    begin, stop = period_range(period, now, start, end)
+    begin, stop = (counter_start(db), now or _now()) if period == 'counter' else period_range(period, now, start, end)
     settings = config.get('billing', {})
+    if period == 'counter':
+        return {'ok': False, 'code': 'PARTIAL_DAY_PERIOD', 'message': 'Для сверки OpenAI выберите полный календарный период: новый отсчёт начался внутри дня.'}
     key = _admin_key(settings)
     if not key:
         return {'ok': False, 'code': 'ADMIN_KEY_MISSING', 'message': 'Автосверка не подключена: на сервере нужен отдельный Admin API key OpenAI.'}
@@ -177,13 +179,13 @@ def sync(db, config, period='month', start=None, end=None, now=None):
 
 
 def spending(db, config, period='month', start=None, end=None, now=None):
-    begin, stop = period_range(period, now, start, end)
+    begin, stop = (counter_start(db), now or _now()) if period == 'counter' else period_range(period, now, start, end)
     settings = config.get('billing', {})
-    actual = _state(db, _cache_key(begin, stop, settings))
+    actual = None if period == 'counter' else _state(db, _cache_key(begin, stop, settings))
     owner = _state(db, 'billing_owner_report')
     # A reported total with another/unknown period stays separate. It cannot
     # silently become the amount for the selected period or for one material.
-    owner_matches = bool(owner and owner.get('start') == begin.isoformat() and owner.get('end')
+    owner_matches = bool(period != 'counter' and owner and owner.get('start') == begin.isoformat() and owner.get('end')
                          and datetime.fromisoformat(owner['end']).date() == stop.date())
     if not actual and owner_matches:
         actual = owner

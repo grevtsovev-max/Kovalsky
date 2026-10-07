@@ -41,6 +41,16 @@ class ResourceTests(unittest.TestCase):
                                   'input_tokens_details': {'cached_tokens': 400},
                                   'output_tokens_details': {'reasoning_tokens': 150}}, 'output': []}
 
+    def test_local_keyword_filter_records_time_without_model_cost(self):
+        with self.runtime.measure('keyword_filter', 'filter'):
+            pass
+        report = snapshot(self.db, self.config)
+        stage = next(s for s in report['stages'] if s['stage'] == 'keyword_filter')
+        self.assertEqual(stage['operations'], 1)
+        self.assertEqual(stage['calls'], 0)
+        self.assertGreaterEqual(stage['operation_seconds'], 0)
+        self.assertIn('без ИИ', stage['label'])
+
     def call(self, stage='editorial', receipt=None, item_id=None):
         token = SCOPE.set({'item_id': item_id, 'stage': stage, 'role': 'editor'})
         try:

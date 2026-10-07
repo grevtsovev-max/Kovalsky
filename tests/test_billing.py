@@ -49,6 +49,23 @@ class BillingTests(unittest.TestCase):
                           'results': [{'amount': {'value': value, 'currency': 'usd'}, 'line_item': item}
                                       for item,value in values]}], 'has_more': more, 'next_page': cursor}).encode())
 
+    def test_counter_period_excludes_old_calls_without_resetting_ledger(self):
+        begin = self.now - timedelta(hours=1)
+        self.db.execute("UPDATE app_state SET value=? WHERE key='pipeline_counter_epoch_v2'",
+                        (json.dumps({'started_at': begin.isoformat(), 'after_item_id': 0}),))
+        self.receipt('editorial')
+        self.receipt('triage')
+        self.db.execute("UPDATE api_usage SET created_at=? WHERE stage='triage'",
+                        ((begin-timedelta(seconds=1)).isoformat(),))
+        self.db.commit()
+        report = spending(self.db, self.config, period='counter', now=self.now)
+        self.assertEqual(report['start'], begin.isoformat())
+        self.assertEqual(report['local']['calls'], 1)
+        self.assertEqual(report['tasks'][0]['name'], 'Разбор ИИ')
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM api_usage').fetchone()[0], 2)
+        self.assertIsNone(report['actual'])
+        self.assertEqual(sync(self.db, self.config, period='counter', now=self.now)['code'], 'PARTIAL_DAY_PERIOD')
+
     def test_reported_total_with_unknown_period_is_never_allocated_to_tasks(self):
         save_owner_report(self.db, {'amount_usd': '63'}, self.now)
         self.receipt('editorial')

@@ -13,8 +13,9 @@ STAGES = {
     'source_google_news': 'Сбор Google News', 'source_x': 'Сбор X',
     'source_read': 'Чтение статьи и первоисточника',
     'recovery_search': 'Поиск недостающего источника',
-    'research_agent': 'Исследователь источника', 'triage': 'Предварительный отбор',
-    'editorial': 'Редакторский разбор', 'correction': 'Правки публикаций',
+    'research_agent': 'Исследователь источника', 'triage': 'Прежний ИИ-отбор',
+    'keyword_filter': 'Фильтр ключевиков · без ИИ',
+    'editorial': 'Разбор ИИ', 'correction': 'Правки публикаций',
     'interest_learning': 'Учёт редакторских предпочтений',
     'archive_memory': 'Разбор опубликованной истории', 'weekly_analysis': 'Недельная аналитика',
     'regulatory_search': 'Поиск нормативных документов',
@@ -100,6 +101,13 @@ def _empty():
                 operations=0, cache_hits=0, deferred=0, operation_errors=0,
                 operation_seconds=0., cpu_seconds=0., known_estimated_usd=0.,
                 reference_usd=0., priced_calls=0, reference_calls=0, unpriced_calls=0)
+
+
+def counter_start(db):
+    row = db.execute("SELECT value FROM app_state WHERE key='pipeline_counter_epoch_v2'").fetchone()
+    if not row:
+        raise ValueError('Новый отсчёт материалов ещё не начат')
+    return datetime.fromisoformat(json.loads(row[0])['started_at'])
 
 
 def snapshot(db, config, hours=24, now=None, item_id=None, start=None):

@@ -2387,7 +2387,11 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         return "DUPLICATE"
     db.commit()
     from .keyword_filter import screen as screen_keywords
-    keyword_outcome = screen_keywords(db, item_id, item, ai_settings or {})
+    from contextlib import nullcontext
+    filter_runtime = (ai_settings or {}).get('_runtime')
+    with (filter_runtime.measure('keyword_filter', 'filter', {'item_id': item_id, 'source_id': source['source_id']})
+          if filter_runtime else nullcontext()):
+        keyword_outcome = screen_keywords(db, item_id, item, ai_settings or {})
     if keyword_outcome:
         _trace_item(item, 'Первый фильтр', keyword_outcome, item['_retry_reason'])
         return keyword_outcome
