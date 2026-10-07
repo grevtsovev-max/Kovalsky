@@ -345,6 +345,12 @@ def _matches_output_schema(value, schema):
 def validate_draft(decision, source, draft, settings):
     """One final semantic check of the actual text, with auditable fact bindings."""
     import copy
+    post_text = draft.get('post_text')
+    if not isinstance(post_text, str) or not post_text.strip():
+        raise AIResponseError('ASSEMBLED_POST_MISSING')
+    decision = {key: value for key, value in decision.items() if key not in {
+        'headline_ru', 'summary_ru', 'what_is_new', 'editorial_check',
+        'editorial_issues', 'final_text_check', 'post_text'}}
     schema = {'type': 'object', 'additionalProperties': False,
               'properties': {
                   'issues': {'type': 'array', 'items': {'type': 'string'}},
@@ -365,14 +371,16 @@ def validate_draft(decision, source, draft, settings):
             'в собственном изложении, сохраняя точность прямых цитат. '
             'Пересказ своими словами разрешён. Дословного копирования источника не требуй. '
             'В covered_claims включи только факты из material_facts, которые действительно '
-            'подтверждены источником и переданы в публикуемом поле. post_quote — точный непрерывный '
+            'подтверждены источником и переданы в post_text. post_quote — точный непрерывный '
             'фрагмент самого готового текста, не цитата источника. Не приписывай фрагменту другой факт. '
             'Для неподтверждённого утверждения или искажения укажи конкретную причину в issues. '
             'Отсутствие существенного неопубликованного факта — issue. '
             'Замечания о вкусе и косметике не являются фактическими ошибками. '
-            'editorial_check относится к реально представленному тексту. Источник добавляет приложение.\n'
+            'post_text — полный собранный пост, включая заголовок, основной текст и ссылку на источник. '
+            'Проверяй именно его; приложение сохранит этот же текст без изменений. '
+            'editorial_check относится только к post_text.\n'
             + _load_editorial_rules(settings, 'drafting')),
-        'input': json.dumps({'decision': decision, 'read_source': source, 'draft': draft,
+        'input': json.dumps({'decision': decision, 'read_source': source, 'post_text': post_text,
                             'draft_contract': settings.get('_draft_contract', {})}, ensure_ascii=False),
         'text': {'format': {'type': 'json_schema', 'name': 'newsroom_final_text_check',
                             'strict': True, 'schema': schema}}}

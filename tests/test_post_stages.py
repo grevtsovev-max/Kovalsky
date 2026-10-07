@@ -9,6 +9,30 @@ def response(value):
 
 
 class PostStagesTests(unittest.TestCase):
+    def test_final_check_receives_only_the_assembled_publication_text(self):
+        post = '🇷🇺 Банк изменил условия\n\nНовые условия.\n\nИсточник: [Банк](https://example.org)'
+        draft = {'post_text': post, 'headline_ru': 'Другой заголовок',
+                 'summary_ru': 'Не публикуемое резюме', 'what_is_new': 'Другой вариант'}
+        decision = dict(draft, facts=[{'text': 'Новые условия.'}])
+        audit = {key: '' if key == 'history_note' else False
+                 for key in ai.SCHEMA['properties']['editorial_check']['required']}
+        result = {'issues': [], 'editorial_check': audit, 'covered_claims': []}
+        with patch.object(ai, 'request_response', return_value=response(result)) as request:
+            self.assertEqual(ai.validate_draft(decision, {'content': 'Источник'}, draft, {}), result)
+        data = json.loads(request.call_args.args[0]['input'])
+        self.assertEqual(data['post_text'], post)
+        self.assertNotIn('draft', data)
+        self.assertNotIn('summary_ru', data['decision'])
+        self.assertNotIn('what_is_new', data['decision'])
+        self.assertNotIn('post_text', data['decision'])
+        self.assertEqual(data['decision']['facts'], decision['facts'])
+
+    def test_final_check_requires_assembled_text(self):
+        with patch.object(ai, 'request_response') as request:
+            with self.assertRaisesRegex(ai.AIResponseError, 'ASSEMBLED_POST_MISSING'):
+                ai.validate_draft({}, {}, {'headline_ru': 'Заголовок', 'summary_ru': 'Текст'}, {})
+        request.assert_not_called()
+
     def test_analysis_marks_unwritten_decision_for_later_drafting(self):
         with patch.object(ai, 'get_api_key', return_value='test'), patch.object(ai, 'request_response', return_value=response({'action': 'NEW_STORY'})) as request:
             result = ai.analyze({'title': 'Событие'}, {'name': 'Источник', 'priority': 1, 'reputation': 'unknown'}, [], {'_analysis_only': True})

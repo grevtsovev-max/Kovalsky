@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from newsroom import ai, compact_editor
-from newsroom.core import process_item, _saved_material
+from newsroom.core import process_item, _saved_material, digest
 from newsroom.ai import validate_draft as real_validate_draft
 from compact_fixtures import compact_response, response
 from test_intake_rules import fixture
@@ -30,6 +30,10 @@ class CompactEditorTests(unittest.TestCase):
             return response(self.value)
         self.assertEqual(payload['text']['format']['name'], 'newsroom_final_text_check')
         data = json.loads(payload['input'])
+        self.assertTrue(data['post_text'].endswith(data['draft_contract']['source_footer']))
+        self.assertNotIn('draft', data)
+        self.assertNotIn('summary_ru', data['decision'])
+        self.assertNotIn('what_is_new', data['decision'])
         return response({'issues': [], 'editorial_check': self.audit,
                          'covered_claims': [{'fact_id': f['fact_id'], 'post_quote': f['statement']}
                                             for f in data['draft_contract']['material_facts']]})
@@ -51,12 +55,32 @@ class CompactEditorTests(unittest.TestCase):
         writer.assert_not_called()
         post = self.db.execute('SELECT * FROM posts').fetchone()
         facts = json.loads(post['fact_check_result'])
-        self.assertTrue(facts['final_text_check']['assembled_sha256'])
+        checked_text = json.loads(request.call_args.args[0]['input'])['post_text']
+        self.assertEqual(post['text'], checked_text)
+        self.assertEqual(facts['final_text_check']['text_sha256'], digest(checked_text))
+        self.assertEqual(facts['final_text_check']['assembled_sha256'], digest(checked_text))
         self.assertTrue(facts['intake_filter']['passed'])
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM post_facts').fetchone()[0], 1)
         saved = json.loads(self.db.execute('SELECT result_json FROM item_analysis').fetchone()[0])
         self.assertTrue(saved['_combined_editor'])
         self.assertTrue(saved['original_reporting_check']['attribution_preserved'])
+
+    def test_source_footer_and_whitespace_are_normalized_before_final_check(self):
+        self.prepare()
+        self.value['summary_ru'] = (self.evidence.replace(' ', '  ')
+                                   + '\n\nИсточник: [Другой источник](https://wrong.example)')
+        with patch.object(ai, 'get_api_key', return_value='test'), \
+             patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.fetch_publisher_article', return_value=self.article), \
+             patch.object(ai, 'validate_draft', wraps=real_validate_draft), \
+             patch.object(ai, 'request_response', side_effect=self.provider) as request:
+            self.assertEqual(self.process(), 'NEW_STORY')
+        text = json.loads(request.call_args.args[0]['input'])['post_text']
+        self.assertEqual(text, self.db.execute('SELECT text FROM posts').fetchone()[0])
+        self.assertIn(self.evidence, text)
+        self.assertEqual(text.count('Источник:'), 1)
+        self.assertTrue(text.endswith('Источник: [Банк России](https://www.cbr.ru/crypto)'))
+        self.assertNotIn('wrong.example', text)
 
     def test_broken_evidence_never_reaches_writing_or_final_check(self):
         self.prepare()

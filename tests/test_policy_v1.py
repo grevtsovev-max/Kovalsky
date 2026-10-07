@@ -100,7 +100,7 @@ class PolicyV1Tests(unittest.TestCase):
             with self.subTest(result=result), patch('newsroom.ai.request_response', return_value={
                     'output': [{'content': [{'type': 'output_text', 'text': json.dumps(result)}]}]}):
                 with self.assertRaisesRegex(AIResponseError, 'INVALID_TEXT_CHECK'):
-                    validate_draft({}, {}, {}, {})
+                    validate_draft({}, {}, {'post_text': 'Готовый пост'}, {})
 
     def test_historic_table_rules_are_not_a_hidden_authority(self):
         settings = {'_editorial_registry': {'rules': [['Лид', 'Старый запрет', '']]}}

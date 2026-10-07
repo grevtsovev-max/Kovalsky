@@ -3038,7 +3038,7 @@ def _finish_post_steps(db, item, ai_settings, context):
     max_length = context['max_length']
     material_ids = set((memory_diff or {}).get('material_unpublished_facts', []))
     draft_source = primary_source or publisher_report or {}
-    draft_citation_name = draft_source.get('publisher') or publisher_name
+    draft_citation_name = draft_source.get('publisher') or ('Первоисточник' if primary_source else publisher_name)
     draft_citation_url = draft_source.get('url') or item['url']
     ai_options['_draft_contract'] = {
         'dates': __import__('newsroom.policy', fromlist=['date_context']).date_context(item, draft_source, source),
@@ -3103,14 +3103,18 @@ def _finish_post_steps(db, item, ai_settings, context):
         # Final validation checks freely written text; it does not repeat selection.
         from .ai import validate_draft
         field = ai_options['_draft_contract']['text_field']
-        text_to_check = draft.get('headline_ru', '') + '\n\n' + draft.get(field, '')
+        text_to_check = make_post(draft.get('headline_ru', ''), draft.get(field, ''),
+                                  draft_citation_name, draft_citation_url, max_length,
+                                  preserve_content=True)
+        check_draft = {**draft, 'post_text': text_to_check}
         mark(db, item_id, 'gate', 'RUNNING', 'Проверка фактов готового текста.')
         db.commit()
         try:
-            check_key = cache_key('final-text', {'draft': draft, 'source': draft_source,
+            check_key = cache_key('final-assembled-text', {'text': text_to_check, 'source': draft_source,
                 'contract': ai_options['_draft_contract'],
+                'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text()),
                 'policy': __import__('newsroom.policy', fromlist=['snapshot']).snapshot(ai_options)})
-            checked = yield Work('editor', validate_draft, (ai_result, draft_source, draft, ai_options),
+            checked = yield Work('editor', validate_draft, (ai_result, draft_source, check_draft, ai_options),
                                  key=check_key, ttl=21600, stage='verification')
             from .policy import relative_date_words
             if relative_date_words(text_to_check):
@@ -3148,7 +3152,9 @@ def _finish_post_steps(db, item, ai_settings, context):
         if memory_diff:
             memory_diff = {**memory_diff, 'post_claims': bindings}
             context['memory_diff'] = memory_diff
-        ai_result['final_text_check'] = {'text_sha256': digest(text_to_check), 'covered_claims': bindings}
+        ai_result['final_text_check'] = {'text_sha256': digest(text_to_check),
+                                       'assembled_sha256': digest(text_to_check),
+                                       'covered_claims': bindings}
         mark(db, item_id, 'drafting', 'DONE', 'Текст подготовлен.')
         ai_result.update(draft)
         if isinstance(ai_result.get('original_reporting_check'), dict):
@@ -3166,14 +3172,11 @@ def _finish_post_steps(db, item, ai_settings, context):
         _trace_item(item, 'Написание поста', 'Завершён', 'Текст подготовлен после проверки актуальности и новизны.')
         db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
             (json.dumps({**ai_result, '_filter_version': FILTER_VERSION}, ensure_ascii=False), item_id))
-        quality_body = ai_result.get("what_is_new") if status == "UPDATE_CANDIDATE" and has_previous_publication else ai_result.get("summary_ru", "")
-        citation_url = primary_source["url"] if primary_source else (publisher_report or {}).get("url", item["url"])
-        citation_name = (primary_source.get("publisher") or "Первоисточник") if primary_source else (publisher_report or {}).get("publisher", publisher_name)
         source_is_report = (bool(primary_source and str(primary_source.get("type") or "").startswith(("ORIGINAL_MEDIA_", "ORIGINAL_SOCIAL_")))
                             if primary_source else bool(publisher_report))
         # Check the assembled text, including the normalized source footer,
         # before creating a post. The send boundary checks this same format.
-        preview = make_post(headline, quality_body or '', citation_name, citation_url, max_length, preserve_content=True)
+        preview = text_to_check
         checked_headline, _, checked_body = preview.partition('\n')
         issues = editorial_issues(checked_headline, checked_body, ai_result,
                                  source_is_report=source_is_report)
@@ -3198,10 +3201,7 @@ def _finish_post_steps(db, item, ai_settings, context):
             db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (disposition,now,item_id))
             db.commit()
             return disposition
-        description = ai_result.get("summary_ru", "")
-        if status == "UPDATE_CANDIDATE" and has_previous_publication:
-            description = ai_result.get("what_is_new") or description
-        post = make_post(headline, description, citation_name, citation_url, max_length, preserve_content=True)
+        post = text_to_check
         primary_source_record = None
         if primary_source:
             primary_source_record = {key: value for key, value in primary_source.items() if key != "content"}
@@ -3244,10 +3244,9 @@ def _finish_post_steps(db, item, ai_settings, context):
                                  "primary_source_status": source_status,
                                  "source_review_required": not bool(primary_source and source_status == "READ")}, ensure_ascii=False)
     if ai_result and ai_result.get('final_text_check'):
-        # Seal the assembled representation before any delivery operation.
+        # The saved representation is exactly what the final checker received.
         stored_facts = json.loads(facts_json)
         stored_facts['material_revision'] = db.execute('SELECT ingest_revision FROM items WHERE item_id=?', (item_id,)).fetchone()[0]
-        stored_facts['final_text_check']['assembled_sha256'] = digest(post)
         facts_json = json.dumps(stored_facts, ensure_ascii=False)
     post_hash = digest(post)
     db.execute('SAVEPOINT memory_post')

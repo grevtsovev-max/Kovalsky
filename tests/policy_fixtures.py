@@ -2,7 +2,7 @@
 def final_check(decision, source, draft, settings):
     import copy
     contract = settings.get('_draft_contract', {})
-    text = draft.get('headline_ru', '') + '\n\n' + draft.get(contract.get('text_field', 'summary_ru'), '')
+    text = draft['post_text']
     facts = contract.get('material_facts', [])
     bindings = []
     for fact in facts:
