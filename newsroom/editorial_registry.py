@@ -180,7 +180,7 @@ def plan(signal, snapshot, settings):
         'input':json.dumps({'signal':signal,'editorial_policy':policy(snapshot),
                            'effective_editorial_rules': __import__('newsroom.policy', fromlist=['amendments']).amendments(settings)},ensure_ascii=False),
         'text':{'format':{'type':'json_schema','name':'editorial_learning','strict':True,'schema':schema}}},
-        {**settings,'_work_role':'editor','_work_category':'background','_work_stage':'editorial_learning'})
+        {**settings,'_work_role':'editor','_work_category':'owner_feedback','_work_stage':'editorial_learning'})
     if response.get('status')=='incomplete': raise ValueError('EDITORIAL_LEARNING_INCOMPLETE')
     raw=''.join(b.get('text','') for o in response.get('output',[]) for b in o.get('content',[]) if b.get('type')=='output_text')
     result = json.loads(raw)

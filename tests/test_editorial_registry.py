@@ -125,6 +125,13 @@ class EditorialRegistryTests(unittest.TestCase):
         self.assertEqual(writer.call_args.args[2]['changes'],[])
         self.assertEqual(state(self.db,'editorial_learning:1')['status'],'DONE')
 
+    def test_owner_feedback_plan_uses_its_bounded_priority_lane(self):
+        changes = [change()]
+        response = {'output': [{'content': [{'type': 'output_text', 'text': json.dumps({'changes': changes, 'clarification': ''})}]}]}
+        with patch('newsroom.ai.request_response', return_value=response) as request:
+            self.assertEqual(board.plan({'reason': 'Убирай канцелярит'}, snapshot(), {}), changes)
+        self.assertEqual(request.call_args.args[1]['_work_category'], 'owner_feedback')
+
     def test_learning_plan_requires_exact_owner_evidence(self):
         c=change(); c['evidence']='Цитата отсутствует'
         response={'output':[{'content':[{'type':'output_text','text':json.dumps({'changes':[c]})}]}]}

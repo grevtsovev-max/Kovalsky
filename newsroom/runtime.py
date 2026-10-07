@@ -140,9 +140,9 @@ class Runtime:
             used = {row[0]: row[1] for row in db.execute(
                 "SELECT category,COUNT(*) FROM api_usage WHERE created_at>=? GROUP BY category", (cutoff,))}
             held = max(0, self.correction_reserve - used.get("correction", 0))
-            if category not in {"retry", "correction"}:
+            if category not in {"retry", "correction", "owner_feedback"}:
                 held += max(0, self.retry_reserve - used.get("retry", 0))
-            if category == "correction":
+            if category in {"correction", "owner_feedback"}:
                 held = 0
             search_used = db.execute("SELECT COUNT(*) FROM api_usage WHERE created_at>=? AND search_requested=1",
                                      (cutoff,)).fetchone()[0]
@@ -153,6 +153,8 @@ class Runtime:
                 delay = max(1, int((datetime.fromisoformat(earliest) + timedelta(seconds=self.window)
                                   - datetime.now(timezone.utc)).total_seconds()) + 1) if earliest else self.window
                 raise BudgetDeferred('requests', delay)
+            if category == 'owner_feedback' and used.get('owner_feedback', 0) >= max(0, int(self.settings.get('api_owner_feedback_per_window', 2))):
+                raise BudgetDeferred('owner_feedback', self.window)
             if category == 'background':
                 busy = db.execute("SELECT COUNT(*) FROM processing_jobs WHERE status IN ('PENDING','RUNNING','WAITING') AND category='fresh'").fetchone()[0]
                 if busy or used.get('background', 0) >= max(0, int(self.settings.get('api_background_per_window', 2))):

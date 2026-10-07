@@ -899,6 +899,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(transport.call_count, 1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM api_usage').fetchone()[0], 1)
 
+    def test_owner_feedback_has_bounded_capacity_while_fresh_queue_is_busy(self):
+        enqueue(self.db, None, WorkflowTests.item(self), self.source, self.options)
+        runtime = self.runtime()
+        for _ in range(2):
+            call = runtime.reserve({'model': 'test'}, {'_work_category': 'owner_feedback'})
+            runtime.finish(call, {'usage': {}}, .01)
+        with self.assertRaises(BudgetDeferred) as waiting:
+            runtime.reserve({'model': 'test'}, {'_work_category': 'owner_feedback'})
+        self.assertEqual(waiting.exception.reason, 'owner_feedback')
+        fresh = runtime.reserve({'model': 'test'}, {'_work_category': 'fresh'})
+        runtime.finish(fresh, {'usage': {}}, .01)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM api_usage WHERE category='owner_feedback'").fetchone()[0], 2)
+
     def test_background_work_waits_while_fresh_queue_is_unfinished(self):
         enqueue(self.db, None, WorkflowTests.item(self), self.source, self.options)
         with self.assertRaises(BudgetDeferred):
