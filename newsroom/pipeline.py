@@ -1,11 +1,12 @@
 """Read-only editorial intake view. Counts represent saved items, not feed polls."""
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from .triage import MAX_AUTOMATIC_RETRIES
 
 STAGES = [
-    ('received', 'Ожидают обработки'), ('primary', 'Читаются'),
-    ('ai', 'Разбираются'), ('confirmation', 'Требуют уточнения'),
+    ('received', 'Ожидают обработки'), ('screening', 'Фильтр ключевиков'), ('primary', 'Чтение источника'),
+    ('ai', 'Разбор ИИ'), ('confirmation', 'Требуют уточнения'),
     ('drafting', 'Готовятся посты'), ('technical', 'Остановлены ошибкой'),
     ('correction', 'Правки опубликованных постов'),
     ('review', 'Проверяются перед отправкой'), ('published', 'Опубликованы'),
@@ -212,6 +213,8 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         period = '48'
     query = params.get('q', [''])[0].strip().casefold()[:200]
     stage = params.get('stage', ['all'])[0]
+    bucket = params.get('bucket', ['all'])[0]
+    milestone = params.get('milestone', ['all'])[0]
     try:
         offset = max(0, int(params.get('offset', ['0'])[0]))
     except ValueError:
@@ -241,12 +244,30 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     counts = dict.fromkeys(dict(STAGES), 0)
     totals = dict(received=0, first_filter=0, analyzed=0, primary_read=0, selected=0, drafted=0, checked=0, published=0)
     keyword_passed = set()
+    keyword_results = {}
     if 'material_stage_results' in tables:
-        keyword_passed = {r[0] for r in db.execute(
-            "SELECT DISTINCT r.item_id FROM material_stage_results r JOIN items i USING(item_id) "
+        for r in db.execute(
+            "SELECT r.item_id,r.result_json FROM material_stage_results r JOIN items i USING(item_id) "
             "WHERE r.revision=i.ingest_revision AND r.stage='screening' AND json_valid(r.result_json) "
-            "AND json_extract(r.result_json,'$.kind')='keyword_prefilter' "
-            "AND json_extract(r.result_json,'$.passed')=1")}
+            "AND json_extract(r.result_json,'$.kind')='keyword_prefilter' ORDER BY r.created_at"):
+            result = obj(r[1])
+            keyword_results[r[0]] = result
+            if result.get('passed') is True:
+                keyword_passed.add(r[0])
+    flow_by_item = {}
+    if 'material_stage_state' in tables:
+        from .material_flow import LABELS
+        for row in db.execute(
+            'SELECT f.* FROM material_stage_state f JOIN items i USING(item_id) '
+            'WHERE f.revision=i.ingest_revision ORDER BY f.updated_at'):
+            point = {key: row[key] for key in row.keys() if key not in {'item_id', 'revision'}}
+            point['label'] = LABELS.get(point['stage'], point['stage'])
+            elapsed = max(0, (now - datetime.fromisoformat(point['updated_at'])).total_seconds())
+            if point['status'] == 'RUNNING':
+                point['work_seconds'] += elapsed
+            elif point['status'] in {'READY', 'WAITING', 'ERROR'}:
+                point['wait_seconds'] += elapsed
+            flow_by_item.setdefault(row['item_id'], []).append(point)
     output = []
     for row in rows:
         item = dict(row)
@@ -308,8 +329,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             elif post['status'] == 'REJECTED':
                 category, reason = 'filtered', 'Связанный черновик окончательно отклонён проверками допуска.'
         if 'material_stage_state' in tables:
-            from .material_flow import snapshot as flow_snapshot
-            item['checkpoints'] = flow_snapshot(db, item['item_id'])
+            item['checkpoints'] = flow_by_item.get(item['item_id'], [])
             if post and post.get('publication_trace'):
                 trace = post['publication_trace']
                 for checkpoint in item['checkpoints']:
@@ -318,26 +338,41 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                         checkpoint['reason'] = trace['status_label']
                         checkpoint['block_kind'] = 'delivery_unknown' if trace['status'] == 'UNKNOWN' else checkpoint['block_kind']
             active_checkpoint = next((x for x in reversed(item['checkpoints']) if x['status'] in {'READY', 'RUNNING', 'WAITING', 'ERROR'}), None)
-            if active_checkpoint and not post:
+            if active_checkpoint and category not in {'published', 'filtered'} and (category != 'processed' or disposition in {'NEW_STORY', 'UPDATE_CANDIDATE'}):
                 item['current_checkpoint'] = active_checkpoint
-                if active_checkpoint['stage'] == 'drafting':
-                    category = 'drafting'
-                if active_checkpoint['block_kind'] == 'technical':
+                if not post:
+                    category = {'screening': 'screening', 'reading': 'primary', 'analysis': 'ai',
+                                'drafting': 'drafting', 'gate': 'review', 'delivery': 'review'}.get(active_checkpoint['stage'], category)
+                if active_checkpoint['status'] == 'ERROR' or active_checkpoint['block_kind'] == 'technical':
                     category = 'technical'
                 if active_checkpoint['reason']:
                     reason = active_checkpoint['reason']
         counts[category] += 1
-        totals['received'] += 1
-        totals['first_filter'] += item['item_id'] in keyword_passed
-        totals['analyzed'] += bool(item['analyzed_at'])
-        totals['primary_read'] += primary.get('status') == 'READ' or primary.get('_material_read') is True
-        totals['selected'] += analysis.get('is_relevant') is True or post is not None
-        if post:
-            import hashlib
-            proof = (post.get('facts') or {}).get('final_text_check') or {}
-            totals['checked'] += bool(proof.get('assembled_sha256') and proof['assembled_sha256'] == hashlib.sha256((post.get('text') or '').encode()).hexdigest())
-        totals['drafted'] += post is not None
-        totals['published'] += category == 'published'
+        proof = ((post.get('facts') or {}).get('final_text_check') or {}) if post else {}
+        progress = {
+            'received': True,
+            'first_filter': item['item_id'] in keyword_passed,
+            'analyzed': bool(item['analyzed_at']),
+            'primary_read': primary.get('status') == 'READ' or primary.get('_material_read') is True,
+            'selected': analysis.get('is_relevant') is True or post is not None,
+            'drafted': post is not None,
+            'checked': bool(post and proof.get('assembled_sha256') and proof['assembled_sha256'] == hashlib.sha256((post.get('text') or '').encode()).hexdigest()),
+            'published': category == 'published',
+        }
+        for key, passed in progress.items():
+            totals[key] += passed
+        terminal = category in {'published', 'filtered', 'processed'}
+        try:
+            discovered = datetime.fromisoformat(item['discovered_at'].replace('Z', '+00:00'))
+            if discovered.tzinfo is None:
+                discovered = discovered.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError, AttributeError):
+            discovered = None
+        slow = bool(not terminal and discovered and (now - discovered).total_seconds() >= 15 * 60)
+        trace = (post or {}).get('publication_trace') or {}
+        needs_attention = bool(not terminal and (slow or category == 'technical' or trace.get('status') == 'UNKNOWN'))
+        item['needs_attention'] = needs_attention
+        item['keyword_filter'] = keyword_results.get(item['item_id'])
         item.update(stage=category, reason=reason,
             material_status=('Материал прочитан' if primary.get('status') == 'READ' or primary.get('_material_read') is True else 'Нет прочитанного пригодного материала'),
             material_url=primary.get('url') if primary.get('status') == 'READ' else primary.get('_material_url') if primary.get('_material_read') is True else None,
@@ -361,7 +396,11 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             post=({k:post.get(k) for k in ('post_id','status','created_at','published_at','telegram_url','external_id',
                                             'text','auto_reason','auto_attempts','auto_last_error',
                                             'publication_trace','link_method')} if post else None))
-        if stage == 'all' or stage == category:
+        in_bucket = (bucket == 'all' or bucket == 'work' and not terminal
+                     or bucket == 'attention' and needs_attention
+                     or bucket == 'published' and category == 'published'
+                     or bucket == 'closed' and category in {'filtered', 'processed'})
+        if in_bucket and (milestone == 'all' or progress.get(milestone, False)) and (stage == 'all' or stage == category):
             output.append(item)
     visible = output[offset:offset+30]
     queue_positions, queue_total, queue_batch = retry_queue_positions(db, config, now)
@@ -399,10 +438,11 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     funnel = [('received', 'Получено материалов', 'Уникальные материалы, сохранённые за выбранный период.'),
               ('first_filter', 'Прошли первый фильтр', 'Есть совпадение с включённым ключевиком таблицы или его словоформой. Без ИИ.'),
               ('primary_read', 'Прочитано', 'Сохранён прочитанный текст источника или пересказа.'),
+              ('analyzed', 'Разобраны ИИ', 'Сохранён результат полного редакционного разбора, включая материалы, завершённые без поста.'),
               ('drafted', 'Подготовлено постов', 'Материалы, для которых сохранён связанный пост, включая впоследствии отклонённые.'),
               ('checked', 'Прошли проверку текста', 'Есть сохранённая проверка именно текущего текста поста.'),
               ('published', 'Опубликовано', 'Материалы со связанным опубликованным постом.')]
     return {'funnel': [{'key': key, 'label': label, 'count': totals[key], 'description': description} for key, label, description in funnel],
             'stages':[{'key':k,'label':v,'count':counts[k]} for k,v in STAGES],
             'totals':totals,'total':len(output),'items':visible,
-            'offset':offset,'limit':30,'period':period,'updated_at':now.isoformat()}
+            'offset':offset,'limit':30,'period':period,'bucket':bucket,'milestone':milestone,'updated_at':now.isoformat()}

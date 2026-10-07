@@ -74,12 +74,56 @@ class PipelineTests(unittest.TestCase):
         self.posts[0]['facts']['final_text_check'] = {'assembled_sha256': hashlib.sha256('Проверенный текст'.encode()).hexdigest()}
         result = self.snapshot(stage='filtered')
         counts = {step['key']: step['count'] for step in result['funnel']}
-        self.assertEqual(counts, {'received': 3, 'first_filter': 0, 'primary_read': 1, 'drafted': 1, 'checked': 1, 'published': 0})
+        self.assertEqual(counts, {'received': 3, 'first_filter': 0, 'primary_read': 1, 'analyzed': 2, 'drafted': 1, 'checked': 1, 'published': 0})
         self.assertEqual(result['total'], 1)
         self.assertEqual(sum(step['count'] for step in result['stages']), 3)
         self.posts[0]['text'] = 'Изменённый непроверенный текст'
         self.assertEqual(self.snapshot()['totals']['checked'], 0)
         self.assertEqual(self.snapshot(q='Материал 3')['totals']['received'], 1)
+
+    def test_work_attention_and_closed_buckets_filter_before_pagination(self):
+        self.add(1, 'NOISE')
+        self.add(2, 'STORE_ONLY')
+        self.add(3, 'TECHNICAL_ERROR', discovered='2026-09-28T11:59:00+00:00')
+        self.add(4, 'PRIMARY_RETRY')
+        self.add(5, 'PENDING', discovered='2026-09-28T11:59:00+00:00')
+        for bucket, expected in [('work', {3, 4, 5}), ('attention', {3, 4}), ('closed', {1, 2}), ('published', set())]:
+            report = self.snapshot(bucket=bucket)
+            self.assertEqual({i['item_id'] for i in report['items']}, expected)
+            self.assertEqual(report['total'], len(expected))
+            self.assertEqual(report['totals']['received'], 5)
+        self.assertFalse(next(i for i in self.snapshot()['items'] if i['item_id'] == 1)['needs_attention'])
+
+    def test_current_checkpoint_is_shown_without_reopening_terminal_material(self):
+        from newsroom.material_flow import SCHEMA, mark
+        self.add(1, 'PENDING', discovered='2026-09-28T11:59:00+00:00')
+        self.add(2, 'NOISE')
+        self.add(3, 'NEW_STORY')
+        self.db.execute("ALTER TABLE items ADD COLUMN ingest_revision TEXT DEFAULT 'r1'")
+        self.db.executescript(SCHEMA)
+        mark(self.db, 1, 'reading', 'ERROR', 'Не ответил обработчик', block_kind='technical')
+        mark(self.db, 2, 'reading', 'ERROR', 'Старая ошибка', block_kind='technical')
+        mark(self.db, 3, 'drafting', 'READY', 'Ожидает написания')
+        report = self.snapshot()
+        items = {i['item_id']: i for i in report['items']}
+        self.assertEqual(items[1]['stage'], 'technical')
+        self.assertEqual(items[1]['current_checkpoint']['stage'], 'reading')
+        self.assertEqual(items[1]['reason'], 'Не ответил обработчик')
+        self.assertEqual(items[2]['stage'], 'filtered')
+        self.assertFalse(items[2]['needs_attention'])
+        self.assertEqual(items[3]['stage'], 'drafting')
+        self.assertEqual({i['item_id'] for i in self.snapshot(bucket='work')['items']}, {1, 3})
+
+    def test_progress_link_returns_materials_that_passed_step_even_if_later_rejected(self):
+        self.add(1, 'NOISE', primary={'_material_read': True})
+        self.add(2, 'PENDING')
+        self.db.execute('INSERT INTO item_analysis VALUES(?,?,?)', (1, '2026-09-28T11:00:00+00:00', '{}'))
+        report = self.snapshot(milestone='analyzed')
+        self.assertEqual([i['item_id'] for i in report['items']], [1])
+        self.assertEqual(report['total'], report['totals']['analyzed'])
+        self.assertEqual(self.snapshot(milestone='primary_read')['total'], 1)
+        self.assertEqual(self.snapshot(bucket='work', milestone='analyzed')['total'], 0)
+        self.assertEqual(self.snapshot(milestone='received')['total'], 2)
 
     def test_partition_counts_and_pagination_cover_more_than_100(self):
         for i in range(105): self.add(i, 'NOISE' if i%2 else 'PRIMARY_RETRY')
