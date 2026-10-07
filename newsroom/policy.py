@@ -33,7 +33,7 @@ def amendments(settings=None, stage=None):
     confirmed = {tuple(row) for row in settings.get('_policy_confirmed_rules', [])}
     changes = [row for row in value.get('rules', []) if tuple(row) not in baseline or tuple(row[:2]) in confirmed]
     if stage in {'analysis', 'screening'}:
-        changes = [row for row in changes if row[0] in {'Отбор', 'Проверка', 'Цифры и даты', 'Повторы'}]
+        changes = [row for row in changes if row[0] in {'Отбор', 'Проверка', 'Цифры и даты', 'Повторы', 'Публикация'}]
     return changes
 
 

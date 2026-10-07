@@ -174,6 +174,18 @@ class PolicyV1Tests(unittest.TestCase):
             self.assertIsNone(backup.execute("SELECT value FROM app_state WHERE key='policy_v1_cutover'").fetchone())
         self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'STORE_ONLY')
 
+    def test_general_selection_and_publication_feedback_reaches_analysis(self):
+        from newsroom import editorial_registry
+        for section in ('Отбор', 'Проверка', 'Повторы', 'Публикация'):
+            with self.subTest(section=section):
+                rule = 'Общий реестр не покрывает новые сведения об отдельном банке.'
+                body = (','.join(editorial_registry.HEADERS['Редакторские правила']) + '\n' + section + ',' + rule + ',,true\n').encode()
+                parsed = editorial_registry.parse(body, 'Редакторские правила')
+                self.assertTrue(parsed[0]['enabled'])
+                settings = {'_policy_baseline': [], '_editorial_registry': {'rules': [[section, rule, '']]}}
+                self.assertIn(rule, policy.prompt('analysis', settings))
+                self.assertNotEqual(policy.stage_signature('analysis', settings), policy.stage_signature('analysis', {'_policy_baseline': []}))
+
     def test_unchanged_article_modification_clock_does_not_reopen_or_reset(self):
         from newsroom.core import _save_item
         item = {'url': 'https://example.org/1', 'title': 'Банк получил лицензию',
