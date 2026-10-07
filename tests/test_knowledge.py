@@ -52,6 +52,17 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT count(*) FROM event_items').fetchone()[0],3)
         self.assertEqual(self.db.execute('SELECT count(*) FROM fact_evidence').fetchone()[0],3)
 
+    def test_false_repeat_explains_exact_prior_fields_without_accepting_change(self):
+        self.add(1)
+        with self.assertRaises(MemoryInvalid) as error:
+            self.add(2, memory('декабрь', relation='REPEAT', previous_fact_id='1'))
+        message = str(error.exception)
+        self.assertIn('FALSE_REPEAT', message)
+        self.assertIn('"value": "октябрь"', message)
+        self.assertIn('"claim_type": "CLAIM"', message)
+        self.assertIn('"valid_from": ""', message)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM story_facts').fetchone()[0], 1)
+
     def test_known_but_unpublished_fact_remains_eligible(self):
         first=self.add(1);self.post(first,status='REJECTED')
         diff=self.add(2,memory(relation='REPEAT',previous_fact_id='1'))
