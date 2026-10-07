@@ -68,6 +68,21 @@ class SourceRecheckTests(unittest.TestCase):
         read.assert_called_once()
         self.assertEqual(check.call_count, 2)
 
+    def test_changed_source_uses_its_publication_clock_not_update_clock(self):
+        self.age()
+        current = {**self.current, 'content': self.original + '\nСегодня опубликовано уточнение.',
+                   'published_at': '2026-01-01T22:30:00+00:00',
+                   'updated_at': '2026-01-04T12:00:00+00:00',
+                   'source_timezone': 'Europe/Moscow'}
+        checked = {'issues': [], 'covered_claims': [], 'editorial_check': self.facts['editorial_check']}
+        with patch('newsroom.core.fetch_publisher_article', return_value=current), patch('newsroom.ai.validate_draft', return_value=checked) as check:
+            verify(self.db, self.config, self.post, self.facts)
+        citation = check.call_args.args[1]
+        dates = check.call_args.args[3]['_draft_contract']['dates']
+        self.assertEqual(citation['published_at'], current['published_at'])
+        self.assertEqual(dates['source_published_at'], current['published_at'])
+        self.assertEqual(dates['source_calendar_day'], '2026-01-02')
+
     def test_second_executor_waits_for_the_same_source_check(self):
         from newsroom.db import connect
         self.age()

@@ -153,12 +153,20 @@ def verify(db, config, post, facts, *, now=None):
     decision = json.loads(analysis[0]) if analysis else facts
     claims = [dict(fact) for fact in db.execute('SELECT f.fact_id,f.subject,f.predicate,f.value,f.statement,f.fact_type FROM post_facts p JOIN story_facts f USING(fact_id) WHERE p.post_id=?', (post['post_id'],))]
     from .policy import date_context
+    # The refreshed text belongs to the refreshed publication clock. An
+    # update timestamp must never stand in for its publication timestamp.
+    refreshed_citation = {**citation, 'content': current['content']}
+    if current.get('published_at'):
+        refreshed_citation['published_at'] = current['published_at']
+    for field in ('source_timezone', 'timezone'):
+        if current.get(field):
+            refreshed_citation[field] = current[field]
     source_row = db.execute('SELECT * FROM sources WHERE source_id=?', (row['source_id'],)).fetchone()
     options = {**config.get('ai', {}), '_transport_attempt': int(state.get('failures', 0)),
                '_draft_contract': {'text_field': 'summary_ru', 'material_facts': claims,
-                                  'dates': date_context(dict(row), citation, dict(source_row) if source_row else {})}}
+                                  'dates': date_context(dict(row), refreshed_citation, dict(source_row) if source_row else {})}}
     try:
-        checked = validate_draft(decision, {**citation, 'content': current['content']},
+        checked = validate_draft(decision, refreshed_citation,
             {'headline_ru': headline, 'summary_ru': body, 'what_is_new': body, 'editorial_check': facts.get('editorial_check')}, options)
         validate_post_bindings(checked, {claim['fact_id'] for claim in claims}, headline + '\n\n' + body)
         from .quality import editorial_issues
