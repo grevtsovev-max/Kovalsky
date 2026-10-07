@@ -107,7 +107,7 @@ INSTRUCTIONS = '''historical_publication_coverage — то, что уже соо
 Каждое claims — одно утверждение: устойчивые subject/predicate/scope задают предмет сравнения, value — значение. Для того же предмета повторно используй subject/predicate/scope из контекста (не перефразируй ключи). scope различает юрисдикцию, проект, период/базу суммы и условие; не помещай изменяемый срок/сумму в scope. valid_from/valid_to — период применимости, а не дата обнаружения.
 source_quote — точная непрерывная цитата из прочитанного primary_source или допустимого publisher_report, подтверждающая утверждение. Не используй поисковые сниппеты. post_quote — точный фрагмент публикуемого текста: summary_ru для нового или ещё не опубликованного сюжета (publication_count=0), what_is_new только для продолжения уже опубликованного сюжета. Наличие story_id само по себе не означает продолжение публикации. Не перефразируй post_quote; пусто, если утверждение в пост не включено. Не включай в текст неподтверждённые утверждения.
 previous_fact_id — ТОЛЬКО fact_id из массива facts. post_id и историческое покрытие НЕ являются fact_id. Если совпадение есть лишь в historical_publication_coverage, previous_fact_id пустой и relation=NEW (новое для реестра доказательств); код отдельно установит повтор для публикации по тем же ключам. REPEAT — то же значение и тип: скопируй value, claim_type (из fact_type), valid_from и valid_to прежнего факта точно, если они подтверждаются прочитанным материалом; не перефразируй value и не меняй REPORT/CLAIM/FACT ради совпадения; SUPERSEDES — явное изменение актуального значения; CONFIRMS — официальный документ подтверждает прежний REPORT/CLAIM; CONTRADICTS — несовместимые сведения без подтверждённого разрешения; RETRACTS — явный отзыв прежнего заявления. Для отношений изменения quote должен подтверждать новое состояние или опровержение. Не называй ошибкой достоверное историческое сообщение о прежнем плане.
-material означает существенность для аудитории, а не новизну для внутренней памяти. При relation=REPEAT и published=false существенная ещё не опубликованная новость сохраняет material=true. Повтор уже опубликованного или неважная деталь не становятся существенными по желанию. material_reason объясняет конкретно значение для аудитории на основе источника. Если рекомендуешь AUTO_PUBLISH, укажи хотя бы одно существенное ещё не опубликованное утверждение. Не повышай REPORT/CLAIM до FACT по одному новому пересказу. Для NOISE допустим пустой claims.''' 
+material означает существенность для аудитории, а не новизну для внутренней памяти. publication_count и наличие published_posts относятся ко всему сюжету, а не ко всем его событиям. Не утверждай, что конкретный факт опубликован, если facts.published=false и его нет в historical_publication_coverage или в тексте опубликованного поста. Пост об одной компании не покрывает другие компании, общий состав реестра или отдельную проведённую сделку. При relation=REPEAT и published=false существенная ещё не опубликованная новость сохраняет material=true. Повтор уже опубликованного или неважная деталь не становятся существенными по желанию. material_reason объясняет конкретно значение для аудитории на основе источника. Если рекомендуешь AUTO_PUBLISH, укажи хотя бы одно существенное ещё не опубликованное утверждение. Не повышай REPORT/CLAIM до FACT по одному новому пересказу. Для NOISE допустим пустой claims.''' 
 
 
 class MemoryInvalid(ValueError):
@@ -128,6 +128,16 @@ def now():
 
 def _id(text):
     return int(text) if str(text).isdigit() else None
+
+
+def latest_published_event_post(db, story_id, event_id, freshness_hours):
+    """A related story alone does not authorize editing a different event."""
+    return db.execute(
+        "SELECT p.post_id FROM posts p JOIN post_memory m USING(post_id) "
+        "WHERE p.story_id=? AND m.event_id=? AND p.status='PUBLISHED' "
+        "AND julianday(p.published_at)>=julianday('now',?) "
+        "ORDER BY p.published_at DESC,p.post_id DESC LIMIT 1",
+        (story_id, event_id, f'-{int(freshness_hours)} hours')).fetchone()
 
 
 def context(db, story_ids):
@@ -304,6 +314,24 @@ def _ingest(db, item_id, story_id, analysis, source, publisher_report=False):
         from .watch import touch
         touch(db, story_id, event_id)
     return diff
+
+
+def draft_post_claims(memory, diff, source):
+    """Keep rendering choices tied to the same validated claim and read text."""
+    options = [dict(claim) for claim in diff.get('post_claims', [])]
+    text = str((source or {}).get('content') or '')
+    for claim in (memory or {}).get('claims', []):
+        original = claim.get('post_quote', '')
+        quote = grounded_span(claim.get('source_quote', ''), text)
+        if not original or not quote or len(quote.strip()) < 24:
+            continue
+        for binding in diff.get('post_claims', []):
+            if binding['post_quote'] != original:
+                continue
+            candidate = {'fact_id': binding['fact_id'], 'post_quote': quote}
+            if candidate not in options:
+                options.append(candidate)
+    return options
 
 
 def bind_post(db, post_id, item_id, diff, text):
