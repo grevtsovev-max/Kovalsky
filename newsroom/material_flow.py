@@ -97,6 +97,8 @@ def save_draft_context(db, item_id, item, settings, context):
     mark(db, item_id, 'analysis', 'DONE', 'Событие и доказательства проверены.')
     if (context.get('ai_result') or {}).get('_needs_post_draft'):
         mark(db, item_id, 'drafting', 'READY', 'Ожидает написания по сохранённому анализу.')
+    elif (context.get('ai_result') or {}).get('_validation_pending'):
+        mark(db, item_id, 'drafting', 'DONE', 'Черновик подготовлен вместе с разбором; ожидает проверки текста.')
     else:
         mark(db, item_id, 'drafting', 'DONE', 'Текст сохранён.')
     db.commit()
@@ -207,6 +209,8 @@ def migrate(db):
 
 def verification_questions(result):
     questions = []
+    if result.get('_combined_editor') and result.get('reason'):
+        questions.append(str(result['reason'])[:400])
     for key in ('source_review_issues', 'memory_issues', 'editorial_issues'):
         values = result.get(key)
         questions.extend(str(x)[:400] for x in (values if isinstance(values, list) else []) if isinstance(x, str))

@@ -83,7 +83,7 @@ SCHEMA = {
     "required": ["action", "story_id", "is_relevant", "topic_category", "is_concrete", "implementation_stage", "geographic_scope", "russia_cis_impact", "impact_evidence", "importance", "freshness", "development_date", "development_date_evidence", "confidence", "headline_ru", "summary_ru", "what_is_new", "event_status", "publication_recommendation", "independent_check", "independent_check_note", "facts", "original_reporting_check", "editorial_check"]
 }
 
-FILTER_VERSION = 27
+FILTER_VERSION = 28
 
 
 def _load_editorial_rules(settings=None, stage='analysis') -> str:
@@ -210,6 +210,9 @@ def _request_response(payload, settings):
 
 def analysis_input(item, source, candidates, settings):
     """Canonical model context, shared by the request and its validated cache."""
+    from .compact_editor import enabled, input_data
+    if enabled(settings):
+        return input_data(item, source, candidates, settings)
     body = item.get("content") or item.get("description") or item.get("title", "")
     return {
         "source": {"name": source["name"], "reputation": source["reputation"], "priority": source["priority"],
@@ -233,6 +236,9 @@ def analyze(item: dict, source: dict, candidates: list[dict], settings: dict) ->
     api_key = get_api_key(settings)
     if not api_key:
         return None
+    from .compact_editor import enabled, analyze as combined_analyze
+    if enabled(settings):
+        return combined_analyze(item, source, candidates, settings)
     model = settings.get("model", "gpt-6-luna")
     request_data = {
         "model": model,

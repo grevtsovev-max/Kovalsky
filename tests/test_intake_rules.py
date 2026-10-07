@@ -101,16 +101,17 @@ class IntakeRulesTests(unittest.TestCase):
         from newsroom.ai import analyze
         settings = fixture()[2]
         item = {'title':'Сбер выпустил ЦФА', '_intake_filter':{'passed':True,'rule':'Бренд'}}
-        response = {'output':[{'content':[{'type':'output_text','text':json.dumps({'action':'NEW_STORY'})}]}]}
+        from compact_fixtures import compact_response, response as provider_response
+        response = provider_response(compact_response())
         with patch('newsroom.ai.get_api_key', return_value='test'), patch('newsroom.ai.request_response', return_value=response) as request:
             result = analyze(item, {'name':'Сбер','reputation':'unknown','priority':1}, [], settings)
         payload = request.call_args.args[0]
         schema = payload['text']['format']['schema']
         self.assertNotIn('is_relevant', schema['properties'])
         self.assertNotIn('topic_match', schema['properties'])
-        self.assertNotIn('NOISE', schema['properties']['action']['enum'])
-        context = json.loads(payload['input'][0]['content'])
-        self.assertIsNone(context['thematic_policy'])
+        self.assertNotIn('action', schema['properties'])
+        context = json.loads(payload['input'])
+        self.assertNotIn('thematic_policy', context)
         self.assertTrue(context['intake_selection']['passed'])
         self.assertTrue(result['is_relevant'])
 

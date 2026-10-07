@@ -2569,6 +2569,10 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             structured = [db.execute('SELECT * FROM stories WHERE story_id=?',(sid,)).fetchone() for sid in related]
             shortlist = (structured + [row for row in shortlist if row['story_id'] not in related])[:12]
             story_rows = list(story_rows) + [row for row in structured if row['story_id'] not in {s['story_id'] for s in story_rows}]
+        from .compact_editor import enabled as compact_editor_enabled
+        compact_editor = compact_editor_enabled(ai_settings)
+        if compact_editor:
+            shortlist = shortlist[:4]
         ai_candidates = [{"story_id": str(s["story_id"]), "headline": s["headline"],
                           "latest_information": s["latest_information"][:1200], "version": s["version"],
                           "publication_count": s["publication_count"],
@@ -2584,11 +2588,14 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             ai_input["publisher_report_exception"] = bool(publisher_report)
             ai_input["publisher_report"] = publisher_report
             ai_input["independent_sources"] = item.get("independent_sources", [])
-            ai_input["history_context"] = _history_context(db, item)
+            ai_input["history_context"] = [] if compact_editor else _history_context(db, item)
             from .interests import learning_context
             ai_input["interest_profile"] = {}
             if memory_mode in {"shadow", "enforce"}:
-                from .knowledge import context
+                if compact_editor:
+                    from .compact_editor import context
+                else:
+                    from .knowledge import context
                 ai_input["knowledge_context"] = context(db, [s['story_id'] for s in shortlist])
             ai_input['editorial_examples'] = []
             previous_analysis = db.execute("SELECT result_json FROM item_analysis WHERE item_id=?", (item_id,)).fetchone()
@@ -2615,6 +2622,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             history_revision = _editor_history_revision(db, item)
             from .ai import _load_editorial_rules
             rules = _load_editorial_rules(ai_options)
+            if compact_editor:
+                rules += _load_editorial_rules(ai_options, 'drafting')
             logic = (Path(__file__).resolve().parent.parent / "AGENT_LOGIC.md").read_text()
             semantic_settings = {key: value for key, value in ai_options.items()
                                  if key in {"model", "max_output_tokens", "max_post_length", "memory_mode"}}
@@ -2623,20 +2632,23 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 "settings": semantic_settings,
                 "rules": digest(rules), "logic": digest(logic), "filter_version": FILTER_VERSION,
                 "prompt_code": digest((Path(__file__).resolve().parent / 'ai.py').read_text()
-                                      + (Path(__file__).resolve().parent / 'knowledge.py').read_text()),
+                                      + (Path(__file__).resolve().parent / 'knowledge.py').read_text()
+                                      + (Path(__file__).resolve().parent / 'compact_editor.py').read_text()),
                 "date": now[:10]})
             db.commit()
             try:
                 try:
                     ai_result = yield Work("editor", analyze_with_ai, (ai_input, editor_source, ai_candidates, ai_options),
-                                           key=analysis_key, ttl=21600)
+                                           key=analysis_key, ttl=21600,
+                                           stage='editorial_draft' if compact_editor else 'editorial')
                 except AIResponseError as exc:
                     if exc.code != "OUTPUT_TOKEN_LIMIT":
                         raise
                     retry_options = dict(ai_options)
                     retry_options["max_output_tokens"] = max(8000, int(ai_options.get("max_output_tokens", 1800)) * 3)
                     ai_result = yield Work("editor", analyze_with_ai, (ai_input, editor_source, ai_candidates, retry_options),
-                                           key=analysis_key, ttl=21600)
+                                           key=analysis_key, ttl=21600,
+                                           stage='editorial_draft' if compact_editor else 'editorial')
             finally:
                 timings["ai_seconds"] += time.perf_counter() - stage_started
             if (ai_result is not None and ai_result.get('action') != 'NOISE'
@@ -2711,7 +2723,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             ai_result = _restore_exact_social_headline_evidence(ai_result, item, primary_source)
             ai_result = require_primary_source_review(ai_result, source_status, primary_source,
                                                        publisher_report=publisher_report,
-                                                       analysis_only=ai_result.get('_needs_post_draft') is True)
+                                                       analysis_only=(ai_result.get('_needs_post_draft') is True
+                                                                      or ai_result.get('_combined_editor') is True))
             independent_audit = [
                 {"publisher": candidate.get("publisher"), "title": candidate.get("title"),
                  "url": candidate.get("url"), "published_at": candidate.get("published_at"),
