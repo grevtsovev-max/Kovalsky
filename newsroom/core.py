@@ -529,7 +529,7 @@ class PublisherArticleParser(HTMLParser):
                         self.published_at = parse_date(value.get("datePublished")) or self.published_at
                         self.updated_at = parse_date(value.get("dateModified")) or self.updated_at
                         body = value.get("articleBody")
-                        if isinstance(body, str) and len(body.strip()) >= 100:
+                        if isinstance(body, str) and body.strip():
                             self.structured_article_bodies.append(body.strip())
                     for child in value.values():
                         if isinstance(child, (dict, list)):
@@ -814,12 +814,12 @@ def _fetch_publisher_article_native(url: str, publisher_name: str, published_at:
     content = "\n".join(blocks)
     description = html.unescape(parser.meta_description).strip()
     structured_body = max(parser.structured_article_bodies, key=len, default="")
-    if len(structured_body) >= 100:
+    if structured_body.strip():
         content = re.sub(r"\s+", " ", html.unescape(structured_body)).strip()
-    article_body_read = len(content) >= 100
-    if len(content) < 100 and len(description) >= 100:
+    article_body_read = bool(structured_body.strip()) or len(content) >= 100
+    if not article_body_read and len(content) < 100 and len(description) >= 100:
         content = description
-    if len(content) < 100 and not embedded_candidates:
+    if not article_body_read and len(content) < 100 and not embedded_candidates:
         raise ValueError("Publisher page has no readable article text")
     meta_title = parser.meta_title.strip()
     heading = parser.headings[0] if parser.headings else ""
@@ -1814,7 +1814,7 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
             return {"status": "REJECTED", "reason": "URL_NOT_FROM_SEARCH"}
         article = result
         content = str(article.get("content") or "")
-        if result.get("material_read") is not True or len(content.strip()) < 100:
+        if result.get("material_read") is not True or not content.strip():
             parsed = urllib.parse.urlsplit(url)
             try:
                 db.commit()
@@ -1837,9 +1837,9 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
         attempt = int(prior_search["attempt"] or 1) if prior_search else 1
         from .source_search import log as log_source_search
         primary_content = str(article.get("primary_source_content") or "")
-        article_readable = article.get("material_read") is True and len(content.strip()) >= 100
+        article_readable = article.get("material_read") is True and bool(content.strip())
         primary_readable = (article.get("primary_source_status") == "READ"
-                            and len(primary_content.strip()) >= 100)
+                            and bool(primary_content.strip()))
         readable = article_readable or primary_readable
         checked = [{"url": article.get("url") or url, "title": article.get("title", ""),
                     "publisher_name": article.get("publisher_name", ""),
@@ -1865,7 +1865,7 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
         read[article["url"]] = article
         primary_url = article.get("primary_source_url")
         if (primary_url and article.get("primary_source_status") == "READ"
-                and len(primary_content.strip()) >= 100):
+                and bool(primary_content.strip())):
             read[primary_url] = {
                 "url": primary_url, "title": article.get("primary_source_title") or "",
                 "publisher_name": article.get("primary_source_publisher") or "",
@@ -1933,7 +1933,7 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
         return None
     host = urllib.parse.urlsplit(selected).hostname or ""
     article_text = str(material.get("content") or "")[:12000]
-    if len(article_text.strip()) < 100:
+    if not article_text.strip():
         _trace_item(item, "Исследователь", "Непрочитанный результат",
                     "Не передаю поисковую страницу в редакторский этап без читаемого текста.")
         return None
@@ -2482,7 +2482,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 db.execute("UPDATE items SET primary_source_json=? WHERE item_id=?",
                            (_stored_primary(item, primary_source, source_status), item_id))
             elif (recovered.get("material_read") is True
-                  and len(str(recovered.get("content") or "").strip()) >= 100):
+                  and str(recovered.get("content") or "").strip()):
                 publisher_report = {
                     "publisher": recovered.get("publisher_name") or "Издание",
                     "url": recovered["url"], "title": recovered.get("title", ""),

@@ -112,7 +112,7 @@ def readable_result(result):
     if not isinstance(material, dict):
         return False
     text = material.get('content') or result.get('body') or material.get('primary_source_content') or ''
-    return (len(str(text).strip()) >= 24 and
+    return (bool(str(text).strip()) and
             (material.get('material_read') is True or material.get('primary_source_status') == 'READ'))
 
 

@@ -29,6 +29,15 @@ class PrimarySourceExtractionTests(unittest.TestCase):
         checker.start()
         self.addCleanup(checker.stop)
 
+    def test_short_complete_structured_article_is_read_without_replacing_with_description(self):
+        body = 'Банк получил лицензию.'
+        page = '<html><head><meta name="description" content="' + 'Длинное описание. ' * 20 + '">'
+        page += '<script type="application/ld+json">' + json.dumps({'@type': 'NewsArticle', 'articleBody': body}) + '</script></head><body></body></html>'
+        with patch('newsroom.core._request_with_url', return_value=(page.encode(), 'https://example.org/news', 'text/html')):
+            article = fetch_publisher_article('https://example.org/news', 'Издание', None, discover_primary=False)
+        self.assertTrue(article['material_read'])
+        self.assertEqual(article['content'], body)
+
     def test_zoom_modified_metadata_is_not_invented_publication_time(self):
         parser = PublisherArticleParser()
         parser.feed('<meta name="zoom:last-modified" content="Tue, 06 Oct 2026 15:16:00 GMT">')

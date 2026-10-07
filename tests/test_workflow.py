@@ -8,7 +8,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from newsroom.core import run_cycle, process_item, _save_item
 from newsroom.db import connect, connect_readonly
@@ -633,6 +633,18 @@ class WorkflowTests(unittest.TestCase):
             self.config['ai']['model'] = 'changed-model'
             process_item(self.db, self.source, self.item(), **self.options, ai_settings=self.config['ai'], existing_item_id=item_id)
             self.assertEqual(analyze.call_count, 2)
+
+    def test_short_read_material_is_cached_but_snippet_is_not(self):
+        from newsroom.workflow import readable_result
+        read = {'content': 'Банк получил лицензию.', 'material_read': True}
+        self.assertTrue(readable_result(read))
+        self.assertFalse(readable_result({**read, 'material_read': False}))
+        self.assertFalse(readable_result({'content': ' ', 'material_read': True}))
+        callback = Mock(return_value=read)
+        work = Work('collector', callback, key=cache_key('short-read', 1), ttl=60)
+        for _ in range(2):
+            self.assertEqual(work.execute(self.config['ai']['_runtime']), read)
+        callback.assert_called_once()
 
     def test_errors_are_never_cached(self):
         calls = []
