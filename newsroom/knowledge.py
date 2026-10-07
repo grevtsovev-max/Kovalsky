@@ -444,18 +444,19 @@ def grounded_span(proposed, source):
     """Locate an actual source span; only extra terminal punctuation may be dropped.
 
     Stored evidence always comes from source, never the model's edited quotation.
-    Offsets retain original whitespace/case; interior words and punctuation must match.
+    Offsets retain original whitespace/case/quote glyphs; interior words and other punctuation must match.
     """
+    quote_shapes = str.maketrans({char: '"' for char in '«»“”„‟'})
     normalized=[];positions=[]
     for offset,char in enumerate(source):
         if char.isspace():
             if normalized and normalized[-1]!=' ':
                 normalized.append(' ');positions.append(offset)
         else:
-            for part in char.casefold().replace('ё','е'):
+            for part in char.casefold().replace('ё','е').translate(quote_shapes):
                 normalized.append(part);positions.append(offset)
     haystack=''.join(normalized)
-    needle=norm(proposed)
+    needle=norm(proposed).translate(quote_shapes)
     for candidate in dict.fromkeys((needle,needle.rstrip('.!?;:,…'))):
         if len(candidate)<24:continue
         index=haystack.find(candidate)

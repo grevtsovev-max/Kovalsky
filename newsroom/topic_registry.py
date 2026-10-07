@@ -466,7 +466,14 @@ def grounded_match(result, thematic, source):
     if match.get('name') not in {t['name'] for t in thematic.get('topics',[])}:
         return False
     quote=match.get('evidence','')
-    return isinstance(quote,str) and len(quote.strip())>=24 and normalize(quote) in normalize(source.get('content',''))
+    if not isinstance(quote, str) or not isinstance(source.get('content', ''), str):
+        return False
+    from .knowledge import grounded_span
+    actual = grounded_span(quote, source.get('content', ''))
+    if actual is None:
+        return False
+    match['evidence'] = actual
+    return True
 
 
 def queue_rating(db, item_id):
