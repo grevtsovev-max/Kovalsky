@@ -360,6 +360,27 @@ class Coordinator:
         row = self.db.execute("SELECT j.status,j.owner,j.revision,i.ingest_revision FROM processing_jobs j JOIN items i USING(item_id) WHERE job_id=?", (job["job_id"],)).fetchone()
         return row and row["status"] == "RUNNING" and row["owner"] == self.owner and row['revision'] == row['ingest_revision']
 
+    def _finish_job(self, job, status, category, outcome, next_at, finished_at, error_code=None):
+        target_id = job['job_id']
+        if category != job['category']:
+            existing = self.db.execute(
+                'SELECT job_id FROM processing_jobs WHERE item_id=? AND revision=? AND category=?',
+                (job['item_id'], job['revision'], category)).fetchone()
+            if existing:
+                # A previous retry lane may already exist for this version.
+                # Keep both histories, but only its canonical retry job runnable.
+                target_id = existing['job_id']
+                self.db.execute("UPDATE processing_jobs SET status='SUPERSEDED',outcome=?,finished_at=?,"
+                                "owner=NULL,lease_until=NULL WHERE job_id=?",
+                                (outcome, stamp(), job['job_id']))
+                self._event(job['job_id'], 'editor', 'SUPERSEDED')
+                self.db.execute('UPDATE processing_jobs SET payload_json=? WHERE job_id=?',
+                                (job['payload_json'], target_id))
+        self.db.execute('UPDATE processing_jobs SET status=?,category=?,outcome=?,next_at=?,finished_at=?,'
+                        'error_code=?,owner=NULL,lease_until=NULL WHERE job_id=?',
+                        (status, category, outcome, next_at, finished_at, error_code, target_id))
+        self._event(target_id, 'editor', status)
+
     def _advance(self, job, generator, value=None, error=None):
         # Collection has its own connection. Validate under the write lock so
         # another material revision cannot enter midway through a local step.
@@ -394,10 +415,9 @@ class Coordinator:
                 # Jobs deferred only by capacity are resumed by this queue.
                 if outcome == 'WAITING_CONFIRMATION' and not capacity:
                     next_at = max(next_at, (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
-            self.db.execute("UPDATE processing_jobs SET status=?,category=?,outcome=?,next_at=?,finished_at=?,owner=NULL,lease_until=NULL WHERE job_id=?",
-                            ("WAITING" if held else "DONE", job['category'] if capacity or not held else 'retry',
-                             outcome, next_at, None if held else stamp(), job["job_id"]))
-            self._event(job["job_id"], "editor", "WAITING" if held else "DONE")
+            self._finish_job(job, "WAITING" if held else "DONE",
+                             job['category'] if capacity or not held else 'retry',
+                             outcome, next_at, None if held else stamp())
             self.db.commit()
             if not self.continuous and held and capacity and job.get('_item', {}).get('_budget_deferred'):
                 self.stop_admission = True
@@ -432,8 +452,8 @@ class Coordinator:
                 self.db.execute("UPDATE items SET disposition='REJECTED',processed_at=? WHERE item_id=?", (stamp(), job["item_id"]))
             retry = self.db.execute("SELECT value FROM app_state WHERE key=?", (f"selection_retry:{job['item_id']}",)).fetchone()
             due = json.loads(retry[0])["next_at"]
-            self.db.execute("UPDATE processing_jobs SET status=?,category='retry',error_code=?,next_at=?,finished_at=?,owner=NULL,lease_until=NULL WHERE job_id=?",
-                            (status, type(exc).__name__, due, stamp() if status == "DONE" else None, job["job_id"]))
+            self._finish_job(job, status, 'retry', 'ERROR', due,
+                             stamp() if status == "DONE" else None, type(exc).__name__)
             self.db.commit()
             return
         from .material_flow import mark
