@@ -102,7 +102,9 @@ def _development_date_issue(result: dict, source: dict | None, freshness_hours: 
         short_dates = {f'{event_date.day} {month}' for month in russian_months}
         short_dates.add(event_date.strftime('%d.%m'))
         if (not re.search(r'\b(?:19|20)\d{2}\b', evidence_norm) and event_date.year == inferred_year) and any(
-                re.search(r'(?<!\w)' + re.escape(normalize(token)) + r'(?![\w.])', evidence_norm)
+                re.search(r'(?<!\w)' + re.escape(normalize(token))
+                          + (r'(?![\w.])' if token == event_date.strftime('%d.%m') else r'(?!\w)'),
+                          evidence_norm)
                 for token in short_dates):
             confirmed = True
         if re.search(r'\bсегодня\b', evidence_norm) and event_date == anchor:
