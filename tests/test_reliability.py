@@ -8,6 +8,12 @@ from newsroom.quality import editorial_issues
 from newsroom.db import connect
 
 class ReliabilityTests(unittest.TestCase):
+    def setUp(self):
+        from policy_fixtures import final_check
+        checker = patch('newsroom.ai.validate_draft', side_effect=final_check)
+        checker.start()
+        self.addCleanup(checker.stop)
+
     def test_api_error_code_is_specific_without_message_or_secret(self):
         err=HTTPError('https://api.openai.com',403,'private',{},io.BytesIO(json.dumps({'error':{'code':'unsupported_country_region_territory','message':'secret'}}).encode()))
         with patch('newsroom.ai.get_api_key',return_value='secret'),patch('newsroom.ai.urllib.request.urlopen',side_effect=err) as call:
@@ -85,7 +91,7 @@ class QueueTriageTests(unittest.TestCase):
             item={'url':'https://example.org/1','title':'Биржа в Корее запустила торги','published_at':datetime.now(timezone.utc).isoformat()}
             result={'action':'NOISE','is_relevant':False,'geographic_scope':'OTHER','russia_cis_impact':'NONE','publication_recommendation':'DO_NOT_PUBLISH'}
             with patch('newsroom.core.fetch_publisher_article',side_effect=TimeoutError),patch('newsroom.core.get_api_key',return_value='test'),patch('newsroom.core.analyze_with_ai',return_value=result):
-                self.assertEqual(process_item(db,source,item,.35,3500,48,ai_settings={}), 'NOISE')
+                self.assertEqual(process_item(db,source,item,.35,3500,48,ai_settings={}), 'PRIMARY_RETRY')
             self.assertEqual(db.execute('select count(*) from posts').fetchone()[0],0)
     def test_quality_failure_blocks_manual_send_too(self):
         from newsroom.cli import publish

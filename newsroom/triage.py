@@ -235,11 +235,15 @@ def schedule_retry(db, item_id, outcome, now=None, retry=True, reason=None, dela
     now = now or datetime.now(timezone.utc)
     key = 'selection_retry:'+str(item_id)
     if outcome not in {'PRIMARY_RETRY', 'AI_RETRY', 'WAITING_CONFIRMATION', 'ERROR'}:
-        db.execute('DELETE FROM app_state WHERE key=?', (key,))
+        prior = _state(db, key)
+        if prior:
+            prior.update(outcome=outcome, completed_at=now.isoformat())
+            prior.pop('next_at', None)
+            save_state(db, key, prior)
         return
     prior = _state(db, key) or {}
     attempts = prior.get('attempts', 0) + (1 if retry else 0)
-    minutes = (1, 2, 3, 3, 3)[min(max(attempts - 1, 0), 4)]
+    minutes = (1, 3, 10)[min(max(attempts, 0), 2)]
     next_at = now + (timedelta(seconds=max(1, int(delay_seconds))) if delay_seconds is not None
                      else timedelta(minutes=minutes))
     state = {'attempts': attempts, 'next_at': next_at.isoformat(), 'outcome': outcome}

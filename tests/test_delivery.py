@@ -52,9 +52,24 @@ class DeliveryTests(unittest.TestCase):
 
     def test_definitive_rejection_retries_at_most_three_times(self):
         self.send.side_effect = DeliveryRejected('rejected')
-        for _ in range(4):
-            with self.assertRaises(DeliveryRejected): self.deliver()
-        self.assertEqual(self.send.call_count, 3)
+        from datetime import datetime, timedelta, timezone
+        current = datetime.now(timezone.utc)
+        for index in range(5):
+            with patch('newsroom.delivery.now', return_value=(current + timedelta(seconds=index*301)).isoformat()):
+                with self.assertRaises(DeliveryRejected): self.deliver()
+        self.assertEqual(self.send.call_count, 4)
+
+    def test_definitive_failure_waits_without_consuming_attempt(self):
+        from newsroom.runtime import BudgetDeferred
+        self.send.side_effect = DeliveryRejected('rejected')
+        with self.assertRaises(DeliveryRejected):
+            self.deliver()
+        with self.assertRaises(BudgetDeferred) as waiting:
+            self.deliver()
+        self.assertGreater(waiting.exception.delay_seconds, 0)
+        self.assertLessEqual(waiting.exception.delay_seconds, 30)
+        self.send.assert_called_once()
+        self.assertEqual(self.db.execute('SELECT attempt_count FROM publication_attempts').fetchone()[0], 1)
 
     def test_second_connection_cannot_send_while_first_is_in_flight(self):
         def sending(config, text):
@@ -76,6 +91,14 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT external_id FROM posts').fetchone()[0], '42')
         self.assertEqual(self.db.execute('SELECT publication_count FROM stories').fetchone()[0], 1)
         self.send.assert_called_once()
+
+    def test_reservation_rechecks_actual_saved_text_before_transport(self):
+        self.db.execute("INSERT INTO stories(story_id,canonical_topic,headline,first_seen_at,last_updated_at) VALUES(1,'a','a','2026','2026')")
+        self.db.execute("INSERT INTO posts(post_id,story_id,text,created_at,version,post_hash) VALUES(1,1,'new unverified body','2026',1,'hash')")
+        with self.assertRaisesRegex(DeliveryRejected, 'changed before reservation'):
+            deliver(self.db, self.config, 'post:1', 'previous checked body', self.send, post_id=1)
+        self.send.assert_not_called()
+        self.assertEqual(self.db.execute('SELECT count(*) FROM publication_attempts').fetchone()[0], 0)
 
     def test_only_matching_actual_channel_update_resolves_unknown(self):
         self.send.side_effect = TimeoutError()
@@ -104,6 +127,39 @@ class DeliveryTests(unittest.TestCase):
             raise TimeoutError()
         self.assertEqual(self.deliver(send=sending), '42')
         self.assertEqual(self.db.execute('SELECT status FROM publication_attempts').fetchone()[0], 'SENT')
+
+    def test_rate_limit_is_durable_and_does_not_consume_failure_attempts(self):
+        from newsroom.delivery import DeliveryRateLimited
+        from datetime import datetime, timedelta, timezone
+        current = datetime.now(timezone.utc)
+        with patch('newsroom.delivery.now', return_value=current.isoformat()):
+            with self.assertRaises(DeliveryRateLimited):
+                self.deliver(send=Mock(side_effect=DeliveryRateLimited(80)))
+            row = self.db.execute('SELECT * FROM publication_attempts').fetchone()
+            self.assertEqual((row['status'], row['attempt_count']), ('PREPARED', 0))
+            with self.assertRaises(DeliveryRateLimited):
+                self.deliver()
+            self.send.assert_not_called()
+            with self.assertRaises(DeliveryRateLimited):
+                deliver(self.db, self.config, 'another-operation', 'other text', self.send)
+            self.assertEqual(self.db.execute('SELECT count(*) FROM publication_attempts').fetchone()[0], 1)
+        with patch('newsroom.delivery.now', return_value=(current + timedelta(seconds=81)).isoformat()):
+            self.assertEqual(self.deliver(), '42')
+        self.send.assert_called_once()
+        self.assertEqual(self.db.execute('SELECT attempt_count FROM publication_attempts').fetchone()[0], 1)
+
+    def test_http_429_preserves_retry_after(self):
+        import io
+        from urllib.error import HTTPError
+        from newsroom.cli import telegram_api
+        from newsroom.delivery import DeliveryRateLimited
+        error = HTTPError('https://api.telegram.org', 429, 'Too many requests', {},
+                          io.BytesIO(json.dumps({'ok': False, 'error_code': 429,
+                                                'parameters': {'retry_after': 57}}).encode()))
+        with patch('newsroom.cli.telegram_token', return_value='test'), patch('newsroom.cli.urllib.request.urlopen', side_effect=error):
+            with self.assertRaises(DeliveryRateLimited) as caught:
+                telegram_api({}, 'sendMessage', {})
+        self.assertEqual(caught.exception.delay_seconds, 57)
 
     def test_malformed_api_reply_is_not_a_definitive_rejection(self):
         from newsroom.cli import telegram_api

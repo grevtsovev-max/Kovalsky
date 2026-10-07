@@ -11,6 +11,10 @@ from newsroom.cli import is_eligible_for_auto_publish
 
 class RecoveryIntegrationTests(unittest.TestCase):
     def setUp(self):
+        from policy_fixtures import final_check
+        checker = patch('newsroom.ai.validate_draft', side_effect=final_check)
+        checker.start()
+        self.addCleanup(checker.stop)
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.db = connect(str(Path(self.tmp.name)/'test.db')); self.addCleanup(self.db.close)
         self.db.execute("INSERT INTO sources(name,type,url) VALUES('Регулятор','rss','https://example.org/feed')")
@@ -37,7 +41,11 @@ class RecoveryIntegrationTests(unittest.TestCase):
         with patch('newsroom.core.fetch_publisher_article',side_effect=TimeoutError), patch('newsroom.core.analyze_with_ai') as analyze:
             self.assertEqual(self.process(),'PRIMARY_RETRY'); analyze.assert_not_called()
         with patch('newsroom.core.fetch_publisher_article',return_value=self.article), patch('newsroom.core.get_api_key',return_value='test'), patch('newsroom.core.analyze_with_ai',return_value=self.result):
+            self.db.execute("UPDATE app_state SET value=json_set(value,'$.next_at','2000-01-01T00:00:00+00:00') WHERE key LIKE 'selection_retry:%'")
+            self.db.commit()
             self.assertEqual(_retry_ai_held_items(self.db,{self.source['source_id']:self.source},self.config),{'NEW_STORY':1})
+            self.db.execute("UPDATE app_state SET value=json_set(value,'$.next_at','2000-01-01T00:00:00+00:00') WHERE key LIKE 'selection_retry:%'")
+            self.db.commit()
             self.assertEqual(_retry_ai_held_items(self.db,{self.source['source_id']:self.source},self.config),{})
         self.assert_ready()
 
@@ -45,6 +53,8 @@ class RecoveryIntegrationTests(unittest.TestCase):
         with patch('newsroom.core.fetch_publisher_article',return_value=self.article), patch('newsroom.core.get_api_key',return_value='test'), patch('newsroom.core.analyze_with_ai',side_effect=AIResponseError('INVALID_STRUCTURED_OUTPUT_JSON')):
             self.assertEqual(self.process(),'AI_RETRY')
         with patch('newsroom.core.fetch_publisher_article') as fetch, patch('newsroom.core.get_api_key',return_value='test'), patch('newsroom.core.analyze_with_ai',return_value=self.result) as analyze:
+            self.db.execute("UPDATE app_state SET value=json_set(value,'$.next_at','2000-01-01T00:00:00+00:00') WHERE key LIKE 'selection_retry:%'")
+            self.db.commit()
             _retry_ai_held_items(self.db,{self.source['source_id']:self.source},self.config)
             fetch.assert_not_called()
             self.assertEqual(analyze.call_args.args[0]['primary_source']['content'],self.evidence)

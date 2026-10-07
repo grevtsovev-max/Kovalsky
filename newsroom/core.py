@@ -116,8 +116,6 @@ def _development_date_issue(result: dict, source: dict | None, freshness_hours: 
     today = datetime.now(timezone.utc).date()
     if event_date > today:
         return ("unverified", "Дата события находится в будущем.")
-    if (today - event_date).total_seconds() > max(1, freshness_hours) * 3600:
-        return ("stale", f"Последнее подтверждённое изменение датировано {event_date.isoformat()} и старше окна свежести; новой стадии или более позднего изменения источник не подтверждает.")
     return None
 
 
@@ -149,6 +147,11 @@ def canonicalize(url: str) -> str:
 def parse_date(value: str | None) -> str | None:
     if not value:
         return None
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+        try:
+            return datetime.fromisoformat(value).date().isoformat()
+        except ValueError:
+            return None
     try:
         date = parsedate_to_datetime(value)
         if date.tzinfo is None:
@@ -430,6 +433,10 @@ def decode_google_news_url(url: str) -> str:
 class PublisherArticleParser(HTMLParser):
     SKIP = {"script", "style", "nav", "header", "footer", "aside", "noscript", "svg", "form"}
     TEXT_TAGS = {"h1", "h2", "h3", "p", "blockquote", "li", "time"}
+    CHROME_CLASSES = {"related", "related-posts", "related-articles", "recommendations",
+                      "advertisement", "ad-banner", "ads", "view-count", "views-count",
+                      "social-share", "share-buttons", "cookie-banner", "cookie-consent"}
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -457,7 +464,10 @@ class PublisherArticleParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
-        if tag == "time" and values.get("datetime"):
+        chrome = (bool(self.CHROME_CLASSES.intersection((values.get('class') or '').lower().split()))
+                  or values.get('role', '').lower() in {'navigation', 'banner', 'contentinfo', 'complementary'}
+                  or 'hidden' in values or values.get('aria-hidden', '').lower() == 'true')
+        if tag == "time" and not self.skip_stack and not chrome and values.get("datetime"):
             date_value = parse_date(values.get("datetime"))
             class_names = (values.get("class") or "").lower().split()
             if date_value and any(token in " ".join(class_names) for token in ("updated", "modified")):
@@ -488,11 +498,10 @@ class PublisherArticleParser(HTMLParser):
                 self.meta_description = values["content"]
         elif tag == "link" and "canonical" in values.get("rel", "").lower():
             self.canonical_url = values.get("href", "")
-        related_classes = {"related", "related-posts", "related-articles", "recommendations"}
-        if (tag in self.SKIP
-                or related_classes.intersection((values.get("class") or "").lower().split())
+        if (tag in self.SKIP or chrome
                 or (self.skip_stack and tag == self.skip_stack[-1])):
-            self.skip_stack.append(tag)
+            if tag not in self.VOID_TAGS:
+                self.skip_stack.append(tag)
             return
         if self.skip_stack:
             return
@@ -526,7 +535,7 @@ class PublisherArticleParser(HTMLParser):
                         self.published_at = parse_date(value.get("datePublished")) or self.published_at
                         self.updated_at = parse_date(value.get("dateModified")) or self.updated_at
                         body = value.get("articleBody")
-                        if isinstance(body, str) and len(body.strip()) >= 100:
+                        if isinstance(body, str) and body.strip():
                             self.structured_article_bodies.append(body.strip())
                     for child in value.values():
                         if isinstance(child, (dict, list)):
@@ -811,12 +820,12 @@ def _fetch_publisher_article_native(url: str, publisher_name: str, published_at:
     content = "\n".join(blocks)
     description = html.unescape(parser.meta_description).strip()
     structured_body = max(parser.structured_article_bodies, key=len, default="")
-    if len(structured_body) >= 100:
+    if structured_body.strip():
         content = re.sub(r"\s+", " ", html.unescape(structured_body)).strip()
-    article_body_read = len(content) >= 100
-    if len(content) < 100 and len(description) >= 100:
+    article_body_read = bool(structured_body.strip()) or len(content) >= 100
+    if not article_body_read and len(content) < 100 and len(description) >= 100:
         content = description
-    if len(content) < 100 and not embedded_candidates:
+    if not article_body_read and len(content) < 100 and not embedded_candidates:
         raise ValueError("Publisher page has no readable article text")
     meta_title = parser.meta_title.strip()
     heading = parser.headings[0] if parser.headings else ""
@@ -1393,12 +1402,12 @@ def _limit_headline(headline: str, maximum: int = 115) -> str:
     return excerpt.rstrip(" ,;:—-") + "…"
 
 
-def make_post(headline: str, description: str, source_name: str, url: str, max_length: int) -> str:
+def make_post(headline: str, description: str, source_name: str, url: str, max_length: int, *, preserve_content=False) -> str:
     host = (urllib.parse.urlsplit(url).hostname or "").lower().removeprefix("www.")
     brands = {"tass.ru":"ТАСС", "ria.ru":"РИА Новости", "rbc.ru":"РБК", "interfax.ru":"Интерфакс",
               "cbr.ru":"Банк России", "minfin.gov.ru":"Минфин России", "duma.gov.ru":"Госдума", "rg.ru":"Российская газета"}
     source_name = brands.get(host, re.sub(r"\s*\((?:Telegram|RSS)\)\s*$", "", source_name))
-    headline = _limit_headline(headline)
+    headline = headline.strip() if preserve_content else _limit_headline(headline)
     body = html.unescape(description).replace("\r\n", "\n").replace("\r", "\n")
     paragraphs = [re.sub(r"[ \t]+", " ", part).strip() for part in re.split(r"\n\s*\n", body)]
     # Citation is assembled once by the application, even if the model returned
@@ -1410,7 +1419,7 @@ def make_post(headline: str, description: str, source_name: str, url: str, max_l
         body = body[len(headline):].lstrip(" —–:;,.\t\n")
     footer = f"Источник: [{source_name}]({url})"
     budget = max(80, max_length - len(footer) - len(headline) - 4)
-    if len(body) > budget:
+    if len(body) > budget and not preserve_content:
         excerpt = body[:budget]
         minimum_boundary = int(budget * 0.60)
         boundaries = [match.end() for match in re.finditer(r"[.!?…](?:[»”\"')\]]*)\s+", excerpt)]
@@ -1574,7 +1583,8 @@ def _stored_primary(item: dict, primary: dict | None, status: str) -> str:
 def _impact_evidence_is_grounded(ai_result: dict, primary_source: dict | None) -> bool:
     evidence = re.sub(r"\s+", " ", str(ai_result.get("impact_evidence") or "").strip().strip('"“”«»'))
     source_text = re.sub(r"\s+", " ", str((primary_source or {}).get("content") or "").strip())
-    return len(evidence) >= 24 and evidence.casefold() in source_text.casefold()
+    from .knowledge import grounded_span
+    return grounded_span(evidence, source_text, min_length=1) is not None
 
 
 def _restore_exact_social_headline_evidence(ai_result: dict, item: dict,
@@ -1608,8 +1618,9 @@ def _source_evidence_issues(result: dict, content: str, *, analysis_only=False) 
     issues = []
     if audit.get('central_claim_supported') is not True:
         issues.append('Не подтверждено центральное утверждение прочитанным материалом.')
-    if len(quote.strip()) < 24 or ' '.join(quote.casefold().split()) not in ' '.join(content.casefold().split()):
-        issues.append('Нужна дословная подтверждающая выдержка из прочитанного материала длиной не менее 24 символов.')
+    from .knowledge import grounded_span
+    if grounded_span(quote, content, min_length=1) is None:
+        issues.append('Нужна подтверждающая выдержка из фактически прочитанного материала.')
     if not analysis_only and audit.get('attribution_preserved') is not True:
         issues.append('Не подтверждено сохранение атрибуции автора сообщения.')
     claims = result.get('facts') or []
@@ -1642,7 +1653,7 @@ def require_primary_source_review(ai_result: dict | None, source_status: str, pr
         audit = result.get("original_reporting_check") or {}
         quote = audit.get("evidence", "")
         supported = (audit.get("central_claim_supported") is True
-                     and len(quote.strip()) >= 24
+                     and bool(quote.strip())
                      and " ".join(quote.casefold().split()) in " ".join(primary_source["content"].casefold().split())
                      and (analysis_only or audit.get("attribution_preserved") is True)
                      and result.get("facts")
@@ -1809,7 +1820,7 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
             return {"status": "REJECTED", "reason": "URL_NOT_FROM_SEARCH"}
         article = result
         content = str(article.get("content") or "")
-        if result.get("material_read") is not True or len(content.strip()) < 100:
+        if result.get("material_read") is not True or not content.strip():
             parsed = urllib.parse.urlsplit(url)
             try:
                 db.commit()
@@ -1832,9 +1843,9 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
         attempt = int(prior_search["attempt"] or 1) if prior_search else 1
         from .source_search import log as log_source_search
         primary_content = str(article.get("primary_source_content") or "")
-        article_readable = article.get("material_read") is True and len(content.strip()) >= 100
+        article_readable = article.get("material_read") is True and bool(content.strip())
         primary_readable = (article.get("primary_source_status") == "READ"
-                            and len(primary_content.strip()) >= 100)
+                            and bool(primary_content.strip()))
         readable = article_readable or primary_readable
         checked = [{"url": article.get("url") or url, "title": article.get("title", ""),
                     "publisher_name": article.get("publisher_name", ""),
@@ -1860,7 +1871,7 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
         read[article["url"]] = article
         primary_url = article.get("primary_source_url")
         if (primary_url and article.get("primary_source_status") == "READ"
-                and len(primary_content.strip()) >= 100):
+                and bool(primary_content.strip())):
             read[primary_url] = {
                 "url": primary_url, "title": article.get("primary_source_title") or "",
                 "publisher_name": article.get("primary_source_publisher") or "",
@@ -1928,7 +1939,7 @@ def _agent_recover_steps(db, item, settings, source, item_id=None):
         return None
     host = urllib.parse.urlsplit(selected).hostname or ""
     article_text = str(material.get("content") or "")[:12000]
-    if len(article_text.strip()) < 100:
+    if not article_text.strip():
         _trace_item(item, "Исследователь", "Непрочитанный результат",
                     "Не передаю поисковую страницу в редакторский этап без читаемого текста.")
         return None
@@ -2098,9 +2109,11 @@ def _editor_history_revision(db, item):
     snapshots = {"stories": related}
     for table in ("posts", "story_facts", "publication_coverage"):
         marks = ','.join('?' for _ in ids) or 'NULL'
-        snapshots[table] = [tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE story_id IN ({marks})", ids)]
-    snapshots['feedback'] = [tuple(row) for row in db.execute(
-        "SELECT feedback_id,feedback_type,reason,item_title,post_text,item_id,story_id FROM editorial_feedback ORDER BY feedback_id DESC LIMIT 400")]
+        published_only = " AND status='PUBLISHED'" if table == 'posts' else ''
+        snapshots[table] = [tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE story_id IN ({marks}){published_only}", ids)]
+    # Unrelated feedback does not invalidate a material. Registered rules are
+    # versioned independently by the policy dependency.
+    snapshots['feedback'] = []
     return cache_key("editor-history", snapshots)
 
 
@@ -2109,7 +2122,7 @@ def _save_item(db, source, item, existing_item_id=None):
     now = NOW()
     from .runtime import cache_key
     ingest_revision = cache_key('material-version', {key: item.get(key) for key in (
-        'url', 'title', 'description', 'content', 'author', 'published_at', 'updated_at')})
+        'url', 'title', 'description', 'content', 'author', 'published_at')})
     canonical = canonicalize(item["url"])
     body = item.get("content") or item.get("description") or item["title"]
     content_hash, title_hash = digest(body), digest(item["title"].lower().strip())
@@ -2139,17 +2152,18 @@ def _save_item(db, source, item, existing_item_id=None):
                 same_metadata = (prior["title_hash"] == title_hash
                                  and prior["description"] == item.get("description", "")
                                  and prior["author"] == item.get("author")
-                                 and prior["published_at"] == item.get("published_at")
-                                 and prior["updated_at"] == item.get("updated_at"))
+                                 and prior["published_at"] == item.get("published_at"))
                 stored_feed_hash = prior["feed_content_hash"] if "feed_content_hash" in prior.keys() else ""
                 # `items.content` is enriched with fetched article text. Compare a
                 # feed poll to its own last-seen body so enrichment cannot reset retries.
                 unchanged = (prior['ingest_revision'] == ingest_revision or
                              same_metadata and (not stored_feed_hash or stored_feed_hash == feed_content_hash))
                 if unchanged:
-                    if not stored_feed_hash:
-                        db.execute("UPDATE items SET feed_content_hash=? WHERE item_id=?",
-                                   (feed_content_hash, prior["item_id"]))
+                    # A changed modification clock alone is metadata, not a new
+                    # article version or permission to reset bounded attempts.
+                    if not stored_feed_hash or prior['updated_at'] != item.get('updated_at'):
+                        db.execute("UPDATE items SET feed_content_hash=?,updated_at=? WHERE item_id=?",
+                                   (stored_feed_hash or feed_content_hash, item.get('updated_at'), prior['item_id']))
                         db.commit()
                     return None
                 item_id = prior["item_id"]
@@ -2182,6 +2196,10 @@ def _save_item(db, source, item, existing_item_id=None):
         if "UNIQUE" in str(exc):
             return None
         raise
+    saved = db.execute('SELECT ingest_revision,discovered_at FROM items WHERE item_id=?', (item_id,)).fetchone()
+    receipt = now if existing_item_id is None else saved['discovered_at']
+    db.execute('INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING',
+               (f"material_received:{item_id}:{saved['ingest_revision']}", json.dumps({'at': receipt})))
     return item_id
 
 
@@ -2215,6 +2233,15 @@ def process_item_steps(db, source, item: dict, threshold: float, max_length: int
             if item.get('_technical_error'):
                 outcome = 'TECHNICAL_ERROR'
                 db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (outcome, NOW(), row['item_id']))
+            if outcome in {"PRIMARY_RETRY", "AI_RETRY", "WAITING_CONFIRMATION"} and item.get('_flow_block_kind') == 'transport':
+                from .material_flow import transport_retry
+                exhausted, delay = transport_retry(db, row['item_id'], item.get('_retry_reason', 'Ошибка внешнего запроса'))
+                item['_retry_without_count'] = True
+                item['_retry_delay_seconds'] = delay
+                if exhausted:
+                    outcome = 'TECHNICAL_ERROR'
+                    item['_retry_reason'] = 'Технические повторы исчерпаны; требуется восстановление сервиса. ' + item.get('_retry_reason', '')
+                    db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (outcome, NOW(), row['item_id']))
             if outcome in {"PRIMARY_RETRY", "AI_RETRY", "WAITING_CONFIRMATION"}:
                 retry_without_count = bool(item.get("_retry_without_count") or item.get("_source_search_deferred"))
                 attempts = schedule_retry(
@@ -2290,7 +2317,8 @@ def process_item_steps(db, source, item: dict, threshold: float, max_length: int
             item_row = None
         _log_timing("item_processing_timing", item_id=item_row["item_id"] if item_row else None,
                     source=source["name"], source_type=source["type"], outcome=outcome,
-                    source_published_at=(item.get("updated_at") or item.get("published_at")),
+                    source_published_at=item.get("published_at"),
+                    source_updated_at=item.get("updated_at"),
                     discovered_at=item_row["discovered_at"] if item_row else None,
                     processed_at=NOW(), total_seconds=round(time.perf_counter() - started, 3),
                     primary_source_read_seconds=round(timings["primary_source_read_seconds"], 3),
@@ -2322,13 +2350,15 @@ def _read_material_report(source, item: dict, body: str) -> dict | None:
     """
     role = source["source_role"] if "source_role" in source.keys() else "aggregator"
     url = item.get("material_url") or item.get("url", "")
-    if (item.get("material_read") is not True or len((body or "").strip()) < 24
+    if (item.get("material_read") is not True or not (body or "").strip()
             or not str(url).startswith(("https://", "http://"))):
         return None
     return {"publisher": item.get("publisher_name") or source["name"], "url": url,
             "title": item.get("title", ""), "content": body, "type": "ATTRIBUTED_REPORT",
             "material_read": True, "source_role": role,
-            "published_at": item.get("published_at") or item.get("updated_at"),
+            "published_at": item.get("published_at"),
+            "updated_at": item.get("updated_at"),
+            "source_timezone": item.get("source_timezone"),
             "forwarded": bool(item.get("telegram_forwarded")),
             "priority": int(source["priority"]), "reputation": source["reputation"]}
 
@@ -2361,29 +2391,17 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
         db.commit()
         return "NOISE"
-    event_time = item.get("updated_at") or item.get("published_at")
-    # Search citations contain a URL and headline, not a verified publication
-    # date. Read the publisher page before deciding whether its date is absent.
-    date_pending = not event_time and source['type'] == 'web_search'
-    if not event_time and not date_pending:
-        _trace_item(item, "Дата публикации", "Отсеян", "У материала не указана дата публикации.")
-        db.execute("UPDATE items SET disposition='UNDATED',processed_at=? WHERE item_id=?", (now, item_id))
+    from .policy import admission
+    date_pending = not item.get('published_at')
+    date_issue = admission(db, item_id, item, source, freshness_hours, initial_backfill_minutes)
+    age_hours = 0  # Admission owns date decisions; queue waiting is never article age.
+    if date_issue:
+        outcome, reason = date_issue
+        item['_retry_reason'] = reason
+        _trace_item(item, 'Окно поступления', outcome, reason)
+        db.execute('UPDATE items SET disposition=?,processed_at=? WHERE item_id=?', (outcome, now, item_id))
         db.commit()
-        return "UNDATED"
-    try:
-        age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(event_time.replace("Z", "+00:00"))).total_seconds() / 3600 if event_time else 0
-    except ValueError:
-        age_hours = 0
-    if initial_backfill_minutes is not None and age_hours * 60 > initial_backfill_minutes:
-        _trace_item(item, "Первичная загрузка", "Отсеян", "Материал старше окна первичной загрузки.")
-        db.execute("UPDATE items SET disposition='BASELINE_SKIPPED',processed_at=? WHERE item_id=?", (now, item_id))
-        db.commit()
-        return "BASELINE_SKIPPED"
-    if age_hours > freshness_hours:
-        _trace_item(item, "Свежесть", "Отсеян", f"Материал старше окна свежести ({freshness_hours} ч).")
-        db.execute("UPDATE items SET disposition='STALE',processed_at=? WHERE item_id=?", (now, item_id))
-        db.commit()
-        return "STALE"
+        return outcome
     # Use the headline and publisher's summary for topic screening; long article bodies can mention unrelated keywords.
     relevance_text = f"{item['title']} {item.get('description', '')}"
     if source["type"] == "manual" and item.get("material_read") is True:
@@ -2396,15 +2414,12 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         relevance_terms = []  # Ignore legacy terms embedded in persisted jobs.
         if not thematic.get('topics'):
             _trace_item(item, "Тематический фильтр", "Отсеян", "В таблице нет включённых тем мониторинга.")
-            db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
+            item["_retry_reason"] = "В темнике нет включённых тем; настройка требует исправления."
+            db.execute("UPDATE items SET disposition='TECHNICAL_ERROR',processed_at=? WHERE item_id=?", (now, item_id))
             db.commit()
-            return "NOISE"
-    if relevance_terms and not is_relevant(relevance_text, relevance_terms):
-        _trace_item(item, "Тематический фильтр", "Отсеян",
-                    "В заголовке и описании не найдено совпадений с темами мониторинга.")
-        db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
-        db.commit()
-        return "NOISE"
+            return "TECHNICAL_ERROR"
+    # Keyword matches trigger collection. Only the read material's semantic
+    # decision may reject a story for topic mismatch.
     from .material_flow import load_draft_context
     resume_context = load_draft_context(db, item_id, item, ai_settings or {})
     if resume_context:
@@ -2412,32 +2427,6 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                     'Сохранённый анализ действителен; чтение и полный анализ не повторяются.')
         return (yield from _finish_post_steps(db, item, ai_settings or {}, resume_context))
     selection = None
-    if ai_settings and ai_settings.get("triage_enabled"):
-        stage_started = time.perf_counter()
-        selection = yield from resolve_steps(screen_item(db, item_id, item, ai_settings, steps=True))
-        timings["ai_seconds"] += time.perf_counter() - stage_started
-        decision = selection["decision"]
-        item["_audit_triage"] = {key: selection.get(key) for key in
-                                 ("decision", "reason", "evidence", "confidence", "origin") if selection.get(key) is not None}
-        _trace_item(item, "Предварительный ИИ-отбор", decision,
-                    selection.get("reason") or "Предварительный отбор завершён.",
-                    evidence=selection.get("evidence"), confidence=selection.get("confidence"))
-        if decision in {"NOISE", "DEFER"} or (decision == "DUPLICATE" and not memory_enforced):
-            outcome = "AI_RETRY" if decision == "DEFER" else decision
-            if decision == "DEFER":
-                item["_retry_without_count"] = bool(selection.get("retry_without_count"))
-                item['_budget_deferred'] = bool(selection.get('budget_deferred'))
-                item['_history_changed'] = bool(selection.get('history_changed'))
-                if selection.get('retry_delay_seconds'):
-                    item['_retry_delay_seconds'] = selection['retry_delay_seconds']
-                item["_retry_reason"] = selection.get("reason")
-                item["_technical_error"] = selection.get("technical_error", False)
-                item["_flow_block_kind"] = selection.get("block_kind")
-            story_id = int(selection["story_id"]) if decision == "DUPLICATE" else None
-            db.execute("UPDATE items SET disposition=?,story_id=?,processed_at=? WHERE item_id=?",
-                       (outcome, story_id, now, item_id))
-            db.commit()
-            return outcome
     if source["type"] in {"rss", "web", "google_news", "web_search", "x", "telegram"} and item.get("primary_source_status") is None:
         stage_started = time.perf_counter()
         db.commit()
@@ -2503,7 +2492,7 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 db.execute("UPDATE items SET primary_source_json=? WHERE item_id=?",
                            (_stored_primary(item, primary_source, source_status), item_id))
             elif (recovered.get("material_read") is True
-                  and len(str(recovered.get("content") or "").strip()) >= 100):
+                  and str(recovered.get("content") or "").strip()):
                 publisher_report = {
                     "publisher": recovered.get("publisher_name") or "Издание",
                     "url": recovered["url"], "title": recovered.get("title", ""),
@@ -2530,8 +2519,8 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         # Retain the original's actual status in items; use only the read report
         # for evidence, memory and the citation (never unread/OCR document text).
         primary_source = None
-    if selection and (not primary_source or source_status != "READ") and not publisher_report:
-        held = "PRIMARY_RETRY" if selection["decision"] == "KEEP" else "WAITING_CONFIRMATION"
+    if (not primary_source or source_status != "READ") and not publisher_report:
+        held = "PRIMARY_RETRY"
         _trace_item(item, "Проверка источника", held,
                     "Для следующего этапа пока нет прочитанного пригодного материала.",
                     source_status=source_status)
@@ -2539,24 +2528,15 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
         db.commit()
         return held
 
-    if date_pending:
-        event_time = item.get('updated_at') or item.get('published_at')
-        if not event_time:
-            _trace_item(item, 'Дата публикации', 'Отсеян', 'В прочитанном материале не подтверждена дата публикации.')
-            db.execute("UPDATE items SET disposition='UNDATED',processed_at=? WHERE item_id=?", (now, item_id))
-            db.commit()
-            return 'UNDATED'
-        try:
-            age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(event_time.replace('Z', '+00:00'))).total_seconds() / 3600
-        except ValueError:
-            age_hours = 0
-        date_outcome = ('BASELINE_SKIPPED' if initial_backfill_minutes is not None and age_hours * 60 > initial_backfill_minutes
-                        else 'STALE' if age_hours > freshness_hours else None)
-        if date_outcome:
-            _trace_item(item, 'Дата публикации', 'Отсеян', 'Прочитанный материал старше допустимого окна публикации.')
-            db.execute('UPDATE items SET disposition=?,processed_at=? WHERE item_id=?', (date_outcome, now, item_id))
-            db.commit()
-            return date_outcome
+    date_issue = admission(db, item_id, item, source, freshness_hours,
+                           initial_backfill_minutes, after_read=True)
+    if date_issue:
+        outcome, reason = date_issue
+        item['_retry_reason'] = reason
+        _trace_item(item, 'Дата источника после чтения', outcome, reason)
+        db.execute('UPDATE items SET disposition=?,processed_at=? WHERE item_id=?', (outcome, now, item_id))
+        db.commit()
+        return outcome
 
     story_rows = db.execute("SELECT * FROM stories ORDER BY last_updated_at DESC LIMIT 1000").fetchall()
     candidate = f"{item['title']} {item.get('description','')} {body}"
@@ -2596,14 +2576,11 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             ai_input["independent_sources"] = item.get("independent_sources", [])
             ai_input["history_context"] = _history_context(db, item)
             from .interests import learning_context
-            ai_input["interest_profile"] = learning_context(db)
+            ai_input["interest_profile"] = {}
             if memory_mode in {"shadow", "enforce"}:
                 from .knowledge import context
                 ai_input["knowledge_context"] = context(db, [s['story_id'] for s in shortlist])
-            ai_input["editorial_examples"] = _editorial_examples(
-                db, item, item_id, story_id=best["story_id"] if best else None)
-            if "_editorial_registry" in ai_options:
-                ai_input["editorial_examples"] = ai_options["_editorial_registry"]["examples"]
+            ai_input['editorial_examples'] = []
             previous_analysis = db.execute("SELECT result_json FROM item_analysis WHERE item_id=?", (item_id,)).fetchone()
             ai_input['editorial_feedback'] = []
             if previous_analysis:
@@ -2723,11 +2700,6 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
             ai_result = require_primary_source_review(ai_result, source_status, primary_source,
                                                        publisher_report=publisher_report,
                                                        analysis_only=ai_result.get('_needs_post_draft') is True)
-            confidence = ai_result.get("confidence")
-            if (ai_result.get("publication_recommendation") == "AUTO_PUBLISH"
-                    and (not isinstance(confidence, (int, float)) or confidence < 0.72)):
-                ai_result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
-                ai_result["source_review_required"] = True
             independent_audit = [
                 {"publisher": candidate.get("publisher"), "title": candidate.get("title"),
                  "url": candidate.get("url"), "published_at": candidate.get("published_at"),
@@ -2951,29 +2923,6 @@ def _process_item_steps(db, source, item: dict, threshold: float, max_length: in
                 _trace_item(item, "Проверка памяти сюжетов", "Нужна повторная проверка",
                             "Найден конфликт между новым материалом и сохранёнными сведениями.",
                             conflict_state=memory_diff.get('conflict_state'))
-            elif (memory_enforced and memory_diff['significant_update']
-                  and memory_diff.get('material_unpublished_facts')
-                  and (primary_source or publisher_report)):
-                correction_owner = str(ai_settings.get("_correction_owner_chat_id") or "")
-                from .knowledge import latest_published_event_post
-                prior_post = latest_published_event_post(
-                    db, story_id, memory_diff['event_id'], freshness_hours)
-                if correction_owner and prior_post:
-                    from .review import enqueue_agent_fact_correction
-                    correction_id = enqueue_agent_fact_correction(
-                        db, item_id=item_id, story_id=story_id, post_id=prior_post["post_id"],
-                        owner_chat_id=correction_owner, supplement=True)
-                    if correction_id:
-                        _trace_item(item, "Самостоятельное дополнение опубликованного поста",
-                                    "AGENT_CORRECTION_QUEUED",
-                                    "Найдено новое существенное подтверждённое сведение в свежем опубликованном сюжете; редактор проверит, стоит ли дополнить тот же пост.",
-                                    correction_id=correction_id)
-                        db.execute("UPDATE items SET disposition='AGENT_CORRECTION_QUEUED',processed_at=? WHERE item_id=?",
-                                   (now, item_id))
-                        db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                                   (json.dumps({**ai_result, '_filter_version': FILTER_VERSION}, ensure_ascii=False), item_id))
-                        db.commit()
-                        return "AGENT_CORRECTION_QUEUED"
             elif memory_enforced and not memory_diff['significant_update']:
                 disposition = 'STORE_ONLY' if memory_diff['unpublished_facts'] else 'DUPLICATE'
                 _trace_item(item, "Проверка новизны сюжета", disposition,
@@ -3053,10 +3002,6 @@ def _finish_post_steps(db, item, ai_settings, context):
     publisher_name = context['publisher_name']
     memory_mode = context['memory_mode']
     memory_diff = context['memory_diff']
-    if memory_diff:
-        from .knowledge import draft_post_claims
-        memory_diff = {**memory_diff, 'post_claims': draft_post_claims(
-            (ai_result or {}).get('memory'), memory_diff, primary_source or publisher_report)}
     memory_enforced = context['memory_enforced']
     story_id = context['story_id']
     best = context['best']
@@ -3068,11 +3013,13 @@ def _finish_post_steps(db, item, ai_settings, context):
     draft_citation_name = draft_source.get('publisher') or publisher_name
     draft_citation_url = draft_source.get('url') or item['url']
     ai_options['_draft_contract'] = {
-        'source_footer': make_post('', '', draft_citation_name, draft_citation_url, max_length).splitlines()[-1],
+        'dates': __import__('newsroom.policy', fromlist=['date_context']).date_context(item, draft_source, source),
+        'source_footer': make_post('', '', draft_citation_name, draft_citation_url, max_length, preserve_content=True).splitlines()[-1],
         'text_field': 'what_is_new' if status == 'UPDATE_CANDIDATE' and has_previous_publication else 'summary_ru',
         'has_previous_publication': bool(has_previous_publication),
-        'required_fact_quotes': [claim['post_quote'] for claim in (memory_diff or {}).get('post_claims', [])
-                                 if claim['fact_id'] in material_ids],
+        'material_facts': [dict(row) for row in db.execute(
+            'SELECT fact_id,subject,predicate,value,statement,fact_type FROM story_facts WHERE fact_id IN ('
+            + (','.join('?' for _ in material_ids) or 'NULL') + ')', list(material_ids))],
     }
     if ai_result:
         if ai_result.get('_needs_post_draft'):
@@ -3114,23 +3061,83 @@ def _finish_post_steps(db, item, ai_settings, context):
                 db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
                 db.commit()
                 return 'AI_RETRY'
-            mark(db, item_id, 'drafting', 'DONE', 'Текст подготовлен.')
             ai_result.update(draft)
-            if isinstance(ai_result.get('original_reporting_check'), dict):
-                # Evidence was checked before writing. This flag now describes
-                # the writer's check of the actual text, not an unwritten draft.
-                ai_result['original_reporting_check'] = {
-                    **ai_result['original_reporting_check'],
-                    'attribution_preserved': (draft.get('editorial_check') or {}).get('attribution_preserved') is True,
-                }
             ai_result['_needs_post_draft'] = False
-            from .material_flow import save_draft_context
+            ai_result['_validation_pending'] = True
             context['ai_result'] = ai_result
+            from .material_flow import save_draft_context
             save_draft_context(db, item_id, item, ai_settings, context)
-            headline = ai_result['headline_ru']
-            _trace_item(item, 'Написание поста', 'Завершён', 'Текст подготовлен после проверки актуальности и новизны.')
+        draft = {key: ai_result.get(key, '') for key in ('headline_ru', 'summary_ru', 'what_is_new', 'editorial_check')}
+        from .policy import absolute_narration_dates
+        for key in ('headline_ru', 'summary_ru', 'what_is_new'):
+            draft[key] = absolute_narration_dates(draft.get(key, ''), ai_options['_draft_contract']['dates'])
+        from .runtime import cache_key
+        # Final validation checks freely written text; it does not repeat selection.
+        from .ai import validate_draft
+        field = ai_options['_draft_contract']['text_field']
+        text_to_check = draft.get('headline_ru', '') + '\n\n' + draft.get(field, '')
+        mark(db, item_id, 'gate', 'RUNNING', 'Проверка фактов готового текста.')
+        db.commit()
+        try:
+            check_key = cache_key('final-text', {'draft': draft, 'source': draft_source,
+                'contract': ai_options['_draft_contract'],
+                'policy': __import__('newsroom.policy', fromlist=['snapshot']).snapshot(ai_options)})
+            checked = yield Work('editor', validate_draft, (ai_result, draft_source, draft, ai_options),
+                                 key=check_key, ttl=21600, stage='verification')
+            from .policy import relative_date_words
+            if relative_date_words(text_to_check):
+                checked['issues'].append('Относительная дата без подтверждённой даты источника: укажи проверяемый абсолютный срок или изложи событие без придуманного календарного дня.')
+            from .knowledge import validate_post_bindings
+            bindings = validate_post_bindings(checked, material_ids, text_to_check)
+        except Exception as exc:
+            from .runtime import BudgetDeferred, account_unavailable
+            from .material_flow import technical_error
+            account = account_unavailable(getattr(exc, 'code', None))
+            item['_technical_error'] = technical_error(exc)
+            item['_retry_without_count'] = isinstance(exc, BudgetDeferred) or account
+            item['_flow_block_kind'] = 'account' if account else 'technical' if item['_technical_error'] else 'transport'
+            item['_retry_reason'] = 'Проверка текста отложена: ' + getattr(exc, 'code', type(exc).__name__)
+            if isinstance(exc, BudgetDeferred): item['_retry_delay_seconds'] = exc.delay_seconds
+            db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
+            db.commit()
+            return 'AI_RETRY'
+        if checked['issues']:
+            ai_result['editorial_issues'] = checked['issues']
+            ai_result['_needs_post_draft'] = True
+            ai_result['_validation_pending'] = False
+            ai_result.pop('final_text_check', None)
+            item['_retry_reason'] = '; '.join(checked['issues'])
+            context['ai_result'] = ai_result
+            from .material_flow import save_draft_context
+            save_draft_context(db, item_id, item, ai_settings, context)
             db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                (json.dumps({**ai_result, '_filter_version': FILTER_VERSION}, ensure_ascii=False), item_id))
+                       (json.dumps(ai_result, ensure_ascii=False), item_id))
+            mark(db, item_id, 'drafting', 'WAITING', item['_retry_reason'], block_kind='verification')
+            db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION',processed_at=? WHERE item_id=?", (NOW(), item_id))
+            db.commit()
+            return 'WAITING_CONFIRMATION'
+        draft['editorial_check'] = checked['editorial_check']
+        if memory_diff:
+            memory_diff = {**memory_diff, 'post_claims': bindings}
+            context['memory_diff'] = memory_diff
+        ai_result['final_text_check'] = {'text_sha256': digest(text_to_check), 'covered_claims': bindings}
+        mark(db, item_id, 'drafting', 'DONE', 'Текст подготовлен.')
+        ai_result.update(draft)
+        if isinstance(ai_result.get('original_reporting_check'), dict):
+            # Evidence was checked before writing. This flag now describes
+            # the writer's check of the actual text, not an unwritten draft.
+            ai_result['original_reporting_check'] = {
+                **ai_result['original_reporting_check'],
+                'attribution_preserved': (draft.get('editorial_check') or {}).get('attribution_preserved') is True,
+            }
+        ai_result['_needs_post_draft'] = False
+        from .material_flow import save_draft_context
+        context['ai_result'] = ai_result
+        save_draft_context(db, item_id, item, ai_settings, context)
+        headline = ai_result['headline_ru']
+        _trace_item(item, 'Написание поста', 'Завершён', 'Текст подготовлен после проверки актуальности и новизны.')
+        db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
+            (json.dumps({**ai_result, '_filter_version': FILTER_VERSION}, ensure_ascii=False), item_id))
         quality_body = ai_result.get("what_is_new") if status == "UPDATE_CANDIDATE" and has_previous_publication else ai_result.get("summary_ru", "")
         citation_url = primary_source["url"] if primary_source else (publisher_report or {}).get("url", item["url"])
         citation_name = (primary_source.get("publisher") or "Первоисточник") if primary_source else (publisher_report or {}).get("publisher", publisher_name)
@@ -3138,10 +3145,15 @@ def _finish_post_steps(db, item, ai_settings, context):
                             if primary_source else bool(publisher_report))
         # Check the assembled text, including the normalized source footer,
         # before creating a post. The send boundary checks this same format.
-        preview = make_post(headline, quality_body or '', citation_name, citation_url, max_length)
+        preview = make_post(headline, quality_body or '', citation_name, citation_url, max_length, preserve_content=True)
         checked_headline, _, checked_body = preview.partition('\n')
         issues = editorial_issues(checked_headline, checked_body, ai_result,
                                  source_is_report=source_is_report)
+        from .news_series import split as split_news
+        try:
+            split_news(preview, max_length)
+        except ValueError as exc:
+            issues.append(str(exc))
         if issues:
             ai_result["editorial_issues"] = issues
             ai_result['_needs_post_draft'] = True
@@ -3161,12 +3173,14 @@ def _finish_post_steps(db, item, ai_settings, context):
         description = ai_result.get("summary_ru", "")
         if status == "UPDATE_CANDIDATE" and has_previous_publication:
             description = ai_result.get("what_is_new") or description
-        post = make_post(headline, description, citation_name, citation_url, max_length)
+        post = make_post(headline, description, citation_name, citation_url, max_length, preserve_content=True)
         primary_source_record = None
         if primary_source:
             primary_source_record = {key: value for key, value in primary_source.items() if key != "content"}
             primary_source_record["content_sha256"] = digest(primary_source["content"])
         facts_json = json.dumps({"mode": "AI", "_filter_version": FILTER_VERSION,
+                                 "policy": __import__("newsroom.policy", fromlist=["snapshot"]).snapshot(ai_settings),
+                                 "final_text_check": ai_result.get("final_text_check"),
                                  "topic_registry": {"version": ai_settings["_topic_registry"].get("version"), "match": ai_result.get("topic_match"), "checked": True} if "_topic_registry" in ai_settings else None,
                                  "memory_mode": memory_mode, "story_diff": memory_diff,
                                  "primary_source": primary_source_record,
@@ -3192,7 +3206,7 @@ def _finish_post_steps(db, item, ai_settings, context):
     else:
         citation_url = primary_source["url"] if primary_source else item["url"]
         citation_name = (primary_source.get("publisher") or "Первоисточник") if primary_source else publisher_name
-        post = make_post(headline, body, citation_name, citation_url, max_length)
+        post = make_post(headline, body, citation_name, citation_url, max_length, preserve_content=True)
         primary_source_record = None
         if primary_source:
             primary_source_record = {key: value for key, value in primary_source.items() if key != "content"}
@@ -3200,6 +3214,12 @@ def _finish_post_steps(db, item, ai_settings, context):
         facts_json = json.dumps({"mode": "RULE_BASED", "primary_source": primary_source_record,
                                  "primary_source_status": source_status,
                                  "source_review_required": not bool(primary_source and source_status == "READ")}, ensure_ascii=False)
+    if ai_result and ai_result.get('final_text_check'):
+        # Seal the assembled representation before any delivery operation.
+        stored_facts = json.loads(facts_json)
+        stored_facts['material_revision'] = db.execute('SELECT ingest_revision FROM items WHERE item_id=?', (item_id,)).fetchone()[0]
+        stored_facts['final_text_check']['assembled_sha256'] = digest(post)
+        facts_json = json.dumps(stored_facts, ensure_ascii=False)
     post_hash = digest(post)
     db.execute('SAVEPOINT memory_post')
     cur = db.execute("INSERT OR IGNORE INTO posts(story_id,origin_item_id,text,status,created_at,version,source_ids,post_hash,fact_check_result) VALUES(?,?,?, 'PENDING', ?,?,?,?,?)",
@@ -3228,7 +3248,7 @@ def _finish_post_steps(db, item, ai_settings, context):
     db.execute('RELEASE memory_post')
     db.commit()
     discovered_row = db.execute("SELECT discovered_at FROM items WHERE item_id=?", (item_id,)).fetchone()
-    ready_post = db.execute("SELECT post_id FROM posts WHERE origin_item_id=? AND post_hash=?", (item_id, post_hash)).fetchone()
+    ready_post = db.execute("SELECT post_id FROM posts WHERE origin_item_id=? AND post_hash=? AND status='PENDING' ORDER BY post_id DESC LIMIT 1", (item_id, post_hash)).fetchone()
     used_source_published_at = (item.get("published_at")
                                 or (primary_source or {}).get("published_at")
                                 or (publisher_report or {}).get("published_at")
@@ -3274,22 +3294,17 @@ def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limi
     # held items cannot consume the entire cycle before current feeds arrive.
     limit = min(limit, max(0, int(config.get("newsroom", {}).get("retry_items_per_cycle", 2))))
     ai_settings = config.get("ai", {})
-    if ai_settings.get("triage_enabled"):
-        limit = min(limit, max(0, int(ai_settings.get("_triage_budget",
-                    config.get("newsroom", {}).get("triage_per_cycle", 12)))))
     if "_analysis_budget" in ai_settings:
         limit = min(limit, max(0, int(ai_settings.get("_analysis_budget", 0))))
     if limit <= 0:
         return counts
     placeholders = ",".join("?" for _ in source_by_id)
     # Apply due times before LIMIT, so sleeping retries cannot starve fresh work.
-    due_filter = (" AND COALESCE(julianday((SELECT json_extract(value,'$.next_at') FROM app_state WHERE key='selection_retry:'||items.item_id)),0)<=julianday('now') "
-                  if config.get("ai", {}).get("triage_enabled") else "")
+    due_filter = " AND COALESCE(julianday((SELECT CASE WHEN json_valid(value) THEN json_extract(value,'$.next_at') END FROM app_state WHERE key='selection_retry:'||items.item_id)),0)<=julianday('now') "
     # Exclude inactive sources before LIMIT and rotate by last attempt.
     rows = db.execute(
         f"SELECT * FROM items WHERE (disposition IN ('AI_RETRY','PRIMARY_RETRY') OR "
         "(disposition='WAITING_CONFIRMATION' "
-        "AND julianday(processed_at)<julianday('now','-5 minutes') "
         "AND COALESCE((SELECT CAST(value AS INTEGER) FROM app_state WHERE key='editor_retry:'||items.item_id),0)<3)) "
         f"AND source_id IN ({placeholders}) {due_filter} "
         "AND NOT EXISTS(SELECT 1 FROM processing_jobs j WHERE j.item_id=items.item_id AND j.status IN ('PENDING','WAITING','RUNNING')) "
@@ -3427,7 +3442,9 @@ def _reconcile_legacy_retry_loops(db) -> int:
 
 
 def _requeue_social_quote_repairs(db, ai_settings, freshness_hours: int) -> int:
-    """Re-evaluate fresh rejected exact social posts once under the current filter."""
+    """Legacy repair only: activated v1 must never reopen a final rejection."""
+    if '_policy_baseline' in (ai_settings or {}):
+        return 0
     if not get_api_key(ai_settings or {}):
         return 0
     rows = db.execute("SELECT i.*,a.result_json FROM items i JOIN item_analysis a USING(item_id) "
@@ -3521,6 +3538,8 @@ def _run_cycle(config, db, cleanup):
     learn_cycle(db, config)
     from .editorial_registry import sync as sync_editorial, learn_cycle as learn_editorial
     sync_editorial(db, config)
+    from .policy import attach as attach_policy
+    attach_policy(config)
     learn_editorial(db, config)
     owner_ids = config.get("telegram", {}).get("interest_owner_user_ids") or []
     if owner_ids:
@@ -3641,9 +3660,8 @@ def _run_cycle(config, db, cleanup):
         if source_type in {"rss", "web"} and source_cfg.get("reputation") == "reputable_media" and host:
             ORIGINAL_REPORTING_PUBLISHERS.setdefault(_registrable_domain(host), re.escape(source_cfg["name"]))
 
-    db.execute("UPDATE items SET disposition='STALE',processed_at=? WHERE disposition IN ('PENDING','AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION') AND julianday(COALESCE(updated_at,published_at))<julianday('now',?)",
-               (NOW(), "-"+str(int(config["newsroom"].get("freshness_window_hours",24)))+" hours"))
-    db.commit()
+    # Intake admission is revision-specific. Time spent in our queue must not
+    # silently turn an already accepted material into an editorial rejection.
     requeued = _requeue_social_quote_repairs(
         db, config.get("ai", {}), int(config["newsroom"].get("freshness_window_hours", 24)))
     if requeued:

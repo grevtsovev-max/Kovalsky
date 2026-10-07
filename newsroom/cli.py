@@ -87,6 +87,10 @@ def _telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -
             rejection = json.loads(exc.read())
         except Exception:
             rejection = {}
+        from .delivery import telegram_rate_limit
+        rate_limit = telegram_rate_limit(rejection)
+        if rate_limit and exc.code == 429:
+            raise rate_limit from None
         if isinstance(rejection, dict) and rejection.get("ok") is False and 400 <= exc.code < 500 and exc.code != 408:
             raise DeliveryRejected(f"Telegram API rejected request ({exc.code})") from None
         raise DeliveryUncertain(f"Telegram API HTTP {exc.code}") from None
@@ -95,6 +99,10 @@ def _telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -
     if not isinstance(result, dict) or result.get("ok") not in (True, False):
         raise DeliveryUncertain("Telegram API malformed response")
     if result.get("ok") is False:
+        from .delivery import telegram_rate_limit
+        rate_limit = telegram_rate_limit(result)
+        if rate_limit:
+            raise rate_limit
         code = result.get("error_code")
         if isinstance(code, int) and 400 <= code < 500 and code != 408:
             raise DeliveryRejected(f"Telegram API rejected request ({code})")
@@ -258,8 +266,12 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
             "ORDER BY a.created_at DESC LIMIT 1), '') AS geographic_scope, "
             "COALESCE(json_extract(p.fact_check_result,'$.test_publication'),0) AS test_publication "
             "FROM posts p LEFT JOIN stories s USING(story_id) "
-            "WHERE p.status='PUBLISHED' AND p.published_at>? AND p.published_at<=?",
-            (cutoff, now.isoformat(timespec="seconds")),
+            "WHERE p.status='PUBLISHED' AND p.published_at>? AND p.published_at<=? "
+            "AND NOT EXISTS(SELECT 1 FROM publication_attempts d WHERE d.post_id=p.post_id "
+            "AND d.status IN ('SENDING','UNKNOWN')) "
+            "AND NOT EXISTS(SELECT 1 FROM publication_attempts d WHERE d.post_id=p.post_id "
+            "AND d.status IN ('SENT','CONFIRMED') AND d.channel_id<>?)",
+            (cutoff, now.isoformat(timespec="seconds"), channel(config)),
         ).fetchall()
         rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
         rows = sorted(rows, key=lambda row: (rank.get(row["importance"], 2), row["published_at"] or ""))
@@ -275,9 +287,7 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
         for row in rows:
             post_text = row["text"] or ""
             headline = post_text.splitlines()[0].strip() if post_text.splitlines() else "Новость"
-            if row["test_publication"] or ("_topic_registry" not in config.get("ai",{}) and row["geographic_scope"] in {"OTHER", "GLOBAL"}):
-                continue
-            if "_topic_registry" not in config.get("ai",{}) and re.search(r"(?i)\b(США|американ\w*|ФРС|SEC|Евросоюз|ЕС|Великобритани\w*|британск\w*)\b", headline):
+            if row["test_publication"]:
                 continue
             headline = re.sub(r"\*\*(.*?)\*\*", r"\1", headline)
             from .core import _limit_headline
@@ -298,6 +308,8 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
                 emoji = "📌"
             selected.append((emoji, headline, row["importance"] or "MEDIUM", post_url))
 
+        if not selected:
+            return False, 0
         if any(not entry[3] for entry in selected):
             raise ChannelPresenceUnavailable('DIGEST_POST_LINK_MISSING')
         observed = inspect_channel_posts(config, [entry[3].rsplit('/', 1)[1] for entry in selected], db=db)
@@ -313,12 +325,11 @@ def _publish_digest(db, config: dict, kind: str, *, rebuild_unsent=False, _visib
         messages = []
         current = title
         if not selected:
-            if rows:
-                current += "\n\nЗа период дайджеста нет публикаций, подходящих для включения в подборку."
-            else:
-                current += "\n\nЗа период дайджеста в канале новых публикаций не было."
+            # No delivery intent or completed-period marker: a later eligible
+            # publication in this period may still produce a real digest.
+            return False, 0
         else:
-            # Keep the approved 25 September digest format: linked headlines only, no body summaries.
+            # The canonical digest format contains links to published headlines.
             for emoji, headline, importance, post_url in selected:
                 linked_headline = _link_digest_action(headline, post_url) if post_url else headline
                 item = f"{emoji} {linked_headline}"
@@ -407,7 +418,9 @@ def is_eligible_for_auto_publish(post, cutoff: str, thematic=None) -> bool:
 
 def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
                       exclude_post_ids=None) -> tuple[int, int, int]:
-    """Publish qualified recent posts; retry Telegram errors three times, then close them."""
+    """Deliver checked posts; resource waits and source updates are separate states."""
+    from .runtime import BudgetDeferred
+    from .source_recheck import SourceUpdateRequired
     if not agent_enabled(config) or config["newsroom"].get("auto_publish", True) is not True:
         return 0, 0, 0
     cutoff = config["newsroom"].get("auto_publish_since")
@@ -427,6 +440,9 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
         if not agent_enabled(config):
             break
         post_id = row["post_id"]
+        if row['auto_last_error'] == 'DELIVERY_RETRY_EXHAUSTED':
+            failed += 1
+            continue
         if post_id in excluded_ids:
             continue
         if selected_ids is not None and post_id not in selected_ids:
@@ -454,6 +470,12 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
             db.execute("UPDATE posts SET auto_attempts=? WHERE post_id=?", (attempt - 1, post_id))
             db.commit()
             break
+        except SourceUpdateRequired:
+            _log_timing('source_update_reprocessing', post_id=post_id)
+        except BudgetDeferred:
+            db.execute('UPDATE posts SET auto_attempts=?,auto_last_error=? WHERE post_id=?',
+                       (attempt - 1, 'RESOURCE_WAIT', post_id))
+            db.commit()
         except DeliveryUncertain:
             failed += 1
             db.execute("UPDATE posts SET auto_last_error='DELIVERY_UNKNOWN' WHERE post_id=?", (post_id,))
@@ -461,14 +483,18 @@ def auto_publish_since(db_path: str, config: dict, *, post_ids=None,
         except Exception as exc:
             failed += 1
             error_code = type(exc).__name__
-            if attempt >= 3:
-                db.execute("UPDATE posts SET status='REJECTED',editor_decision='AUTO_REJECTED',auto_last_error=? WHERE post_id=?",
-                           (error_code, post_id))
-                rejected += 1
-                print(f"Пост #{post_id} автоматически отклонён после трёх неудачных попыток ({error_code}).", file=sys.stderr)
+            exhausted = db.execute("SELECT 1 FROM publication_attempts WHERE post_id=? AND status='FAILED' AND attempt_count>=4 LIMIT 1", (post_id,)).fetchone()
+            if exhausted:
+                db.execute("UPDATE posts SET auto_last_error='DELIVERY_RETRY_EXHAUSTED' WHERE post_id=?", (post_id,))
+                if row['origin_item_id']:
+                    from .material_flow import mark
+                    mark(db, row['origin_item_id'], 'delivery', 'ERROR',
+                         'Доставка технически заблокирована: повторы исчерпаны; материал и ответы сохранены.',
+                         block_kind='technical')
+                print(f'Доставка поста #{post_id} технически заблокирована после исчерпания повторов.', file=sys.stderr)
             else:
                 db.execute("UPDATE posts SET auto_last_error=? WHERE post_id=?", (error_code, post_id))
-                print(f"Публикация поста #{post_id} не удалась ({error_code}); автоматическая попытка {attempt}/3.", file=sys.stderr)
+                print(f"Доставка поста #{post_id} не завершена ({error_code}); история попыток сохранена.", file=sys.stderr)
             db.commit()
     db.close()
     return published, failed, rejected
@@ -1003,9 +1029,6 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         facts, primary, report = {}, {}, {}
     if not is_eligible_for_auto_publish(post, config["newsroom"].get("auto_publish_since"), config.get("ai", {}).get("_topic_registry")):
         raise RuntimeError("Публикация остановлена: пост не прошёл условия автопубликации")
-    confidence = facts.get("confidence")
-    if not isinstance(confidence, (int, float)) or confidence < 0.72:
-        raise RuntimeError("Автопубликация остановлена: уверенность ниже автоматического порога")
     report_ok = (facts.get("publisher_report_exception") is True
                  and attributed_report_supported(report, facts, stored=True)
                  and report.get("url") in post["text"])
@@ -1017,7 +1040,7 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         audit = facts.get("original_reporting_check") or {}
         claims = facts.get("facts") or []
         if (facts.get("source_review_required") or audit.get("central_claim_supported") is not True
-                or audit.get("attribution_preserved") is not True or len(audit.get("evidence", "").strip()) < 24
+                or audit.get("attribution_preserved") is not True or not audit.get("evidence", "").strip()
                 or report.get("evidence") != audit.get("evidence")
                 or not claims or any(f.get("claim_type") not in {"CLAIM", "REPORT", "OPINION"} for f in claims)):
             raise RuntimeError("Публикация остановлена: сообщение источника должно быть точно подтверждено прочитанным текстом и атрибутировано")
@@ -1025,13 +1048,21 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         audit = facts.get("original_reporting_check") or {}
         claims = facts.get("facts") or []
         if (facts.get("source_review_required") or audit.get("central_claim_supported") is not True
-                or audit.get("attribution_preserved") is not True or len(audit.get("evidence", "").strip()) < 24
+                or audit.get("attribution_preserved") is not True or not audit.get("evidence", "").strip()
                 or not claims or any(f.get("claim_type") not in {"CLAIM", "REPORT", "OPINION"} for f in claims)):
             raise RuntimeError("Публикация остановлена: происхождение и атрибуция сообщения СМИ не проверены")
     if automatic and not is_eligible_for_auto_publish(post, config["newsroom"].get("auto_publish_since"), config.get("ai", {}).get("_topic_registry")):
         raise RuntimeError("Публикация остановлена: пост не прошёл условия автопубликации")
-    _attach_previous_story_link(db, config, post)
+    # New-policy text is final: no heuristic links or edits at the send boundary.
     post = db.execute("SELECT * FROM posts WHERE post_id=?", (post_id,)).fetchone()
+    if facts.get('policy') or '_policy_baseline' in config.get('ai', {}):
+        from .policy import publication_issues
+        proof_issues = publication_issues(post['text'], facts, config.get('ai', {}))
+        if proof_issues:
+            if 'POLICY_CHANGED' in proof_issues and post['origin_item_id']:
+                from .policy import requeue_changed_policy
+                requeue_changed_policy(db, config, post)
+            raise RuntimeError('Публикация остановлена: ' + ', '.join(proof_issues))
     headline, _, body = post["text"].partition("\n")
     issues = editorial_issues(headline, body, facts, final_post=True)
     if issues:
@@ -1044,19 +1075,27 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
         if memory_issues:
             raise RuntimeError('Publication memory gate: ' + ', '.join(memory_issues))
     if post['origin_item_id']:
+        from .source_recheck import verify
+        verify(db, config, post, facts)
         from .material_flow import mark
         mark(db, post['origin_item_id'], 'gate', 'DONE', 'Проверки текста, доказательств и опубликованной истории выполнены.')
         mark(db, post['origin_item_id'], 'delivery', 'RUNNING', 'Отправка через штатный журнал доставки.')
         db.commit()
     publish_started = time.perf_counter()
     try:
-        external_id = deliver(db, config, f"post:{post_id}", post["text"], telegram_send, post_id=post_id)
+        from .news_series import deliver_series
+        external_id = deliver_series(db, config, post_id, post['text'], telegram_send,
+                                     config['newsroom'].get('max_post_length', 3500))
     except Exception as exc:
         if post['origin_item_id']:
             from .material_flow import mark
+            from .runtime import BudgetDeferred
+            deferred = isinstance(exc, BudgetDeferred)
             mark(db, post['origin_item_id'], 'delivery', 'WAITING',
+                 'Ожидает разрешённого времени повторной доставки.' if deferred else
                  'Результат отправки неизвестен; требуется сверка.' if isinstance(exc, DeliveryUncertain) else 'Отправка не завершена: '+type(exc).__name__,
-                 block_kind='delivery_unknown' if isinstance(exc, DeliveryUncertain) else 'transport')
+                 block_kind='delivery_wait' if deferred else 'delivery_unknown' if isinstance(exc, DeliveryUncertain) else 'transport',
+                 next_at=(datetime.now(timezone.utc) + timedelta(seconds=exc.delay_seconds)).isoformat() if deferred else None)
             db.commit()
         _log_timing("telegram_publish_timing", post_id=post_id,
                     seconds=round(time.perf_counter() - publish_started, 3),
@@ -1229,6 +1268,11 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     control = sub.add_parser("agent", help="Постоянное включение/отключение всего агента")
     control.add_argument("action", choices=["disable", "enable", "status"])
+    policy_command = sub.add_parser('policy', help='Версия правил и безопасная миграция')
+    policy_command.add_argument('action', choices=['show', 'activate'])
+    recovery = sub.add_parser('recover-material', help='Возобновить технически заблокированный материал после устранения причины')
+    recovery.add_argument('--item-id', type=int, required=True)
+    recovery.add_argument('--evidence', required=True, help='Подтверждение устранённой причины; сохраняется в истории')
     sub.add_parser("init", help="Создать/обновить локальную базу")
     sub.add_parser("once", help="Проверить все активные RSS-источники один раз")
     sub.add_parser("run", help="Постоянный цикл мониторинга")
@@ -1259,7 +1303,7 @@ def main() -> None:
         print("Агент включён" if agent_enabled(config) else "Агент отключён")
         return
     config = load_config(args.config)
-    if args.command not in {"dashboard", "health", "pending", "init"}:
+    if args.command not in {"dashboard", "health", "pending", "init", "policy"}:
         require_enabled(config)
     db_path = config["newsroom"]["database"]
     database_path = Path(db_path).expanduser()
@@ -1267,7 +1311,19 @@ def main() -> None:
         database_path = Path.cwd() / database_path
     configure_runtime_log(database_path.parent / "newsroom-runtime.log")
     _log_timing("runtime_loaded", build="kovalsky-v2-20260929-r1", command=args.command, pid=os.getpid())
-    if args.command == "init":
+    if args.command == 'policy':
+        from . import policy
+        if args.action == 'activate':
+            policy.activate(db_path)
+        from .editorial_registry import attach_cached
+        attach_cached(config)
+        policy.attach(config)
+        print(json.dumps(policy.snapshot(config.get('ai', {})), ensure_ascii=False))
+    elif args.command == 'recover-material':
+        from .material_flow import recover_technical
+        with connect(db_path) as db:
+            print(json.dumps(recover_technical(db, config, args.item_id, args.evidence), ensure_ascii=False))
+    elif args.command == "init":
         connect(db_path).close()
         print(f"База готова: {db_path}")
     elif args.command == "dashboard":

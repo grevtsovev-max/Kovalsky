@@ -57,11 +57,10 @@ class ProcessorTests(unittest.TestCase):
         with patch('newsroom.core.get_api_key', return_value='test'), \
              patch('newsroom.core.analyze_with_ai', return_value=result):
             outcome = process_item(self.db, self.source, item, .35, 3500, 24, ai_settings=self.config['ai'])
-        self.assertEqual(outcome, 'WAITING_CONFIRMATION')
-        analysis = json.loads(self.db.execute('SELECT result_json FROM item_analysis ORDER BY item_id DESC LIMIT 1').fetchone()[0])
-        self.assertIn('REDUNDANT_SOURCE_ATTRIBUTION', analysis['editorial_issues'])
-        self.assertTrue(analysis['_needs_post_draft'])
-        self.assertEqual(self.db.execute('SELECT count(*) FROM posts').fetchone()[0], 0)
+        self.assertEqual(outcome, 'NEW_STORY')
+        post = self.db.execute('SELECT text FROM posts').fetchone()[0]
+        self.assertIn('DeCenter сообщает:', post)
+        self.assertIn('https://t.me/DeCenter/903', post)
 
     def test_collection_does_not_wait_for_editor(self):
         from newsroom.core import run_cycle
@@ -90,7 +89,7 @@ class ProcessorTests(unittest.TestCase):
             release.set()
             executor.shutdown()
 
-    def test_capacity_wait_returns_to_running_without_counting_a_retry(self):
+    def test_capacity_wait_releases_worker_and_resumes_without_editorial_retry(self):
         from newsroom.runtime import BudgetDeferred
         from newsroom.material_flow import revision, snapshot
         enqueue(self.db, None, self.fixture.item(), self.source, self.fixture.options)
@@ -105,12 +104,20 @@ class ProcessorTests(unittest.TestCase):
                 state = next(x for x in snapshot(db, 1) if x['stage'] == 'analysis')
             self.assertEqual(state['status'], 'RUNNING')
             self.assertIsNone(state['block_kind'])
-            self.assertGreater(state['wait_seconds'], .3)
             return {'action': 'NOISE'}
         executor = StageExecutor(1)
         try:
-            future = executor.submit(Work('editor', analyze).execute, runtime, scope)
-            self.assertEqual(future.result(timeout=3), {'action': 'NOISE'})
+            work = Work('editor', analyze)
+            future = executor.submit(work.execute, runtime, scope)
+            with self.assertRaises(BudgetDeferred):
+                future.result(timeout=1)
+            with runtime.db() as db:
+                waiting = next(x for x in snapshot(db, 1) if x['stage'] == 'analysis')
+            self.assertEqual(waiting['status'], 'WAITING')
+            self.assertEqual(waiting['block_kind'], 'capacity')
+            self.assertIsNotNone(waiting['next_at'])
+            resumed = executor.submit(work.execute, runtime, scope)
+            self.assertEqual(resumed.result(timeout=1), {'action': 'NOISE'})
         finally:
             executor.shutdown()
         self.assertEqual(len(calls), 2)
@@ -233,7 +240,9 @@ class ProcessorTests(unittest.TestCase):
             self.assertNotIn('HEADLINE_NOT_EVENT_LED', editorial_issues(headline, facts['summary_ru'], facts))
         for headline in ('🇷🇺 Новые счета цифрового рубля', '🇷🇺 Новые правила цифровых активов',
                          '🇷🇺 Открыть счёт цифрового рубля', '🇷🇺 Откройте счёт цифрового рубля'):
-            self.assertIn('HEADLINE_NOT_EVENT_LED', editorial_issues(headline, facts['summary_ru'], facts))
+            invalid = copy.deepcopy(facts)
+            invalid['editorial_check']['headline_main_event'] = False
+            self.assertIn('HEADLINE_MAIN_EVENT', editorial_issues(headline, facts['summary_ru'], invalid))
 
     def test_legacy_migration_preserves_attempts_and_read_source(self):
         from newsroom.material_flow import migrate, snapshot
@@ -322,7 +331,7 @@ class ProcessorTests(unittest.TestCase):
         from newsroom.core import process_item
         source = dict(self.source, type='web_search')
         old = (datetime.now(timezone.utc)-timedelta(hours=48)).isoformat()
-        for number, date, expected in ((100, self.fixture.now, 'NOISE'), (101, old, 'STALE'), (102, None, 'UNDATED')):
+        for number, date, expected in ((100, self.fixture.now, 'NOISE'), (101, old, 'STORE_ONLY'), (102, None, 'STORE_ONLY')):
             with self.subTest(date=date):
                 article = dict(self.fixture.item(number), published_at=date)
                 item = {key: article[key] for key in ('url', 'title')}

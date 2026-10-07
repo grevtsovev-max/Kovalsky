@@ -33,7 +33,19 @@ BEGIN SELECT RAISE(ABORT, 'rule snapshots are immutable'); END;
 
 
 def rule_version(db, name):
-    text = (Path(__file__).resolve().parent.parent / name).read_text(encoding='utf-8')
+    if name in {'EDITORIAL_RULES.md', 'AGENT_LOGIC.md'}:
+        from .policy import document, amendments
+        from .source_registry import state
+        from .editorial_registry import policy, SNAPSHOT
+        baseline = state(db, 'policy_v1_cutover')
+        settings = {'_editorial_registry': policy(state(db, SNAPSHOT, {}))}
+        if baseline:
+            settings['_policy_baseline'] = baseline['legacy_rules']
+            settings['_policy_confirmed_rules'] = state(db, 'policy_v1_confirmed_rules', [])
+        name = 'NEWSROOM_RULES_V1.md'
+        text = json.dumps([document(), amendments(settings)], ensure_ascii=False)
+    else:
+        text = (Path(__file__).resolve().parent.parent / name).read_text(encoding='utf-8')
     version = hashlib.sha256(text.encode()).hexdigest()
     db.execute('INSERT OR IGNORE INTO rule_snapshots(sha256,name,content) VALUES(?,?,?)', (version, name, text))
     return version

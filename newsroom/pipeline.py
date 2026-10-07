@@ -182,15 +182,26 @@ def publication_trace(db, post_id, tables):
                 (attempt['attempt_id'],)
             ).fetchall()
         ]
+    series_info = {}
+    if 'news_series' in tables:
+        series = db.execute('SELECT parts_json FROM news_series WHERE post_id=?', (post_id,)).fetchone()
+        if series:
+            parts = [dict(row) for row in db.execute(
+                'SELECT delivery_key,status,telegram_message_id FROM publication_attempts WHERE post_id=? ORDER BY attempt_id', (post_id,))]
+            total = len(json.loads(series['parts_json']))
+            delivered = sum(part['status'] in {'SENT', 'CONFIRMED'} for part in parts)
+            series_info = {'series_total': total, 'series_delivered': delivered, 'series_parts': parts}
     return {
         'status': attempt['status'],
-        'status_label': DELIVERY_LABELS.get(attempt['status'], 'Статус отправки не определён'),
+        'status_label': (f"Доставлено частей: {series_info['series_delivered']}/{series_info['series_total']} · "
+                         if series_info else '') + DELIVERY_LABELS.get(attempt['status'], 'Статус отправки не определён'),
         'attempt_count': attempt['attempt_count'],
         'telegram_message_id': attempt['telegram_message_id'],
         'error_code': attempt['error_code'],
         'created_at': attempt['created_at'],
         'updated_at': attempt['updated_at'],
         'events': events,
+        **series_info,
     }
 
 

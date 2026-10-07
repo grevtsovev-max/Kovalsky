@@ -23,9 +23,14 @@ HEADERS = {
     'Примеры редактуры': ['Исходный текст', 'Исправленный текст', 'Что улучшено', 'Учитывать'],
     'История обучения': ['Дата', 'Комментарий', 'Изменение', 'Статус', 'ID'],
 }
-SECTIONS = ['Заголовок', 'Лид', 'Структура', 'Язык и тон', 'Имена и названия', 'Цифры и даты', 'Цитаты', 'Ссылки', 'Продолжение', 'Дайджест']
+SECTIONS = ['Отбор', 'Проверка', 'Повторы', 'Публикация', 'Заголовок', 'Лид', 'Структура', 'Язык и тон', 'Имена и названия', 'Цифры и даты', 'Цитаты', 'Ссылки', 'Продолжение', 'Дайджест']
+
+
+class LearningClarification(ValueError):
+    """A scope question must be answered before a general amendment is applied."""
+
 GUARDRAILS = (
-    'Правила таблицы определяют оформление, а не факты, тематический охват или разрешение на публикацию. '
+    'Зарегистрированные уточнения владельца определяют редакционные критерии и оформление; тематический охват задаётся темником. '
     'Прочитай пригодный источник и сохраняй его URL, точную атрибуцию, стадию и масштаб. '
     'Не выдумывай факты, связи, последствия и историю. Не повышай заявление или мнение до факта. '
     'Публикуй только новое подтверждённое событие в установленном окне свежести и по включённой теме. '
@@ -82,6 +87,8 @@ def prompt(value):
 
 def apply(config, snapshot):
     config.setdefault('ai',{})['_editorial_registry'] = policy(snapshot)
+    from .policy import attach
+    attach(config)
 
 
 def attach_cached(config):
@@ -119,11 +126,13 @@ def configure(db, payload):
 
 def report(db):
     settings=state(db,SETTINGS)
-    if not settings: return {'connected':False}
+    learning = learning_report(db)
+    if not settings: return {'connected':False, 'questions': learning['questions']}
     snapshot=state(db,SNAPSHOT,{})
     return {'connected':True,'url':settings['url'],'version':snapshot.get('version'),'checked_at':snapshot.get('checked_at'),
             'error':state(db,ERROR),'counts':{k:len(v) for k,v in snapshot.get('sections',{}).items()},
-            'learning':state(db,'editorial_registry_learning',{}), 'writer':state(db,'editorial_registry_writer',{})}
+            'learning':state(db,'editorial_registry_learning',{}), 'writer':state(db,'editorial_registry_writer',{}),
+            'questions': learning['questions']}
 
 
 def probe_writer(db, force=False):
@@ -148,22 +157,39 @@ def plan(signal, snapshot, settings):
         'type':'object','additionalProperties':False,'properties':{
             'operation':{'type':'string','enum':['ADD','REPLACE','DISABLE']},'section':{'type':'string','enum':SECTIONS},
             'rule':{'type':'string'},'previous_rule':{'type':'string'},'example':{'type':'string'},'evidence':{'type':'string'}},
-        'required':['operation','section','rule','previous_rule','example','evidence']}}},'required':['changes']}
+        'required':['operation','section','rule','previous_rule','example','evidence']}}},'required':['changes','clarification']}
+    schema['properties']['clarification'] = {'type': 'string'}
     response=request_response({'model':settings.get('model','gpt-6-luna'),'store':False,'max_output_tokens':2000,
-        'instructions':('Выдели общие предпочтения оформления из редакторского замечания владельца, не более трёх изменений. '
-            'Факт, число, участник, юридический статус одного поста, тема мониторинга или жалоба на дубль сами по себе не создают стилевое правило: changes=[]. '
+        'instructions':('Выдели общие редакционные требования из замечания владельца, не более трёх изменений. '
+            'Требования к отбору, проверке, повторам и содержательному допуску публикации относятся к соответствующим разделам; '
+            'требования к форме относятся к разделам оформления. '
+            'Частное исправление факта, числа, участника или юридического статуса одного поста само по себе не создаёт общего правила: changes=[]. '
+            'Конкретная тема мониторинга меняется через темник; ясное общее требование о предотвращении дублей может стать правилом Повторы. '
+            'Общее пожелание может быть высказано в комментарии к одному посту: определяй охват по смыслу. '
+            'Если общий охват неоднозначен, changes=[] и clarification содержит короткий вопрос владельцу. '
+            'При ясном охвате clarification пуст. Не расширяй частную правку самовольно. '
+            'Историческая строка таблицы вне effective_editorial_rules не является действующим правилом; '
+            'явное пожелание владельца восстановить её может быть ADD. '
             'Не повторяй уже действующее правило, сопоставь смысл. Сохраняй ручные выключения. '
             'Каждое evidence — дословная непрерывная цитата из reason не короче восьми символов. '
             'Для REPLACE/DISABLE нужны явное пожелание владельца и точное previous_rule из таблицы. '
             'Предварительный TELEGRAM_EDIT и самостоятельный AGENT_EDIT не задают новых общих правил: changes=[]. '
-            'Не меняй достоверность, чтение источника, стадии, новизну, автоматический допуск, безопасность и тематический охват. '
+            'Не объявляй непроверенное утверждение владельца доказанным фактом. Не отменяй чтение, проверку и журнал доставки через редакционное предпочтение. '
+            'Не утверждай, что изменение текста правила само по себе изменило технические пределы, расписание или код конвейера. '
             'Пример содержит только образец формы с условными участниками, не новые факты.'),
-        'input':json.dumps({'signal':signal,'editorial_policy':policy(snapshot)},ensure_ascii=False),
+        'input':json.dumps({'signal':signal,'editorial_policy':policy(snapshot),
+                           'effective_editorial_rules': __import__('newsroom.policy', fromlist=['amendments']).amendments(settings)},ensure_ascii=False),
         'text':{'format':{'type':'json_schema','name':'editorial_learning','strict':True,'schema':schema}}},
-        {**settings,'_work_role':'editor','_work_category':'background','_work_stage':'editorial_learning'})
+        {**settings,'_work_role':'editor','_work_category':'owner_feedback','_work_stage':'editorial_learning'})
     if response.get('status')=='incomplete': raise ValueError('EDITORIAL_LEARNING_INCOMPLETE')
     raw=''.join(b.get('text','') for o in response.get('output',[]) for b in o.get('content',[]) if b.get('type')=='output_text')
-    changes=json.loads(raw)['changes']; reason=str(signal.get('reason',''))
+    result = json.loads(raw)
+    changes=result['changes']; reason=str(signal.get('reason',''))
+    question = result.get('clarification', '')
+    if not isinstance(question, str) or len(question) > 1000 or question and changes:
+        raise ValueError('EDITORIAL_CLARIFICATION_INVALID')
+    if question.strip():
+        raise LearningClarification(question.strip())
     if not isinstance(changes,list) or len(changes)>3: raise ValueError('EDITORIAL_LEARNING_SIZE')
     existing=snapshot.get('sections',{}).get('Редакторские правила',[])
     for change in changes:
@@ -230,6 +256,26 @@ def write_job(db, key, job):
 
 
 def learn_cycle(db, config):
+    """The bot and collector share one durable learning lease."""
+    import uuid
+    owner = uuid.uuid4().hex
+    db.commit(); db.execute('BEGIN IMMEDIATE')
+    lease = state(db, 'editorial_learning_lease', {})
+    if lease.get('until', 0) > time.time():
+        db.commit(); return
+    save(db, 'editorial_learning_lease', {'owner': owner,
+         'until': time.time() + max(180, int(config.get('ai', {}).get('timeout_seconds', 90)) + 180)})
+    db.commit()
+    try:
+        _learn_cycle(db, config)
+    finally:
+        db.rollback(); db.execute('BEGIN IMMEDIATE')
+        if state(db, 'editorial_learning_lease', {}).get('owner') == owner:
+            db.execute("DELETE FROM app_state WHERE key='editorial_learning_lease'")
+        db.commit()
+
+
+def _learn_cycle(db, config):
     if not state(db,SETTINGS): return
     cursor=state(db,'editorial_registry_cursor',0)
     for row in db.execute('SELECT * FROM editorial_feedback WHERE feedback_id>? ORDER BY feedback_id LIMIT 100',(cursor,)).fetchall():
@@ -258,15 +304,84 @@ def learn_cycle(db, config):
                 job['status']='READY'; save(db,key,job); db.commit()
             if not topics.credentials_available(state(db,topics.SETTINGS)):
                 raise RuntimeError('GOOGLE_SHEETS_WRITE_ACCESS_MISSING')
+            from .agent_control import require_enabled
+            require_enabled(config)
             write_job(db,key,job)
-            job['status']='DONE'; job.pop('error',None); save(db,key,job); db.commit()
             sync(db,config,force=True)
+            if job['changes'] and state(db, ERROR):
+                raise ValueError('EDITORIAL_WRITE_NOT_CONFIRMED')
+            actual = state(db, SNAPSHOT, {}).get('sections', {}).get('Редакторские правила', [])
+            confirmed = state(db, 'policy_v1_confirmed_rules', [])
+            for change in job['changes']:
+                target = change['previous_rule'] if change['operation'] == 'DISABLE' else change['rule']
+                matching = [r for r in actual if r['values'][:2] == [change['section'], target]]
+                if change['operation'] == 'DISABLE':
+                    if any(r['enabled'] for r in matching):
+                        raise ValueError('EDITORIAL_WRITE_NOT_CONFIRMED')
+                    confirmed = [r for r in confirmed if r != [change['section'], target]]
+                else:
+                    if not any(r['enabled'] for r in matching):
+                        raise ValueError('EDITORIAL_WRITE_NOT_CONFIRMED')
+                    if [change['section'], change['rule']] not in confirmed:
+                        confirmed.append([change['section'], change['rule']])
+            save(db, 'policy_v1_confirmed_rules', confirmed)
+            db.commit()
+            from .policy import attach, snapshot as policy_snapshot
+            attach(config)
+            job.update(status='DONE', applied_version=policy_snapshot(config.get('ai', {})), applied_at=time.time())
+            job.pop('error',None); save(db,key,job); db.commit()
         except Exception as exc:
             from .runtime import BudgetDeferred
-            if isinstance(exc,BudgetDeferred): job['retry_at']=time.time()+exc.delay_seconds
+            from .agent_control import AgentDisabled
+            if isinstance(exc, AgentDisabled):
+                raise
+            if isinstance(exc, LearningClarification):
+                job.update(status='NEEDS_CLARIFICATION', question=str(exc))
+            elif isinstance(exc,BudgetDeferred): job['retry_at']=time.time()+exc.delay_seconds
             elif str(exc) in {'APPS_SCRIPT_EDITORIAL_UPDATE_REQUIRED','GOOGLE_SHEETS_WRITE_ACCESS_MISSING'}:
                 job.update(status='BLOCKED',error=str(exc),retry_at=time.time()+180)
             else:
                 job['attempts']+=1; job.update(status='RETRY' if job['attempts']<3 else 'NEEDS_REVIEW',error=type(exc).__name__,retry_at=time.time()+180)
             save(db,key,job); db.commit()
         break
+
+
+def learning_report(db):
+    questions, applied = [], []
+    for row in db.execute("SELECT key,value FROM app_state WHERE key LIKE 'editorial_learning:%' ORDER BY key"):
+        job = json.loads(row['value'])
+        if job.get('status') == 'NEEDS_CLARIFICATION':
+            questions.append({'key': row['key'], 'question': job['question'],
+                              'reason': job['signal'].get('reason', '')})
+        if job.get('status') == 'DONE' and job.get('changes') and job.get('applied_version'):
+            applied.append({'key': row['key'], 'changes': job['changes'], 'at': job.get('applied_at'),
+                            'version': job['applied_version']})
+    return {'questions': questions, 'applied': sorted(applied, key=lambda job: job['at'] or 0)[-20:]}
+
+
+def clarify(db, key, answer):
+    """Authenticated owner answer; append a new signal rather than rewriting evidence."""
+    from .runtime import stamp
+    if not isinstance(key, str) or not key.startswith('editorial_learning:') or not isinstance(answer, str) or not 1 <= len(answer.strip()) <= 4000:
+        raise ValueError('EDITORIAL_CLARIFICATION_INVALID')
+    answer = answer.strip()
+    db.commit(); db.execute('BEGIN IMMEDIATE')
+    try:
+        job = state(db, key)
+        if not job:
+            raise ValueError('EDITORIAL_QUESTION_MISSING')
+        if job.get('status') == 'ANSWERED' and job.get('answer') == answer:
+            db.commit(); return job['answer_feedback_id']
+        if job.get('status') != 'NEEDS_CLARIFICATION':
+            raise ValueError('EDITORIAL_QUESTION_ALREADY_RESOLVED')
+        signal = job['signal']
+        reason = ('Исходное замечание владельца:\n' + signal.get('reason', '') +
+                  '\nВопрос об области действия:\n' + job['question'] + '\nОтвет владельца:\n' + answer)
+        feedback_id = db.execute('INSERT INTO editorial_feedback(created_at,item_id,story_id,post_id,feedback_type,reason,item_title,post_text) VALUES(?,?,?,?,?,?,?,?)',
+            (stamp(), signal.get('item_id'), signal.get('story_id'), signal.get('post_id'), 'OWNER_RULE_CLARIFICATION',
+             reason, signal.get('item_title', ''), signal.get('post_text', ''))).lastrowid
+        job.update(status='ANSWERED', answer=answer, answer_feedback_id=feedback_id, answered_at=stamp())
+        save(db, key, job); db.commit()
+        return feedback_id
+    except Exception:
+        db.rollback(); raise

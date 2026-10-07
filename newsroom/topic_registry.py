@@ -469,7 +469,7 @@ def grounded_match(result, thematic, source):
     if not isinstance(quote, str) or not isinstance(source.get('content', ''), str):
         return False
     from .knowledge import grounded_span
-    actual = grounded_span(quote, source.get('content', ''))
+    actual = grounded_span(quote, source.get('content', ''), min_length=1)
     if actual is None:
         return False
     match['evidence'] = actual

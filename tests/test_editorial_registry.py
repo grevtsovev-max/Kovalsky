@@ -69,10 +69,10 @@ class EditorialRegistryTests(unittest.TestCase):
         value=board.policy(snapshot())
         self.assertNotIn('Выключенное правило',json.dumps(value,ensure_ascii=False))
         prompt=_load_editorial_rules({'_editorial_registry':value})
-        self.assertIn('Пиши кратко',prompt); self.assertIn('достоверность',prompt.casefold())
-        self.assertIn('точную атрибуцию',prompt)
+        self.assertNotIn('Пиши кратко',prompt); self.assertIn('Kovalsky 1.0',prompt)
+        self.assertIn('Одного пригодного материала достаточно',prompt)
         source={'name':'Example','reputation':'unknown','priority':1}
-        self.assertEqual(analysis_input({},source,[],{'_editorial_registry':value})['editorial_policy']['version'],'v1')
+        self.assertEqual(analysis_input({},source,[],{'_editorial_registry':value})['editorial_policy']['version'],'1.0')
 
     def test_read_failure_preserves_last_good_copy(self):
         config={}
@@ -125,11 +125,52 @@ class EditorialRegistryTests(unittest.TestCase):
         self.assertEqual(writer.call_args.args[2]['changes'],[])
         self.assertEqual(state(self.db,'editorial_learning:1')['status'],'DONE')
 
+    def test_owner_feedback_plan_uses_its_bounded_priority_lane(self):
+        changes = [change()]
+        response = {'output': [{'content': [{'type': 'output_text', 'text': json.dumps({'changes': changes, 'clarification': ''})}]}]}
+        with patch('newsroom.ai.request_response', return_value=response) as request:
+            self.assertEqual(board.plan({'reason': 'Убирай канцелярит'}, snapshot(), {}), changes)
+        self.assertEqual(request.call_args.args[1]['_work_category'], 'owner_feedback')
+
     def test_learning_plan_requires_exact_owner_evidence(self):
         c=change(); c['evidence']='Цитата отсутствует'
         response={'output':[{'content':[{'type':'output_text','text':json.dumps({'changes':[c]})}]}]}
         with patch('newsroom.ai.request_response',return_value=response):
             with self.assertRaises(ValueError): board.plan({'reason':'Убирай канцелярит'},snapshot(),{})
+
+    def test_successful_write_is_not_reported_applied_when_readback_failed(self):
+        self.db.execute("INSERT INTO editorial_feedback(created_at,feedback_type,reason) VALUES('2026-01-01','OTHER','Убирай канцелярит')")
+        self.db.commit()
+        with patch.object(topics,'credentials_available',return_value=True), patch.object(board,'probe_writer',return_value=True), patch.object(board,'plan',return_value=[change()]), patch.object(board,'write_job'), patch.object(board,'read_registry',side_effect=OSError):
+            board.learn_cycle(self.db, {'ai': {}})
+        job = state(self.db, 'editorial_learning:1')
+        self.assertEqual(job['status'], 'RETRY')
+        self.assertNotIn('applied_version', job)
+
+    def test_ambiguous_scope_waits_for_owner_without_retrying_or_writing(self):
+        self.db.execute("INSERT INTO editorial_feedback(created_at,feedback_type,reason) VALUES('2026-01-01','OTHER','Здесь сократи')")
+        self.db.commit()
+        with patch.object(board,'probe_writer',return_value=True), patch.object(board,'plan',side_effect=board.LearningClarification('Только этот пост или следующие тоже?')), patch.object(board,'write_job') as write:
+            board.learn_cycle(self.db, {'ai': {}})
+            board.learn_cycle(self.db, {'ai': {}})
+        write.assert_not_called()
+        job = state(self.db, 'editorial_learning:1')
+        self.assertEqual(job['status'], 'NEEDS_CLARIFICATION')
+        self.assertEqual(job['attempts'], 0)
+        self.assertEqual(board.learning_report(self.db)['questions'][0]['question'], job['question'])
+        feedback_id = board.clarify(self.db, 'editorial_learning:1', 'Для следующих постов тоже')
+        self.assertEqual(board.clarify(self.db, 'editorial_learning:1', 'Для следующих постов тоже'), feedback_id)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM editorial_feedback').fetchone()[0], 2)
+        self.assertEqual(state(self.db, 'editorial_learning:1')['status'], 'ANSWERED')
+        self.assertEqual(board.learning_report(self.db)['questions'], [])
+
+    def test_concurrent_learning_executor_does_not_write_twice(self):
+        import time
+        save(self.db, 'editorial_learning_lease', {'owner': 'other', 'until': time.time()+60})
+        self.db.commit()
+        with patch.object(board, '_learn_cycle') as work:
+            board.learn_cycle(self.db, {'ai': {}})
+        work.assert_not_called()
 
 
 if __name__=='__main__': unittest.main()

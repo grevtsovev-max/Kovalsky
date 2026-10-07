@@ -8,7 +8,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from newsroom.core import run_cycle, process_item, _save_item
 from newsroom.db import connect, connect_readonly
@@ -208,6 +208,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNone(load_draft_context(self.db, 1, self.item(), self.config['ai']))
 
     def setUp(self):
+        from policy_fixtures import final_check
+        checker = patch('newsroom.ai.validate_draft', side_effect=final_check)
+        checker.start()
+        self.addCleanup(checker.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = str(Path(self.temp.name) / 'newsroom.db')
@@ -270,7 +274,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT status FROM publication_attempts').fetchone()[0], 'CONFIRMED')
         self.assertEqual(json.loads(self.db.execute('SELECT telegram_response_json FROM publication_attempts').fetchone()[0])['message_id'], 100)
         roles = {row[0] for row in self.db.execute('SELECT role FROM processing_job_events')}
-        self.assertEqual(roles, {'collector', 'filter', 'editor'})
+        self.assertEqual(roles, {'collector', 'editor'})
 
     def test_related_documents_wait_for_each_other_before_spending_on_analysis(self):
         first = self.item(1)
@@ -480,9 +484,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(request.call_args.args[0]['max_output_tokens'], 5000)
 
     def test_draft_request_is_accounted_as_drafting(self):
-        from newsroom.ai import draft_post
+        from newsroom.ai import draft_post, SCHEMA
         draft = {'headline_ru': 'Банк открыл счета', 'summary_ru': 'Банк открыл счета цифрового рубля.',
-                 'what_is_new': '', 'editorial_check': {}}
+                 'what_is_new': '', 'editorial_check': {key: '' if key == 'history_note' else False for key in SCHEMA['properties']['editorial_check']['required']}}
         response = {'output': [{'content': [{'type': 'output_text', 'text': json.dumps(draft)}]}]}
         with patch('newsroom.ai.request_response', return_value=response) as request:
             contract = {'text_field': 'summary_ru', 'has_previous_publication': False,
@@ -497,7 +501,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('summary_ru', content['checked_decision'])
         self.assertEqual(content['previous_draft']['editorial_check'], old_audit)
         self.assertEqual(content['previous_draft']['summary_ru'], 'Old draft')
-        self.assertIn('required_fact_quotes', request.call_args.args[0]['instructions'])
+        self.assertIn('своими словами', request.call_args.args[0]['instructions'])
 
     def test_existing_retry_job_accepts_fresh_completion_without_unique_conflict(self):
         for fails in (False, True):
@@ -519,9 +523,10 @@ class WorkflowTests(unittest.TestCase):
                     yield
                 coordinator._advance(job, finish())
                 rows = self.db.execute('SELECT category,status,attempts FROM processing_jobs WHERE item_id=? ORDER BY category', (item_id,)).fetchall()
-                self.assertEqual([(r['category'], r['status']) for r in rows], [('fresh', 'SUPERSEDED'), ('retry', 'WAITING')])
+                expected = [('fresh', 'DONE'), ('retry', 'DONE')] if fails else [('fresh', 'SUPERSEDED'), ('retry', 'WAITING')]
+                self.assertEqual([(r['category'], r['status']) for r in rows], expected)
                 self.assertEqual(rows[1]['attempts'], 2)
-                self.assertEqual(self.db.execute('SELECT count(*) FROM processing_job_events WHERE job_id=?', (job['job_id'],)).fetchone()[0], 2)
+                self.assertEqual(self.db.execute('SELECT count(*) FROM processing_job_events WHERE job_id=?', (job['job_id'],)).fetchone()[0], 1 if fails else 2)
                 self.db.execute("UPDATE processing_jobs SET status='DONE' WHERE item_id=?", (item_id,))
                 self.db.commit()
 
@@ -629,6 +634,32 @@ class WorkflowTests(unittest.TestCase):
             process_item(self.db, self.source, self.item(), **self.options, ai_settings=self.config['ai'], existing_item_id=item_id)
             self.assertEqual(analyze.call_count, 2)
 
+    def test_api_concurrency_wait_releases_stage_worker(self):
+        from newsroom.workflow import StageExecutor
+        executor = StageExecutor(1)
+        try:
+            blocked = Work('collector', Mock(side_effect=BudgetDeferred('concurrency', 1)))
+            first = executor.submit(blocked.execute, None, {})
+            with self.assertRaises(BudgetDeferred):
+                first.result(timeout=1)
+            ready = Work('collector', Mock(return_value={'content': 'Read', 'material_read': True}))
+            second = executor.submit(ready.execute, None, {})
+            self.assertEqual(second.result(timeout=1)['content'], 'Read')
+        finally:
+            executor.shutdown()
+
+    def test_short_read_material_is_cached_but_snippet_is_not(self):
+        from newsroom.workflow import readable_result
+        read = {'content': 'Банк получил лицензию.', 'material_read': True}
+        self.assertTrue(readable_result(read))
+        self.assertFalse(readable_result({**read, 'material_read': False}))
+        self.assertFalse(readable_result({'content': ' ', 'material_read': True}))
+        callback = Mock(return_value=read)
+        work = Work('collector', callback, key=cache_key('short-read', 1), ttl=60)
+        for _ in range(2):
+            self.assertEqual(work.execute(self.config['ai']['_runtime']), read)
+        callback.assert_called_once()
+
     def test_errors_are_never_cached(self):
         calls = []
         def fail():
@@ -656,7 +687,7 @@ class WorkflowTests(unittest.TestCase):
         finally:
             readonly.close()
 
-    def test_ordinary_failures_still_end_after_three_real_retries(self):
+    def test_malformed_provider_output_uses_technical_retries_without_rejecting_story(self):
         from newsroom.ai import AIResponseError
         with patch('newsroom.core.fetch_rss', return_value=[self.item()]), \
              patch('newsroom.core.get_api_key', return_value='test'), \
@@ -664,11 +695,11 @@ class WorkflowTests(unittest.TestCase):
             for attempt in range(4):
                 run_cycle(self.config)
                 state = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])
-                self.assertEqual(state['attempts'], attempt)
+                self.assertEqual(state['attempts'], 0)
                 if attempt < 3:
                     self.db.execute("UPDATE processing_jobs SET next_at='2000-01-01' WHERE status='WAITING'")
                     self.db.commit()
-        self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'REJECTED')
+        self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'TECHNICAL_ERROR')
         self.assertEqual(snapshot(self.db)['unfinished'], 0)
 
     def test_legacy_pending_material_is_seeded_into_the_durable_queue(self):
@@ -679,6 +710,17 @@ class WorkflowTests(unittest.TestCase):
             Coordinator(self.db, self.config, counts).close()
         self.assertEqual(counts, {'NOISE': 1})
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM processing_jobs').fetchone()[0], 1)
+
+    def test_disabling_source_monitoring_does_not_abandon_accepted_material(self):
+        _save_item(self.db, self.source, self.item())
+        self.db.execute('UPDATE sources SET active=0 WHERE source_id=?', (self.source['source_id'],))
+        self.db.commit()
+        counts = {}
+        with patch('newsroom.core.get_api_key', return_value='test'), patch('newsroom.core.analyze_with_ai', side_effect=self.noise):
+            Coordinator(self.db, self.config, counts).close()
+        self.assertEqual(counts, {'NOISE': 1})
+        self.assertEqual(snapshot(self.db)['unfinished'], 0)
+        self.assertEqual(self.db.execute('SELECT active FROM sources').fetchone()[0], 0)
 
     def test_related_backlog_does_not_hide_independent_work_beyond_first_batch(self):
         for number in range(1, 35):
@@ -734,7 +776,7 @@ class WorkflowTests(unittest.TestCase):
         enqueue(self.db, None, item, self.source, self.options)
         self.config['sources'] = []
         run_cycle(self.config)
-        self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'STALE')
+        self.assertEqual(self.db.execute('SELECT disposition FROM items').fetchone()[0], 'STORE_ONLY')
         self.assertEqual(snapshot(self.db)['unfinished'], 0)
 
     def test_correction_budget_deferral_preserves_spent_attempts_and_remaining_limit(self):
@@ -845,14 +887,30 @@ class RuntimeTests(unittest.TestCase):
 
     def test_http_retry_also_requires_a_new_budget_reservation(self):
         from newsroom.ai import request_response
+        from newsroom.ai import AIResponseError
         from urllib.error import URLError
         runtime = self.runtime(api_requests_per_window=1)
         with patch('newsroom.ai.get_api_key', return_value='test'), patch('newsroom.ai.time.sleep'), \
              patch('newsroom.ai.urllib.request.urlopen', side_effect=URLError('connection failed')) as transport:
+            with self.assertRaises(AIResponseError):
+                request_response({'model': 'test'}, {'_runtime': runtime})
             with self.assertRaises(BudgetDeferred):
                 request_response({'model': 'test'}, {'_runtime': runtime})
         self.assertEqual(transport.call_count, 1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM api_usage').fetchone()[0], 1)
+
+    def test_owner_feedback_has_bounded_capacity_while_fresh_queue_is_busy(self):
+        enqueue(self.db, None, WorkflowTests.item(self), self.source, self.options)
+        runtime = self.runtime()
+        for _ in range(2):
+            call = runtime.reserve({'model': 'test'}, {'_work_category': 'owner_feedback'})
+            runtime.finish(call, {'usage': {}}, .01)
+        with self.assertRaises(BudgetDeferred) as waiting:
+            runtime.reserve({'model': 'test'}, {'_work_category': 'owner_feedback'})
+        self.assertEqual(waiting.exception.reason, 'owner_feedback')
+        fresh = runtime.reserve({'model': 'test'}, {'_work_category': 'fresh'})
+        runtime.finish(fresh, {'usage': {}}, .01)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM api_usage WHERE category='owner_feedback'").fetchone()[0], 2)
 
     def test_background_work_waits_while_fresh_queue_is_unfinished(self):
         enqueue(self.db, None, WorkflowTests.item(self), self.source, self.options)

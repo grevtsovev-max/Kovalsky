@@ -23,11 +23,70 @@ from newsroom.cli import is_eligible_for_auto_publish
 
 
 class PrimarySourceExtractionTests(unittest.TestCase):
+    def setUp(self):
+        from policy_fixtures import final_check
+        checker = patch('newsroom.ai.validate_draft', side_effect=final_check)
+        checker.start()
+        self.addCleanup(checker.stop)
+
+    def test_short_complete_structured_article_is_read_without_replacing_with_description(self):
+        body = 'Банк получил лицензию.'
+        page = '<html><head><meta name="description" content="' + 'Длинное описание. ' * 20 + '">'
+        page += '<script type="application/ld+json">' + json.dumps({'@type': 'NewsArticle', 'articleBody': body}) + '</script></head><body></body></html>'
+        with patch('newsroom.core._request_with_url', return_value=(page.encode(), 'https://example.org/news', 'text/html')):
+            article = fetch_publisher_article('https://example.org/news', 'Издание', None, discover_primary=False)
+        self.assertTrue(article['material_read'])
+        self.assertEqual(article['content'], body)
+
+    def test_manual_url_accepts_short_read_article_and_rejects_unread_preview(self):
+        from newsroom.manual_intake import _submit_locked, IntakeError
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'newsroom': {'database': str(Path(directory) / 'manual.sqlite3'), 'independent_processing': True}, 'ai': {'_policy_baseline': []}}
+            article = {'title': 'Банк получил лицензию', 'content': 'Банк получил лицензию.',
+                       'url': 'https://news.example/short', 'material_read': True, 'published_at': None}
+            with patch('newsroom.core._validate_public_http_url'), patch('newsroom.manual_intake.fetch_publisher_article', return_value=article):
+                result = _submit_locked(config, article['url'])
+            self.assertEqual(result['outcome'], 'QUEUED')
+            db = connect(config['newsroom']['database'])
+            try:
+                self.assertEqual(db.execute('SELECT content FROM items').fetchone()[0], article['content'])
+            finally:
+                db.close()
+            with patch('newsroom.core._validate_public_http_url'), patch('newsroom.manual_intake.fetch_publisher_article', return_value={**article, 'material_read': False}):
+                with self.assertRaises(IntakeError):
+                    _submit_locked(config, article['url'])
+
     def test_zoom_modified_metadata_is_not_invented_publication_time(self):
         parser = PublisherArticleParser()
         parser.feed('<meta name="zoom:last-modified" content="Tue, 06 Oct 2026 15:16:00 GMT">')
         self.assertEqual(parser.updated_at, '2026-10-06T15:16:00+00:00')
         self.assertIsNone(parser.published_at)
+
+    def test_navigation_clock_and_changing_counters_do_not_change_read_material(self):
+        def parse(views, clock):
+            parser = PublisherArticleParser()
+            parser.feed(f'<nav><time datetime="{clock}">Часы сайта</time></nav>'
+                        '<div role="navigation"><p>Меню</p></div>'
+                        '<article><p>Банк получил лицензию.</p>'
+                        f'<div class="view-count"><p>{views} просмотров</p></div>'
+                        '<div class="advertisement"><p>Реклама вклада</p></div>'
+                        '<img class="ad-banner" src="banner.jpg">'
+                        '<p>Разрешение вступает в силу 10 октября.</p></article>')
+            return parser
+        old = parse(100, '2026-10-06T10:00:00+03:00')
+        new = parse(200, '2026-10-07T10:00:00+03:00')
+        self.assertEqual(old.blocks, new.blocks)
+        self.assertEqual(len(new.blocks), 2)
+        self.assertIn('10 октября', str(new.blocks))
+        self.assertIsNone(new.published_at)
+
+    def test_hidden_ui_is_excluded_without_erasing_substantive_article_words(self):
+        parser = PublisherArticleParser()
+        parser.feed('<div hidden><p>Скрытое меню</p></div>'
+                    '<span aria-hidden="true">999</span>'
+                    '<p>Банк повысил ставки: реклама и просмотры не являются причиной решения.</p>')
+        self.assertEqual(len(parser.blocks), 1)
+        self.assertIn('реклама и просмотры', str(parser.blocks))
 
     def test_nested_related_cards_do_not_leak_links_or_hide_following_article(self):
         parser = PublisherArticleParser()
@@ -198,7 +257,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
         sent_item = json.loads(sent["input"][0]["content"])["item"]
         self.assertEqual(sent_item["primary_source_status"], "READ")
         self.assertEqual(sent_item["primary_source"]["content"], "Текст решения.")
-        self.assertIn("primary_source_status равен UNREADABLE", sent["instructions"])
+        self.assertIn("Используй только прочитанные сведения", sent["instructions"])
 
     def test_relevant_rss_item_reads_article_before_ai_and_records_primary_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -320,8 +379,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
                  patch("newsroom.core.get_api_key", return_value="test-key"), \
                  patch("newsroom.core.analyze_with_ai", return_value=ai_result) as analyze:
                 process_item(db, source, item, 0.35, 700, 48, ai_settings={"model": "test"})
-            analyze.assert_called_once()
-            self.assertIsNone(analyze.call_args.args[0]["primary_source"])
+            analyze.assert_not_called()
             held = db.execute("SELECT disposition,primary_source_json FROM items").fetchone()
             self.assertEqual(held["disposition"], "PRIMARY_RETRY")
             self.assertEqual(json.loads(held["primary_source_json"])["status"], "ARTICLE_UNREADABLE")

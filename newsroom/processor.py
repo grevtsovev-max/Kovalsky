@@ -17,6 +17,8 @@ def prepare(config, db=None):
     from .editorial_registry import attach_cached
     attach(config)
     attach_cached(config)
+    from .policy import attach as attach_policy
+    attach_policy(config)
     config['_continuous_processing'] = True
     config['ai'] = {k: v for k, v in config['ai'].items()
                     if k not in {'_analysis_budget', '_triage_budget', '_disabled_for_cycle', '_triage_disabled'}}
@@ -38,7 +40,7 @@ def seed_held(db, config):
     migrate(db)
     _reconcile_legacy_retry_loops(db)
     _close_exhausted_retries(db)
-    sources = {r['source_id']: r for r in db.execute("SELECT * FROM sources WHERE active=1 OR type='manual' OR url LIKE 'story-watch://%'")}
+    sources = {r['source_id']: r for r in db.execute('SELECT * FROM sources')}
     settings = {**config, 'newsroom': {**config.get('newsroom', {}), 'retry_items_per_cycle': 1000, 'triage_per_cycle': 1000}}
     # Migration only seeds missing jobs; it never clears attempts or reopens terminal work.
     _retry_ai_held_items(db, sources, settings, limit=1000, coordinator=True)

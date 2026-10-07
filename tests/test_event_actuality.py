@@ -16,7 +16,7 @@ class EventActualityTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.assertIsNone(self.check(now.date().isoformat(), 'Сегодня банк запустил сервис.', now.isoformat()))
         old = now - timedelta(days=10)
-        self.assertEqual(self.check(old.date().isoformat(), 'Сегодня банк запустил сервис.', old.isoformat())[0], 'stale')
+        self.assertIsNone(self.check(old.date().isoformat(), 'Сегодня банк запустил сервис.', old.isoformat()))
 
     def test_date_without_year_and_yesterday_are_resolved(self):
         now = datetime.now(timezone.utc)
@@ -29,7 +29,7 @@ class EventActualityTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         old = now - timedelta(days=400)
         quote = f'Банк запустил сервис {old.date().isoformat()}.'
-        self.assertEqual(self.check(old.date().isoformat(), quote, now.isoformat())[0], 'stale')
+        self.assertIsNone(self.check(old.date().isoformat(), quote, now.isoformat()))
         self.assertEqual(self.check(now.date().isoformat(), quote, now.isoformat())[0], 'unverified')
 
     def test_dateline_month_accepts_sentence_period_but_numeric_date_keeps_year_boundary(self):

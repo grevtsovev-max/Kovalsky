@@ -31,10 +31,10 @@ class InitialBackfillTests(unittest.TestCase):
         self.assertEqual(self.run_first_cycle(8), "PRIMARY_RETRY")
 
     def test_old_story_stays_outside_initial_window(self):
-        self.assertEqual(self.run_first_cycle(49), "BASELINE_SKIPPED")
+        self.assertEqual(self.run_first_cycle(49), "STORE_ONLY")
 
     def test_default_follows_configured_freshness_window(self):
         self.assertEqual(self.run_first_cycle(60, {"freshness_window_hours": 72}), "PRIMARY_RETRY")
 
     def test_explicit_narrow_window_is_respected(self):
-        self.assertEqual(self.run_first_cycle(8, {"initial_backfill_minutes": 15}), "BASELINE_SKIPPED")
+        self.assertEqual(self.run_first_cycle(8, {"initial_backfill_minutes": 15}), "STORE_ONLY")

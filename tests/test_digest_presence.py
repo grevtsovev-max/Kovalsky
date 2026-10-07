@@ -128,6 +128,19 @@ class DigestRemovalTests(ChannelPresenceTests):
             self.assertEqual(publish_digest(self.path, config), (True, 1))
             self.assertNotIn('/2)', send.call_args.args[1])
 
+    def test_receipts_from_another_channel_are_not_reused_in_new_channel(self):
+        for post in self.db.execute('SELECT * FROM posts').fetchall():
+            self.db.execute("INSERT INTO publication_attempts(delivery_key,channel_id,post_id,text,content_hash,status,telegram_message_id,telegram_response_json,created_at,updated_at) VALUES(?,?,?,?,?,'CONFIRMED',?,?,?,?)",
+                            (f"@old_channel:post:{post['post_id']}", '@old_channel', post['post_id'], post['text'], post['post_hash'], post['external_id'], json.dumps({'message_id': int(post['external_id'])}), post['published_at'], post['published_at']))
+        self.db.commit()
+        config = dict(self.config, telegram=dict(self.config['telegram'], chat_id='@new_channel'))
+        with patch('newsroom.channel_presence.inspect_channel_posts') as inspect, patch('newsroom.cli.datetime') as clock, patch('newsroom.cli.telegram_send') as send:
+            clock.now.return_value = datetime(2026, 10, 5, 18, tzinfo=timezone.utc)
+            clock.combine.side_effect = datetime.combine
+            self.assertEqual(publish_digest(self.path, config), (False, 0))
+        inspect.assert_not_called()
+        send.assert_not_called()
+
     def test_deletion_after_batch_creation_is_removed_before_send(self):
         config = dict(self.config, telegram=dict(self.config['telegram'], chat_id='@race_test'))
         calls = []
