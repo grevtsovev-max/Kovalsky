@@ -87,6 +87,10 @@ def _telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -
             rejection = json.loads(exc.read())
         except Exception:
             rejection = {}
+        from .delivery import telegram_rate_limit
+        rate_limit = telegram_rate_limit(rejection)
+        if rate_limit and exc.code == 429:
+            raise rate_limit from None
         if isinstance(rejection, dict) and rejection.get("ok") is False and 400 <= exc.code < 500 and exc.code != 408:
             raise DeliveryRejected(f"Telegram API rejected request ({exc.code})") from None
         raise DeliveryUncertain(f"Telegram API HTTP {exc.code}") from None
@@ -95,6 +99,10 @@ def _telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -
     if not isinstance(result, dict) or result.get("ok") not in (True, False):
         raise DeliveryUncertain("Telegram API malformed response")
     if result.get("ok") is False:
+        from .delivery import telegram_rate_limit
+        rate_limit = telegram_rate_limit(result)
+        if rate_limit:
+            raise rate_limit
         code = result.get("error_code")
         if isinstance(code, int) and 400 <= code < 500 and code != 408:
             raise DeliveryRejected(f"Telegram API rejected request ({code})")
@@ -1079,9 +1087,13 @@ def _publish(db, config, post_id: int, automatic: bool = False) -> None:
     except Exception as exc:
         if post['origin_item_id']:
             from .material_flow import mark
+            from .runtime import BudgetDeferred
+            deferred = isinstance(exc, BudgetDeferred)
             mark(db, post['origin_item_id'], 'delivery', 'WAITING',
+                 'Ожидает разрешённого времени повторной доставки.' if deferred else
                  'Результат отправки неизвестен; требуется сверка.' if isinstance(exc, DeliveryUncertain) else 'Отправка не завершена: '+type(exc).__name__,
-                 block_kind='delivery_unknown' if isinstance(exc, DeliveryUncertain) else 'transport')
+                 block_kind='delivery_wait' if deferred else 'delivery_unknown' if isinstance(exc, DeliveryUncertain) else 'transport',
+                 next_at=(datetime.now(timezone.utc) + timedelta(seconds=exc.delay_seconds)).isoformat() if deferred else None)
             db.commit()
         _log_timing("telegram_publish_timing", post_id=post_id,
                     seconds=round(time.perf_counter() - publish_started, 3),

@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timezone, timedelta
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS publication_attempts (
  attempt_id INTEGER PRIMARY KEY,
  delivery_key TEXT NOT NULL UNIQUE,
@@ -75,6 +76,25 @@ class DeliveryUncertain(RuntimeError):
 
 class DeliveryRejected(RuntimeError):
     """Only a definitive rejection, or a failure before any request, is retryable."""
+
+
+from .runtime import BudgetDeferred
+
+
+class DeliveryRateLimited(BudgetDeferred):
+    """Telegram definitively refused this request and specified a wait."""
+    def __init__(self, seconds):
+        super().__init__('delivery', seconds)
+
+
+def telegram_rate_limit(response):
+    if not isinstance(response, dict) or response.get('ok') is not False or response.get('error_code') != 429:
+        return None
+    parameters = response.get('parameters')
+    seconds = parameters.get('retry_after') if isinstance(parameters, dict) else None
+    if type(seconds) is int and seconds > 0:
+        return DeliveryRateLimited(seconds)
+    return None
 
 
 class TelegramReceipt(str):
@@ -162,6 +182,13 @@ def deliver(db, config, operation, text, send, post_id=None, verified_text=None)
     if row and row['status'] in {'SENDING', 'UNKNOWN'}:
         db.commit()
         raise DeliveryUncertain('Delivery outcome requires reconciliation; resend blocked')
+    wait_key = 'telegram_wait:' + target
+    wait_row = db.execute('SELECT value FROM app_state WHERE key=?', (wait_key,)).fetchone()
+    if wait_row:
+        remaining = (datetime.fromisoformat(json.loads(wait_row[0])['until']) - datetime.fromisoformat(now())).total_seconds()
+        if remaining > 0:
+            db.commit()
+            raise DeliveryRateLimited(max(1, int(remaining + .999)))
     if row and row['attempt_count'] >= 4:
         db.commit()
         raise DeliveryRejected('Delivery retry limit reached')
@@ -237,6 +264,16 @@ def deliver(db, config, operation, text, send, post_id=None, verified_text=None)
         # The production transport always returns a message ID and its actual response.
         if not isinstance(receipt, (str, int)) or not str(receipt).isdigit():
             raise DeliveryUncertain('Telegram response has no valid message ID')
+    except DeliveryRateLimited as exc:
+        until = (datetime.fromisoformat(now()) + timedelta(seconds=exc.delay_seconds)).isoformat()
+        db.execute('INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                   (wait_key, json.dumps({'until': until})))
+        changed = db.execute("UPDATE publication_attempts SET status='PREPARED',attempt_count=attempt_count-1,error_code='TELEGRAM_RATE_LIMIT',updated_at=? WHERE attempt_id=? AND status='SENDING'",
+                             (now(), attempt_id)).rowcount
+        if changed:
+            event(db, attempt_id, 'PREPARED', {'error_code': 'TELEGRAM_RATE_LIMIT', 'retry_at': until})
+        db.commit()
+        raise
     except Exception as exc:
         status = 'FAILED' if isinstance(exc, (DeliveryRejected, AgentDisabled)) else 'UNKNOWN'
         changed = db.execute("UPDATE publication_attempts SET status=?,error_code=?,updated_at=? WHERE attempt_id=? AND status='SENDING'",
