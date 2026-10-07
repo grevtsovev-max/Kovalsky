@@ -478,7 +478,7 @@ class PublisherArticleParser(HTMLParser):
             key = (values.get("property") or values.get("name") or "").lower()
             if key in {"article:published_time", "datepublished", "pubdate"}:
                 self.published_at = parse_date(values.get("content"))
-            elif key in {"article:modified_time", "datemodified"}:
+            elif key in {"article:modified_time", "datemodified", "zoom:last-modified"}:
                 self.updated_at = parse_date(values.get("content"))
             if key in {"og:title", "twitter:title"} and values.get("content"):
                 self.meta_title = values["content"]
