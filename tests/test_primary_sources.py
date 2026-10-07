@@ -23,6 +23,12 @@ from newsroom.cli import is_eligible_for_auto_publish
 
 
 class PrimarySourceExtractionTests(unittest.TestCase):
+    def test_zoom_modified_metadata_is_not_invented_publication_time(self):
+        parser = PublisherArticleParser()
+        parser.feed('<meta name="zoom:last-modified" content="Tue, 06 Oct 2026 15:16:00 GMT">')
+        self.assertEqual(parser.updated_at, '2026-10-06T15:16:00+00:00')
+        self.assertIsNone(parser.published_at)
+
     def test_nested_related_cards_do_not_leak_links_or_hide_following_article(self):
         parser = PublisherArticleParser()
         parser.feed("<div class='related'><div><a href='https://related.gov/a'>one</a></div>"
