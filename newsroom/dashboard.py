@@ -130,7 +130,7 @@ body{font-size:14px;line-height:1.55}.app{grid-template-columns:244px minmax(0,1
 @media(max-width:1100px){.path-strip{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.path-step{border:0;background:#f5f8f6;padding:8px 10px}.path-step:first-child{padding-left:10px}}
 @media(max-width:600px){.path-strip{grid-template-columns:repeat(7,minmax(112px,1fr));overflow-x:auto;padding-bottom:7px}.path-step:last-child{grid-column:auto}.path-step strong{font-size:20px}.material-path .panel-head{align-items:flex-start;flex-direction:column}.material-heading{display:block}.material-heading .pill{max-width:100%;margin-top:8px}.material-tabs{gap:3px}.material-tabs button{font-size:12px;padding:8px}.material-summary>div{grid-template-columns:65px minmax(0,1fr)}.material-card{padding:16px}.material-toolbar label{width:100%}.top h1{font-size:25px}}
 </style></head><body>
-<div class="app"><aside class="side"><div class="brand">Kovalsky<span>Newsroom</span></div><nav class="nav"><a class="active" href="/?view=pipeline" data-view="pipeline">Материалы</a><a href="/?view=published" data-view="published">Публикации</a><a href="/?view=sources" data-view="sources">Источники</a><a href="/?view=policy" data-view="policy">Правила <span id="policy-question-count"></span></a><a href="/?view=resources" data-view="resources">Расходы</a><details class="nav-more"><summary>Дополнительно</summary><a href="/?view=corrections" data-view="corrections">Правки постов</a><a href="/?view=regulatory" data-view="regulatory">Нормативные документы</a><a href="/?view=analysis" data-view="analysis">Аналитика</a></details></nav><div class="side-foot">Кабинет редакции<br><span class="muted">Данные обновляются автоматически</span></div></aside>
+<div class="app" data-design="materials-path-v2"><aside class="side"><div class="brand">Kovalsky<span>Newsroom</span></div><nav class="nav"><a class="active" href="/?view=pipeline" data-view="pipeline">Материалы</a><a href="/?view=published" data-view="published">Публикации</a><a href="/?view=sources" data-view="sources">Источники</a><a href="/?view=policy" data-view="policy">Правила <span id="policy-question-count"></span></a><a href="/?view=resources" data-view="resources">Расходы</a><details class="nav-more"><summary>Дополнительно</summary><a href="/?view=corrections" data-view="corrections">Правки постов</a><a href="/?view=regulatory" data-view="regulatory">Нормативные документы</a><a href="/?view=analysis" data-view="analysis">Аналитика</a></details></nav><div class="side-foot">Кабинет редакции<br><span class="muted">Путь материалов v2 · данные обновляются автоматически</span></div></aside>
 <main class="main"><header class="top"><div><div class="eyebrow">Редакция · <span id="updated">загрузка…</span></div><h1 id="heading">Материалы</h1><div class="sub" id="subtitle">Что получено, где находится и что будет дальше</div></div><button class="refresh" onclick="reloadAll()">↻ Обновить</button></header>
 
 
@@ -143,7 +143,7 @@ body{font-size:14px;line-height:1.55}.app{grid-template-columns:244px minmax(0,1
 <div id="agent-state" class="agent-state" role="status">Проверяю состояние агента…</div>
 <div id="account-alert" role="status"></div>
 <div class="panel material-path">
-<div class="panel-head"><h2>Путь материалов</h2><label class="period-control">Получены за <select id="pipeline-period" onchange="pipelineOffset=0;loadPipeline()"><option value="24">24 часа</option><option value="48">48 часов</option><option value="168">7 дней</option><option value="all" selected>всё время</option></select></label></div>
+<div class="panel-head"><h2>Путь материалов</h2><label class="period-control">Получены за <select id="pipeline-period" onchange="pipelineOffset=0;loadPipeline()"><option value="24">24 часа</option><option value="48" selected>48 часов</option><option value="168">7 дней</option><option value="all">всё время</option></select></label></div>
 <div id="pipeline-funnel" class="path-strip" aria-label="Пройденные шаги"></div>
 <p id="pipeline-counter-start" class="path-caption"></p><div id="pipeline-stage-explanation" class="path-active-explanation" aria-live="polite" hidden></div><details class="path-help"><summary>Кто и что делает на каждом этапе · что означают числа</summary><ol id="pipeline-stage-guide" class="path-guide"></ol><p class="path-caption">Числа показывают сохранённые результаты по материалам выбранного периода, а не текущую очередь. Повторы не увеличивают счётчики. Нажмите на шаг, чтобы увидеть его материалы. У материалов, обработанных прежними версиями, часть отметок могла не сохраняться: поэтому «Прочитано» иногда больше, чем «Прошло фильтр».</p></details>
 </div>
@@ -214,7 +214,7 @@ async function loadPipeline(){
   const params=new URLSearchParams({period:document.getElementById('pipeline-period').value,stage:document.getElementById('pipeline-stage').value,bucket:pipelineBucket,milestone:pipelineMilestone,q:document.getElementById('pipeline-search').value,offset:String(pipelineOffset)}),d=await api('/api/pipeline?'+params);
   if(request!==pipelineRequest)return;
   document.getElementById('pipeline-counter-start').textContent=d.counter_started_at?'Новый отсчёт с '+date(d.counter_started_at)+'. Счётчики и нажатия на шаги показывают только новые материалы. Прежние доступны во вкладке «Все».':'';
-  const shortLabels={received:'Получено',first_filter:'Прошло фильтр',primary_read:'Прочитано',analyzed:'Факты и черновик',drafted:'Пост сохранён',checked:'Текст проверен',published:'Опубликовано'};
+  const shortLabels={received:'Получено',first_filter:'Первый фильтр',primary_read:'Прочитано',analyzed:'Факты и черновик',drafted:'Оформление поста',checked:'Проверка текста',published:'Отправка и квитанция'};
   document.getElementById('pipeline-funnel').innerHTML=d.funnel.map((s,n)=>`<button class="path-step" aria-pressed="${pipelineMilestone===s.key}" title="${esc((s.owner?s.owner+': ':'')+(s.action||s.description))}" onclick="chooseMilestone('${esc(s.key)}')"><span>${n+1}. ${esc(shortLabels[s.key]||s.label)}</span><strong>${s.count.toLocaleString('ru-RU')}</strong><small class="path-owner">${esc(s.owner||'')}</small></button>`).join('');
   document.getElementById('pipeline-stage-guide').innerHTML=d.funnel.map((s,n)=>`<li><div><b>${n+1}. ${esc(shortLabels[s.key]||s.label)}</b><small>${esc(s.owner||'')}</small></div><div><p>${esc(s.action||'')}</p><p class="counter-note"><b>Счётчик:</b> ${esc(s.description)}</p></div></li>`).join('');
   const explanation=document.getElementById('pipeline-stage-explanation'),selectedStep=d.funnel.find(s=>s.key===pipelineMilestone);
@@ -469,7 +469,7 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                     from .pipeline import pipeline_snapshot
                     db = self._read_db()
                     try:
-                        self._json(pipeline_snapshot(db, config, parse_qs(parsed.query), self._posts(all_rows=True)["items"]))
+                        self._json(pipeline_snapshot(db, config, parse_qs(parsed.query), self._pipeline_posts(db)))
                     finally:
                         db.close()
                 elif parsed.path == "/api/regulatory":
@@ -771,6 +771,39 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                                   "item_id":origin_item_id or (latest_item["item_id"] if latest_item else None)})
                 return {"items":items}
             finally: db.close()
+
+        def _pipeline_posts(self, db):
+            rows = db.execute(
+                "SELECT p.post_id,p.story_id,p.origin_item_id,p.text,p.status,p.created_at,p.published_at,"
+                "p.external_id,p.source_ids,p.fact_check_result,p.auto_attempts,p.auto_last_error,"
+                "(SELECT edited_text FROM telegram_post_edits e WHERE e.post_id=p.post_id "
+                "ORDER BY e.captured_at DESC,ABS(e.update_id) DESC LIMIT 1) AS edited_text "
+                "FROM posts p"
+            ).fetchall()
+            from .cli import _telegram_message_url
+            items = []
+            for row in rows:
+                try:
+                    facts = json.loads(row["fact_check_result"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    facts = {}
+                try:
+                    source_ids = json.loads(row["source_ids"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    source_ids = []
+                external_id = row["external_id"]
+                text = row["edited_text"] if row["edited_text"] else row["text"]
+                items.append({
+                    "post_id": row["post_id"], "story_id": row["story_id"],
+                    "origin_item_id": row["origin_item_id"], "status": row["status"],
+                    "created_at": row["created_at"], "published_at": row["published_at"],
+                    "external_id": external_id, "source_ids": source_ids,
+                    "text": text, "facts": facts, "auto_reason": None,
+                    "auto_attempts": row["auto_attempts"],
+                    "auto_last_error": row["auto_last_error"],
+                    "telegram_url": _telegram_message_url(config, str(external_id)) if external_id else None,
+                })
+            return items
 
         def _analysis_drafts(self):
             db=self._read_db()

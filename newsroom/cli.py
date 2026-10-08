@@ -1269,6 +1269,22 @@ def _start_digest_scheduler(config_path: str):
     return worker
 
 
+def _run_collection_cycle(config, db_path, *, persistent=False):
+    # Collection and the independent editor share a process. A transient
+    # SQLite write collision must not kill in-flight editorial/API work.
+    import sqlite3
+    try:
+        return run_one_cycle(config, db_path)
+    except sqlite3.OperationalError as exc:
+        code = getattr(exc, 'sqlite_errorcode', None)
+        busy = ((code is not None and (code & 255) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+                or str(exc) in {'database is locked', 'database table is locked'})
+        if not persistent or not busy:
+            raise
+        print('Сбор отложен: база временно занята; редактор продолжает работу.', flush=True)
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="newsroom", description="Локальный агент мониторинга новостей")
     parser.add_argument("--config", default="config.toml")
@@ -1370,7 +1386,7 @@ def main() -> None:
                 print("Сбор пропущен: другой цикл уже выполняется.", flush=True)
             else:
                 try:
-                    run_one_cycle(config, db_path)
+                    _run_collection_cycle(config, db_path, persistent=args.command == "run")
                 finally:
                     lock.close()
             if args.command == "once":

@@ -215,7 +215,13 @@ def _validate(memory, source, story_id, db, publisher_report):
             if not prior:
                 raise MemoryInvalid('INVALID_PREVIOUS_FACT')
             if any(norm(prior[k]) != norm(claim[k]) for k in ('subject','predicate','scope')):
-                raise MemoryInvalid('FACT_SCOPE_MISMATCH')
+                expected = {k: prior[k] for k in ('subject', 'predicate', 'scope')}
+                raise MemoryInvalid('FACT_SCOPE_MISMATCH: для previous_fact_id=' + str(prior_id)
+                                    + ' используйте точные поля идентичности '
+                                    + json.dumps(expected, ensure_ascii=False)
+                                    + '; только если это тот же факт, подтверждённый прочитанным материалом. '
+                                    'Для другого факта используйте relation=NEW без previous_fact_id; '
+                                    'не меняйте смысл или область действия ради совпадения.')
             same = norm(prior['value']) == norm(claim['value']) and prior['fact_type'] == claim['claim_type']
             if relation == 'REPEAT' and (not same or any((prior[k] or '') != claim.get(k,'') for k in ('valid_from','valid_to'))):
                 expected = {'value': prior['value'], 'claim_type': prior['fact_type'],
@@ -463,7 +469,7 @@ def _date(value):
 
 
 def grounded_span(proposed, source, *, min_length=24):
-    """Locate an actual source span; only extra terminal punctuation may be dropped.
+    """Locate an actual source span, ignoring quotation wrappers and terminal punctuation.
 
     Stored evidence always comes from source, never the model's edited quotation.
     Offsets retain original whitespace/case/quote glyphs; interior words and other punctuation must match.
@@ -479,7 +485,14 @@ def grounded_span(proposed, source, *, min_length=24):
                 normalized.append(part);positions.append(offset)
     haystack=''.join(normalized)
     needle=norm(proposed).translate(quote_shapes)
-    for candidate in dict.fromkeys((needle,needle.rstrip('.!?;:,…'))):
+    candidates = [needle, needle.rstrip('.!?;:,…')]
+    # Models wrap an extracted sentence in quotation marks even when those
+    # delimiters lie outside the actual source span. Interior text still matches
+    # exactly, including punctuation; always return the real source substring.
+    if len(needle) >= 2 and needle[0] == needle[-1] == '"':
+        unwrapped = needle[1:-1].strip()
+        candidates.extend((unwrapped, unwrapped.rstrip('.!?;:,…')))
+    for candidate in dict.fromkeys(candidates):
         if len(candidate)<min_length:continue
         index=haystack.find(candidate)
         if index>=0:

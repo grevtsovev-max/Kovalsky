@@ -75,6 +75,24 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual(grounded_span(proposed, source), source)
         self.assertIsNone(grounded_span(proposed.replace('ноябре', 'декабре'), source))
 
+    def test_quote_wrappers_do_not_hide_a_grounded_source_sentence(self):
+        from newsroom.knowledge import grounded_span
+        source = 'Банк сообщил: Доступ через «ВТБ Мои Инвестиции» рассчитываем открыть в ноябре, соответственно. Следующее предложение.'
+        proposed = '«Доступ через «ВТБ Мои Инвестиции» рассчитываем открыть в ноябре, соответственно.»'
+        self.assertEqual(grounded_span(proposed, source), source[len('Банк сообщил: '):source.index(' Следующее')])
+        self.assertIsNone(grounded_span(proposed.replace('ноябре', 'декабре'), source))
+
+    def test_scope_mismatch_returns_exact_identity_for_targeted_retry(self):
+        self.add(1)
+        with self.assertRaises(MemoryInvalid) as error:
+            self.add(2, memory(relation='REPEAT', previous_fact_id='1', scope='другая область'))
+        message = str(error.exception)
+        self.assertIn('FACT_SCOPE_MISMATCH', message)
+        self.assertIn('previous_fact_id=1', message)
+        self.assertIn('"scope": "криптосервис RU"', message)
+        self.assertIn('relation=NEW', message)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM story_facts').fetchone()[0], 1)
+
     def test_three_articles_share_event_and_multiple_evidence(self):
         first=self.add(1);self.post(first)
         for i in (2,3):
