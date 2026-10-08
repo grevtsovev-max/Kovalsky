@@ -52,7 +52,7 @@ class PipelineTests(EditionCase):
         self.assertTrue(writer.call_args.kwargs['feedback'])
 
     def test_failed_style_repair_is_saved_and_published_without_automatic_replay(self):
-        bad=draft(self.mid);bad['headline']='🏦 Коротко'
+        bad=draft(self.mid);bad['headline']='🏦 '+('А'*109)
         result,writer,checker=self.run_job(writer=[(bad,receipt())]*2,checker=[(review_result(),receipt())]*2)
         self.assertEqual(result['state'],'PUBLISHED');self.send.assert_called_once()
         self.assertEqual(writer.call_count,2);self.assertEqual(self.document()['repairs'],1)
@@ -61,7 +61,7 @@ class PipelineTests(EditionCase):
         self.assertEqual(len(details(self.db,result['job_id'])['checks']),3)
 
     def test_explicit_retry_preserves_old_attempt_and_starts_a_new_one(self):
-        bad=draft(self.mid);bad['headline']='🏦 Коротко'
+        bad=draft(self.mid);bad['headline']='🏦 '+('А'*109)
         result,_,_=self.run_job(writer=[(bad,receipt())]*2,checker=[(review_result(),receipt())]*2,publish=False)
         # A historical unfinished attempt remains available for an explicit retry.
         self.db.execute("UPDATE edition_jobs SET state='INCOMPLETE' WHERE job_id=?",(result['job_id'],))
@@ -140,7 +140,8 @@ class PipelineTests(EditionCase):
         self.assertNotIn('tools',payload);self.assertFalse(settings['web_search_enabled'])
         data=json.loads(payload['input']);self.assertEqual(len(data['references']['references']),14)
         self.assertEqual(data['references']['references'][0]['text'],'Solana запустила обновление сети')
-        self.assertEqual(data['rules']['limits']['headline_min'],80)
+        self.assertNotIn('headline_min',data['rules']['limits'])
+        self.assertNotIn('90–100',payload['instructions'])
 
     def test_checker_receives_final_bold_headline_and_linked_sources(self):
         response={'status':'completed','id':'response','output':[{'content':[{'type':'output_text','text':json.dumps({'approved':True,'issues':[],'assessments':{key:{'passed':True,'explanation':'Проверено на условном материале'} for key in model.REVIEW_RULES}})}]}]}

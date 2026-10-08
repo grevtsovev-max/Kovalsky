@@ -18,10 +18,10 @@ class FormattingTests(EditionCase):
         self.assertNotIn('**',markup);self.assertNotIn('https://',plain)
 
     def test_exact_headline_limits(self):
-        for length in (79,80,110,111):
+        for length in (3,29,70,79,80,110,111):
             with self.subTest(length=length):
                 self.draft['headline']='🏦 '+('А'*(length-2))
-                self.assertEqual('headline_length' in self.codes(),length not in (80,110))
+                self.assertEqual('headline_length' in self.codes(),length>110)
 
     def test_emoji_required_and_only_one(self):
         for prefix in ('','🏦 🚀 '):

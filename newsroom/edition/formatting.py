@@ -77,8 +77,8 @@ def validate(draft,materials,group=None):
     if not isinstance(draft,dict) or not all(isinstance(draft.get(k),str) for k in ('headline','lead')) or not isinstance(draft.get('blocks'),list):
         return [problem('structure','','Некорректная структура текста')]
     headline=draft['headline'];lead=draft['lead'];evidence={m['material_id']:m for m in materials}
-    if not limits['headline_min']<=len(headline)<=limits['headline_max']:
-        issues.append(problem('headline_length',headline,f"Заголовок: {len(headline)} символов; требуется 80–110"))
+    if len(headline)>limits['headline_max']:
+        issues.append(problem('headline_length',headline,f"Заголовок: {len(headline)} символов; максимум {limits['headline_max']}"))
     # Recognise one leading emoji cluster, including flags, variation selectors and ZWJ sequences.
     first=headline.split(' ',1)[0]
     emoji_parts=[c for c in first if ord(c) not in (0xfe0f,0x200d) and not 0x1f3fb<=ord(c)<=0x1f3ff]
