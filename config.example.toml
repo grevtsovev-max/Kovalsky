@@ -95,3 +95,8 @@ jina_cloud_proxy = false
 jina_cloud_hosts = []
 # По умолчанию: папка materials рядом с newsroom.database.
 # archive_directory = "data/materials"
+
+[editorial]
+# Автоматическая подготовка и публикация после двух проверок.
+# Не снимает постоянную остановку агента владельцем.
+enabled = true

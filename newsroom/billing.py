@@ -16,6 +16,7 @@ from .resources import snapshot, counter_start
 _LOCK = threading.Lock()
 COSTS_URL = 'https://api.openai.com/v1/organization/costs'
 TASKS = {
+    'edition_planner':'Группировка новостей', 'edition_writer':'Подготовка постов', 'edition_checker':'Проверка постов',
     'discovery_search': 'Поиск новостей и источников', 'recovery_search': 'Поиск новостей и источников',
     'research_agent': 'Поиск новостей и источников', 'triage': 'Прежний ИИ-отбор',
     'editorial': 'Разбор ИИ', 'correction': 'Исправление публикаций',

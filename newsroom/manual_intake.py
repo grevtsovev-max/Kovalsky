@@ -81,6 +81,6 @@ def _submit_locked(config: dict, url: str, retry_after_credits_restored: bool = 
         attach_cached(config)
         item_id = enqueue(db, None, {**article, 'url': article_url}, source, {'settings': config.get('ai', {})})
         return {'item_id': item_id, 'outcome': 'STORED' if item_id else 'DUPLICATE',
-                'posts': [], 'published': 0, 'message': 'Материал сохранён. Редактор удалён; новая версия ещё не реализована.'}
+                'posts': [], 'published': 0, 'message': 'Материал сохранён. Прошедшие первый фильтр материалы поступают в редакцию.'}
     finally:
         db.close()

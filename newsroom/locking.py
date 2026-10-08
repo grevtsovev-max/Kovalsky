@@ -10,7 +10,7 @@ def acquire_cycle_lock(database_path: str):
 
 
 def acquire_named_lock(database_path: str, name: str):
-    if name not in {"cycle", "processing"}:
+    if name not in {"cycle", "processing", "edition"}:
         raise ValueError("UNKNOWN_LOCK")
     db_path = Path(database_path).expanduser().resolve()
     lock_path = db_path.with_suffix(db_path.suffix + "." + name + ".lock")

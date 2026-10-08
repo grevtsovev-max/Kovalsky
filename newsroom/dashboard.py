@@ -17,12 +17,15 @@ from .db import connect, connect_readonly
 
 PAGE = r'''
 <!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kovalsky</title><style>body{margin:32px auto;padding:20px;max-width:1100px;font:16px/1.5 system-ui;color:#172236;background:#f4f6fa}button{font:inherit;padding:9px 14px;cursor:pointer;margin:4px;border:1px solid #ddd;border-radius:8px;background:white}.row-card{padding:18px;margin:12px 0;background:white;border-radius:12px;overflow-wrap:anywhere}a{color:#365cf5}
-</style><body><main style="max-width:1100px;margin:30px auto;padding:20px"><h1>Kovalsky</h1><p>Редактор удалён. Сбор и хранение материалов продолжаются. Новая редактура будет реализована с нуля.</p><div id="summary"></div><p><button class="btn" onclick="collect()">Собрать материалы</button> <button class="btn" onclick="show('news')">Материалы</button> <button class="btn" onclick="show('sources')">Источники</button> <button class="btn" onclick="show('posts')">Опубликованное</button> <button class="btn" onclick="show('resources')">Расход ресурсов</button></p><div id="notice"></div><div id="registry"></div><div id="content"></div></main><script>
+</style><body><main style="max-width:1100px;margin:30px auto;padding:20px"><h1>Kovalsky</h1><p>Новая редакция: подготовка, проверка и автоматическая публикация. Цель — до 10 минут от получения материала до канала.</p><div id="summary"></div><p><button class="btn" onclick="collect()">Собрать материалы</button> <button class="btn" onclick="show('news')">Материалы</button> <button class="btn" onclick="show('sources')">Источники</button> <button class="btn" onclick="show('posts')">Опубликованное</button> <button class="btn" onclick="show('resources')">Расход ресурсов</button></p><p><button class="btn" onclick="showEdition()">Редакция</button></p><div id="notice"></div><div id="registry"></div><div id="content"></div></main><script>
 const token='__TOKEN__';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const safe=u=>{try{const x=new URL(u);return ['https:','http:'].includes(x.protocol)?x.href:'#'}catch{return '#'}};
 async function api(p,opts={}){let r=await fetch('/api/'+p,{...opts,headers:{'Content-Type':'application/json','X-Dashboard-Token':token}});let d=await r.json();if(!r.ok)throw Error(d.error||'Не удалось выполнить запрос');return d}
 async function show(kind){try{let d=await api(kind);let rows=Array.isArray(d)?d:d.items||d.sources||[];document.getElementById('content').innerHTML=kind==='resources'?'<article class="row-card"><h3>Расходы за последние сутки</h3><p>Обращений к ИИ: '+esc(d.total.calls)+'</p><p>Задач: '+esc(d.total.operations)+'</p><p>Оценка расходов: '+(d.total.estimated_usd==null?'нет полной оценки':'$'+Number(d.total.estimated_usd).toFixed(4))+'</p></article>':rows.map(x=>'<article class="row-card"><h3>'+esc(x.title||x.headline||x.name||'')+'</h3><p>'+esc(x.source_name||x.type||x.status||x.disposition||'')+'</p>'+(x.url||x.telegram_url?'<a href="'+esc(safe(x.url||x.telegram_url))+'" target="_blank" rel="noopener">Открыть ↗</a>':'')+(kind==='posts'?'<p style="white-space:pre-wrap">'+esc(x.text)+'</p>':'')+'</article>').join('')||'<p>Пока нет материалов.</p>'}catch(e){document.getElementById('notice').textContent=e.message}}
+async function retryEdition(id){try{await api('edition/retry',{method:'POST',body:JSON.stringify({job_id:id})});await showEdition()}catch(e){document.getElementById('notice').textContent=e.message}}
+async function editionDetails(id){try{let d=await api('edition/job?job_id='+encodeURIComponent(id));document.getElementById('content').innerHTML='<button onclick="showEdition()">Назад</button><h2>Исходные материалы</h2>'+d.materials.map(m=>'<article class="row-card"><h3>'+esc(m.title)+'</h3><a href="'+esc(safe(m.url))+'" target="_blank" rel="noopener">'+esc(m.source_name)+'</a><p style="white-space:pre-wrap">'+esc(m.content||m.description)+'</p></article>').join('')+'<h2>Версии и проверки</h2>'+d.events.filter(e=>['draft','repair','check','published','INCOMPLETE'].includes(e.stage)).map(e=>'<article class="row-card"><h3>'+esc(({draft:'Первая версия',repair:'Доработка',check:'Проверка',published:'Отправлено',INCOMPLETE:'Не завершено'})[e.stage])+'</h3><p style="white-space:pre-wrap">'+esc(e.payload.draft?[e.payload.draft.headline,e.payload.draft.lead,...e.payload.draft.blocks.map(b=>b.text)].join('\n\n'):(e.payload.issues||e.payload.reasons||[]).map(x=>x.reason).join('\n'))+'</p></article>').join('')}catch(e){document.getElementById('notice').textContent=e.message}}
+async function showEdition(){try{let d=await api('edition');document.getElementById('content').innerHTML='<h2>Редакция</h2><p>'+(d.enabled?'Включена':'Отключена')+' · Сохранено референсов: '+esc(d.references)+'</p>'+d.jobs.map(j=>'<article class="row-card"><h3>'+esc(j.documents.map(x=>x.subject).join('; ')||'Подготовка материалов')+'</h3><p>'+esc(j.state_label)+(j.delayed?' · Задержка более 10 минут':'')+'</p>'+j.documents.map(x=>'<p>'+esc(x.state_label)+'</p><p style="white-space:pre-wrap">'+esc(x.text||x.draft.lead||'')+'</p>'+x.reasons.map(r=>'<p>'+esc(r.reason)+'</p>').join('')).join('')+j.reasons.map(r=>'<p>'+esc(r.reason)+'</p>').join('')+'<button onclick="editionDetails(\''+j.job_id+'\')">Исходники и проверки</button>'+(j.retryable?' <button onclick="retryEdition(\''+j.job_id+'\')">Повторить подготовку</button>':'')+'</article>').join('')+(d.jobs.length?'':'<p>Пока нет подготовок.</p>')}catch(e){document.getElementById('notice').textContent=e.message}}
 async function collect(){try{await api('collect',{method:'POST',body:'{}'});document.getElementById('notice').textContent='Сбор запущен'}catch(e){document.getElementById('notice').textContent=e.message}}
 async function load(){let d=await api('summary');document.getElementById('summary').textContent='Материалов: '+d.materials+' · Источников: '+d.source_total+' · Опубликовано ранее: '+d.published_total;try{let r=await api('topic-registry');if(r.url)document.getElementById('registry').innerHTML='<a href="'+esc(safe(r.url))+'" target="_blank" rel="noopener">Открыть темник ↗</a>'}catch{}show('news')}load();
 </script></body></html>
@@ -134,6 +137,18 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                         self._json(report(db, config))
                     finally:
                         db.close()
+                elif parsed.path in ('/api/edition','/api/edition/job','/api/edition/rules'):
+                    from .edition.views import overview,details
+                    from .edition.model import bundle
+                    db=self._read_db()
+                    try:
+                        if parsed.path.endswith('/job'):
+                            self._json(details(db,parse_qs(parsed.query).get('job_id',[''])[0]))
+                        elif parsed.path.endswith('/rules'):
+                            policy,refs,digest=bundle();self._json({'policy':policy,'references':refs,'bundle_hash':digest})
+                        else:self._json(overview(db,config))
+                    except ValueError as exc:self._json({'error':str(exc)},400)
+                    finally:db.close()
                 elif parsed.path == "/api/summary":
                     self._json(self._summary())
                 elif parsed.path == "/api/diagnostics":
@@ -216,7 +231,7 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
         def _summary(self):
             db=self._read_db()
             try:
-                return {'editorial':'removed','auto_publish_enabled':False,'agent_enabled':agent_enabled(config),
+                return {'editorial':'v2','auto_publish_enabled':config.get('editorial',{}).get('enabled') is True,'agent_enabled':agent_enabled(config),
                         'materials':db.execute('SELECT COUNT(*) FROM items').fetchone()[0],
                         'published_total':db.execute("SELECT COUNT(*) FROM posts WHERE status='PUBLISHED'").fetchone()[0],
                         'source_total':db.execute('SELECT COUNT(*) FROM sources WHERE active=1').fetchone()[0]}
@@ -233,7 +248,7 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
             db=self._read_db()
             try:
                 from .cli import _telegram_message_url
-                rows=db.execute("SELECT post_id,text,status,external_id,published_at FROM posts WHERE status='PUBLISHED' ORDER BY published_at DESC LIMIT 200").fetchall()
+                rows=db.execute("SELECT post_id,COALESCE((SELECT plain_text FROM edition_documents d WHERE d.post_id=posts.post_id),text) AS text,status,external_id,published_at FROM posts WHERE status='PUBLISHED' ORDER BY published_at DESC LIMIT 200").fetchall()
                 return [{**dict(r),'headline':r['text'].splitlines()[0] if r['text'] else '',
                          'telegram_url':_telegram_message_url(config,r['external_id']) if r['external_id'] else None} for r in rows]
             finally: db.close()
@@ -284,6 +299,18 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                 from .agent_control import enabled
                 if parts in (["api", "collect"], ["api", "intake-url"], ["api", "post-corrections"]) and not enabled(config):
                     self._json({"error": "Агент отключён владельцем"}, 409)
+                    return
+                if parts==['api','edition','retry']:
+                    from .edition.views import retry
+                    from .cli import load_config
+                    payload=json.loads(self.rfile.read(size).decode('utf-8'))
+                    current=load_config(str(config_file))
+                    if current['newsroom']['database']!=db_path:
+                        self._json({'error':'Настройки изменились; перезапустите кабинет'},409);return
+                    db=self._db()
+                    try:self._json(retry(db,current,str(payload.get('job_id') or '')),202)
+                    except ValueError as exc:self._json({'error':str(exc)},409)
+                    finally:db.close()
                     return
                 if parts in (["api", "billing", "report"], ["api", "billing", "sync"]):
                     from .billing import save_owner_report, sync

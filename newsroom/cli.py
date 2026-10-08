@@ -309,6 +309,10 @@ def main():
         print(json.dumps(publish_from_codex(config,args.request_key,sys.stdin.read()),ensure_ascii=False))
     elif args.command in {'once','run'}:
         from .locking import acquire_cycle_lock
+        if args.command=='run':
+            from .edition.worker import run as run_editor
+            editor_stop=threading.Event()
+            threading.Thread(target=run_editor,args=(args.config,editor_stop),daemon=True,name='newsroom-edition').start()
         while True:
             started = time.monotonic()
             config = load_config(args.config)
@@ -328,10 +332,11 @@ def main():
                 export(db,sys.stdout)
             elif args.command == 'init': print('База готова')
             elif args.command == 'health':
-                print(json.dumps({'editorial':'removed','materials':db.execute('SELECT COUNT(*) FROM items').fetchone()[0],
+                print(json.dumps({'editorial':'enabled' if config.get('editorial',{}).get('enabled') is True else 'disabled','materials':db.execute('SELECT COUNT(*) FROM items').fetchone()[0],
                                   'sources':db.execute('SELECT COUNT(*) FROM sources WHERE active=1').fetchone()[0]},ensure_ascii=False))
             else:
-                print('Редактор удалён. Сохранённые материалы ожидают новой реализации.')
+                from .edition.views import overview
+                print(json.dumps(overview(db,config),ensure_ascii=False))
         finally: db.close()
 
 

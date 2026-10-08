@@ -78,6 +78,8 @@ def enqueue(db, item_id, item, source, options, *, category="fresh"):
         from .keyword_filter import screen
         screen(db, item_id, item, settings)
     db.commit()
+    from .edition.store import ingest
+    ingest(db,item_id,settings)
     return item_id
 
 

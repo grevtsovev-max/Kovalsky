@@ -294,6 +294,7 @@ def attach(config):
     from .topic_registry import attach_cached
     attach_cached(config)
     settings = config.setdefault("ai", {})
+    settings["_edition_enabled"] = config.get("editorial", {}).get("enabled") is True
     settings["_agent_control_config"] = {"newsroom": dict(config.get("newsroom", {}))}
     settings['web_search_enabled'] = config.get('web_search', {}).get('enabled', False) is True
     path = config.get("newsroom", {}).get("database")

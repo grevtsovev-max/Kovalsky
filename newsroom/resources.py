@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 STAGES = {
+    'edition_planner':'Группировка новостей', 'edition_writer':'Подготовка поста', 'edition_checker':'Проверка поста',
     'discovery_search': 'Поиск новых новостей', 'source_rss': 'Сбор RSS',
     'source_web': 'Сбор сайтов', 'source_telegram': 'Сбор Telegram',
     'source_google_news': 'Сбор Google News', 'source_x': 'Сбор X',

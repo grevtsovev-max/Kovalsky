@@ -219,6 +219,9 @@ def deliver(db, config, operation, text, send, post_id=None, verified_text=None)
             db.commit()
             raise DeliveryRejected('Final publication changed before reservation')
         facts = json.loads(current_post['fact_check_result'] or '{}')
+        if facts.get('edition_v2'):
+            from .edition.publication import gate
+            gate(db,facts['edition_v2'],text,post_id)
         if facts.get('material_revision') and current_post['origin_item_id']:
             material = db.execute('SELECT ingest_revision FROM items WHERE item_id=?', (current_post['origin_item_id'],)).fetchone()
             if not material or material[0] != facts['material_revision']:

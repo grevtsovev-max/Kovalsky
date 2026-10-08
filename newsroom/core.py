@@ -1562,7 +1562,7 @@ def _archive_item_revision(db, item_id: int, prior_row) -> None:
 
 def _save_item(db, source, item, existing_item_id=None):
     """Persist discovery before any costly work; keep feed and read text distinct."""
-    now = NOW()
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     from .runtime import cache_key
     ingest_revision = cache_key('material-version', {key: item.get(key) for key in (
         'url', 'title', 'description', 'content', 'author', 'published_at')})
