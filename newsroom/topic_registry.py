@@ -31,6 +31,8 @@ PUBLIC_ACTIVITY = 'Публичные активности брендов и л�
 FILTER_RULES = 'Правила первого фильтра'
 FILTER_HEADERS = ['Правило', 'Обязательные условия', 'Необязательные условия', 'Мониторинг', 'Объяснение']
 FLAT_KEYWORD_HEADERS = ['Ключевик', 'Мониторинг', 'Роль', 'Уточнение']
+NEGATIVE_KEYWORDS = 'Минус-слова'
+NEGATIVE_HEADERS = ['Минус-слово', 'Мониторинг', 'Где искать', 'Тип', 'Варианты', 'Комментарий']
 KEYWORD_ROLES = {'Профильный', 'Требует уточнения', 'Контекстный'}
 HEADERS = {
     'Темы': ['Тема', 'Что отслеживать', 'Мониторинг'],
@@ -159,6 +161,34 @@ def keyword_enabled(entry, names):
     return entry['enabled'] and (entry.get('flat') or entry['title'] in names)
 
 
+def parse_negative_keywords(body):
+    rows = list(csv.reader(io.StringIO(body.decode('utf-8-sig'))))
+    if not rows or rows[0] != NEGATIVE_HEADERS or len(rows) > 10001:
+        raise ValueError('NEGATIVE_KEYWORD_HEADERS_OR_SIZE')
+    result = []
+    for number, raw in enumerate(rows[1:], 2):
+        if raw == NEGATIVE_HEADERS:
+            continue
+        word, flag, scope, kind, aliases, note = [str(v).strip() for v in (raw + [''] * 6)[:6]]
+        if not word:
+            if scope or kind or aliases or note:
+                raise ValueError('NEGATIVE_KEYWORD_EMPTY')
+            continue
+        scope, kind = scope or 'Заголовок', kind or 'Слово или фраза'
+        flag = normalize(flag)
+        if (flag not in {'true','false','истина','ложь','да','нет','1','0',''}
+                or scope not in {'Заголовок','Весь текст'} or kind not in {'Название','Слово или фраза'}
+                or len(word) > 250 or len(aliases) > 2000 or len(note) > 2000):
+            raise ValueError('NEGATIVE_KEYWORD_INVALID')
+        result.append({'word':word, 'enabled':flag in {'true','истина','да','1'},
+                       'scope':scope, 'kind':kind, 'aliases':[s.strip() for s in aliases.split('|') if s.strip()],
+                       'note':note, 'row':number})
+    keys = [(normalize(r['word']), r['scope'], r['kind']) for r in result]
+    if len(set(keys)) != len(keys):
+        raise ValueError('NEGATIVE_KEYWORD_DUPLICATE')
+    return result
+
+
 def parse_filter_rules(body):
     rows = list(csv.reader(io.StringIO(body.decode('utf-8-sig'))))
     if not rows or rows[0] != FILTER_HEADERS or len(rows) > 101:
@@ -200,6 +230,13 @@ def read_registry(settings):
         sections[FILTER_RULES] = parse_filter_rules(body)
         if any('role' not in r for r in sections['Ключевые слова']):
             raise ValueError('INTAKE_KEYWORD_ROLES_MISSING')
+    if settings.get('negative_keywords_gid'):
+        gid = str(settings['negative_keywords_gid'])
+        if not re.fullmatch(r'\d{1,12}', gid):
+            raise ValueError('NEGATIVE_KEYWORD_GID')
+        url = f"https://docs.google.com/spreadsheets/d/{settings['spreadsheet_id']}/export?format=csv&gid={gid}"
+        body, _, _ = _request_with_url(url, timeout=8, public_only=True)
+        sections[NEGATIVE_KEYWORDS] = parse_negative_keywords(body)
     titles = {r['title'] for r in sections['Темы']}
     if any(not r.get('flat') and r['title'] not in titles for r in sections['Ключевые слова']):
         raise ValueError('TOPIC_REGISTRY_UNKNOWN_TOPIC')
@@ -258,6 +295,9 @@ def apply_snapshot(config, snapshot, entities=()):
             'brands':thematic['organizations'], 'people':thematic['people'],
             'rules':thematic['intake_rules'],
         }
+    if NEGATIVE_KEYWORDS in snapshot.get('sections', {}):
+        config['ai']['_keyword_prefilter']['negative_keywords'] = [
+            r for r in snapshot['sections'][NEGATIVE_KEYWORDS] if r['enabled']]
     config.setdefault('newsroom', {})['relevance_terms'] = []
     for source in config.get('sources', []):
         source.pop('interest_exclusions', None)
@@ -315,10 +355,12 @@ def configure(db, payload):
         raise ValueError('Нужны вкладки Темы, Ключевые слова, Исключения и География')
     previous = state(db, SETTINGS, {})
     if previous.get('spreadsheet_id') == settings['spreadsheet_id']:
-        for key in ('credentials_file', 'service_account_email', 'write_verified_at', 'apps_script_file', 'filter_rules_gid'):
+        for key in ('credentials_file', 'service_account_email', 'write_verified_at', 'apps_script_file', 'filter_rules_gid', 'negative_keywords_gid'):
             if key in previous: settings[key] = previous[key]
     if payload.get('filter_rules_gid') is not None:
         settings['filter_rules_gid'] = str(payload['filter_rules_gid'])
+    if payload.get('negative_keywords_gid') is not None:
+        settings['negative_keywords_gid'] = str(payload['negative_keywords_gid'])
     snapshot = read_registry(settings)
     save(db, SETTINGS, settings); save(db, SNAPSHOT, snapshot)
     save(db, ATTEMPT, snapshot['checked_at']); save(db, ERROR, None)

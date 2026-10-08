@@ -55,15 +55,39 @@ def match(text, keywords):
 
 def evaluate(text, spec, title=''):
     if spec.get('mode') == 'intake_rules':
-        return evaluate_rules(text, title, spec)
+        return apply_negatives(evaluate_rules(text, title, spec), text, title, spec)
     keyword = match(text, spec.get('keywords') or [])
     brand = match(text, spec.get('brands') or [])
     person = match(text, spec.get('people') or [])
     topic_keyword = match(text, spec.get('topic_keywords') or []) if brand else None
     brand_only = bool(brand and not person and not topic_keyword)
-    return {'matched_keyword': keyword, 'matched_brand': brand,
+    return apply_negatives({'matched_keyword': keyword, 'matched_brand': brand,
             'matched_topic_keyword': topic_keyword, 'brand_only': brand_only,
-            'passed': bool(keyword) and not brand_only}
+            'passed': bool(keyword) and not brand_only}, text, title, spec)
+
+
+def apply_negatives(result, text, title, spec):
+    if result.get('configuration_error') or not spec.get('keywords') and spec.get('mode') != 'intake_rules':
+        return result
+    for entry in spec.get('negative_keywords') or []:
+        if not entry.get('enabled'):
+            continue
+        scope = entry['scope']
+        target = title if scope == 'Заголовок' else text
+        target = html.unescape(re.sub(r'<[^>]*>', ' ', target))
+        variants = [entry['word'], *entry.get('aliases', [])]
+        if entry['kind'] == 'Название':
+            found = next((v for v in variants if re.search(
+                r'(?<!\w)' + r'\s+'.join(re.escape(t) for t in normalize(v).split()) + r'(?!\w)', normalize(target))), None)
+        else:
+            found = match(target, variants)
+        if found:
+            result.update(passed=False, matched_negative_keyword=entry['word'],
+                          matched_negative_variant=found, negative_scope=scope,
+                          negative_row=entry.get('row'), negative_kind=entry['kind'],
+                          reason=f"Первый фильтр не пройден: минус-слово «{entry['word']}», найдено «{found}»; область: {scope.lower()}.")
+            break
+    return result
 
 
 def evaluate_rules(text, title, spec):
