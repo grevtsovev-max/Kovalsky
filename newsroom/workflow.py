@@ -65,6 +65,8 @@ def enqueue(db, item_id, item, source, options, *, category="fresh"):
     if item_id is None:
         item_id = _save_item(db, source, item)
         if item_id is None:
+            # Failed duplicate INSERTs still acquire the SQLite write lock.
+            db.commit()
             return None
     revision = cache_key("material-version", {key: item.get(key) for key in (
         "url", "title", "description", "content", "author", "published_at")})
