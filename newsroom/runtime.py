@@ -63,9 +63,11 @@ def stamp():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
+
 def account_unavailable(code):
     return code in {'CREDENTIALS_MISSING', 'HTTP_429:credit_balance_exhausted', 'HTTP_429:insufficient_quota',
                     'HTTP_429:billing_hard_limit_reached', 'HTTP_401:invalid_api_key'}
+
 
 
 class BudgetDeferred(RuntimeError):
@@ -84,6 +86,7 @@ class BudgetDeferred(RuntimeError):
     def user_reason(self):
         return ('недоступен счёт ИИ; требуется проверить баланс и доступ'
                 if self.reason == 'account' else 'нет свободного места или общего лимита запросов')
+
 
 
 class Runtime:
@@ -274,12 +277,6 @@ class Runtime:
             if not row:
                 return None
             result = json.loads(row[0])
-            if stage == 'collector':
-                from .workflow import readable_result
-                if not readable_result(result):
-                    return None
-            if stage == 'editor' and isinstance(result, dict) and result.get('publication_recommendation') == 'WAIT_FOR_AUTOMATION':
-                return None
             db.execute("INSERT INTO cache_events(stage,item_id,created_at) VALUES(?,?,?)", (stage, SCOPE.get().get("item_id"), stamp()))
         return result
 
@@ -305,9 +302,11 @@ def attach(config):
     return settings.get("_runtime")
 
 
+
 def cache_key(stage, value):
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256((stage + ":" + encoded).encode()).hexdigest()
+
 
 
 def snapshot(db, now=None):
@@ -339,6 +338,7 @@ def snapshot(db, now=None):
     return result
 
 
+
 def health_lines(db, now=None):
     usage = snapshot(db, now)
     from .workflow import snapshot as queue_snapshot
@@ -362,3 +362,4 @@ def health_lines(db, now=None):
                      f"входных токенов {role['input_tokens'] if role['input_tokens'] is not None else 'неизвестно'} · "
                      f"выходных токенов {role['output_tokens'] if role['output_tokens'] is not None else 'неизвестно'}.")
     return lines
+

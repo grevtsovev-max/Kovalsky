@@ -1,6 +1,6 @@
 // Вставьте в Apps Script таблицы тем; добавьте сервис Google Sheets.
 const KOVALSKY_TABS = ['Темы', 'Ключевые слова', 'Исключения', 'География'];
-const KOVALSKY_COLUMNS = {'Темы':3,'Ключевые слова':3,'Исключения':3,'География':3,'Редакторские правила':4,'Примеры редактуры':4,'История обучения':5};
+const KOVALSKY_COLUMNS = {'Темы':3,'Ключевые слова':3,'Исключения':3,'География':3};
 
 function setupKovalsky() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet();
@@ -83,7 +83,7 @@ function validateKovalskyOperation(operation, sheets, flatKeywords) {
   const flat = keyword && flatKeywords;
   const width = flat ? 4 : KOVALSKY_COLUMNS[sheet.properties.title];
   const flagColumn = flat ? 1 : width - 1;
-  const history = sheet.properties.title === 'История обучения';
+  const history = false;
   if (name === 'insertDimension') {
     if (Object.keys(value).some(k => ['range','inheritFromBefore'].indexOf(k) < 0) || Object.keys(r).some(k => ['sheetId','dimension','startIndex','endIndex'].indexOf(k) < 0) || r.dimension !== 'ROWS' || !Number.isInteger(r.startIndex) || r.startIndex < 1 || r.startIndex > 10000 || r.endIndex !== r.startIndex + 1 || value.inheritFromBefore !== true) throw new Error('OPERATION_INVALID');
     return;

@@ -1,43 +1,91 @@
 from __future__ import annotations
 
+
 import hashlib
+
+
 import gzip
+
+
 import io
+
+
 import html
+
+
 import http.client
+
+
 import json
+
+
 import ipaddress
+
+
 import re
+
+
 import socket
+
+
 import urllib.parse
+
+
 import urllib.request
+
+
 import urllib.error
+
+
 import ssl
+
+
 import os
+
+
 import subprocess
+
+
 import tempfile
+
+
 import time
+
+
 import xml.etree.ElementTree as ET
+
+
 from html.parser import HTMLParser
+
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
 from datetime import datetime, timezone, timedelta
+
+
 from email.utils import parsedate_to_datetime
+
+
 from pathlib import Path
 
-from .db import connect
-from .triage import MAX_AUTOMATIC_RETRIES, screen as screen_item, schedule_retry
-from .quality import editorial_issues, attributed_report_supported
-from .ai import request_response, AIResponseError, FILTER_VERSION, analyze as analyze_with_ai, get_api_key, web_search_enabled
 
-NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
+from .db import connect
+
+
+from .ai import request_response, AIResponseError, get_api_key, web_search_enabled
+
 
 _RUNTIME_LOG_PATH: Path | None = None
+
+NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def configure_runtime_log(path: str | Path) -> None:
     """Write structured timing events to the same local log read by `health`."""
     global _RUNTIME_LOG_PATH
     _RUNTIME_LOG_PATH = Path(path)
+
 
 
 def _log_timing(event: str, **fields) -> None:
@@ -53,71 +101,6 @@ def _log_timing(event: str, **fields) -> None:
             pass
 
 
-def _development_date_issue(result: dict, source: dict | None, freshness_hours: int, publication_date: str | None = None) -> tuple[str, str] | None:
-    """Check established event dates without requiring an exact date for every event before treating a fresh article as fresh news."""
-    if result.get("publication_recommendation") != "AUTO_PUBLISH":
-        return None
-    raw_date = str(result.get("development_date") or "").strip()
-    evidence = str(result.get("development_date_evidence") or "").strip()
-    content = str((source or {}).get("content") or "")
-    if not raw_date:
-        return None  # Unknown event day is not evidence that the report is stale.
-    if not evidence or not content:
-        return ("unverified", "Указанная дата события не подтверждена прочитанным материалом.")
-    try:
-        event_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
-    except ValueError:
-        return ("unverified", "Дата события указана не в формате YYYY-MM-DD.")
-    normalize = lambda value: re.sub(r"\s+", " ", value).strip().casefold().replace("ё", "е")
-    if normalize(evidence) not in normalize(content):
-        return ("unverified", "Цитата для даты события отсутствует в прочитанном первичном источнике.")
-    date_tokens = {
-        event_date.isoformat(),
-        f"{event_date.day}.{event_date.month}.{event_date.year}",
-        event_date.strftime("%d.%m.%Y"),
-        f"{event_date.day}/{event_date.month}/{event_date.year}",
-        event_date.strftime("%d/%m/%Y"),
-        event_date.strftime("%B %d, %Y"),
-        event_date.strftime("%B %d %Y"),
-        event_date.strftime("%b %d, %Y"),
-        event_date.strftime("%b %d %Y"),
-    }
-    russian_months = (
-        ("января", "янв."), ("февраля", "фев."), ("марта", "мар."),
-        ("апреля", "апр."), ("мая",), ("июня", "июн."),
-        ("июля", "июл."), ("августа", "авг."), ("сентября", "сен."),
-        ("октября", "окт."), ("ноября", "нояб."), ("декабря", "дек."),
-    )[event_date.month - 1]
-    date_tokens.update(f"{event_date.day} {month} {event_date.year}" for month in russian_months)
-    evidence_norm = normalize(evidence)
-    confirmed = any(normalize(token) in evidence_norm for token in date_tokens)
-    try:
-        anchor = datetime.fromisoformat(str(publication_date or (source or {}).get('published_at') or '').replace('Z', '+00:00')).date()
-    except ValueError:
-        anchor = None
-    if anchor:
-        # Resolve incomplete and relative dates against the source publication,
-        # never against discovery time or the time of this retry.
-        inferred_year = anchor.year - int(event_date.month == 12 and anchor.month == 1)
-        short_dates = {f'{event_date.day} {month}' for month in russian_months}
-        short_dates.add(event_date.strftime('%d.%m'))
-        if (not re.search(r'\b(?:19|20)\d{2}\b', evidence_norm) and event_date.year == inferred_year) and any(
-                re.search(r'(?<!\w)' + re.escape(normalize(token))
-                          + (r'(?![\w.])' if token == event_date.strftime('%d.%m') else r'(?!\w)'),
-                          evidence_norm)
-                for token in short_dates):
-            confirmed = True
-        if re.search(r'\bсегодня\b', evidence_norm) and event_date == anchor:
-            confirmed = True
-        if re.search(r'\bвчера\b', evidence_norm) and event_date == anchor - timedelta(days=1):
-            confirmed = True
-    if not confirmed:
-        return ("unverified", "Цитата источника не подтверждает указанную календарную дату события.")
-    today = datetime.now(timezone.utc).date()
-    if event_date > today:
-        return ("unverified", "Дата события находится в будущем.")
-    return None
-
 
 def _trusted_tls_context():
     try:
@@ -130,6 +113,7 @@ def _trusted_tls_context():
     return ssl.create_default_context(cafile=certifi.where())
 
 
+
 TLS_CONTEXT = _trusted_tls_context()
 
 
@@ -137,11 +121,13 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+
 def canonicalize(url: str) -> str:
     parsed = urllib.parse.urlsplit(url.strip())
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query = [(k, v) for k, v in query if not k.lower().startswith("utm_") and k.lower() not in {"ref", "fbclid", "gclid"}]
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), urllib.parse.urlencode(query), ""))
+
 
 
 def parse_date(value: str | None) -> str | None:
@@ -167,6 +153,7 @@ def parse_date(value: str | None) -> str | None:
             return None
 
 
+
 def _public_host_addresses(host: str, port: int = 443) -> list[str]:
     host = host.rstrip(".").encode("idna").decode("ascii")
     try:
@@ -183,12 +170,14 @@ def _public_host_addresses(host: str, port: int = 443) -> list[str]:
     return sorted(addresses)
 
 
+
 def _validate_public_http_url(url: str) -> None:
     parsed = urllib.parse.urlsplit(url)
     if (parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password
             or parsed.port not in (None, 443)):
         raise ValueError("URL_NOT_ALLOWED")
     _public_host_addresses(parsed.hostname)
+
 
 
 class _PublicHttpsConnection(http.client.HTTPSConnection):
@@ -221,6 +210,7 @@ class _PublicHttpsConnection(http.client.HTTPSConnection):
             return
 
 
+
 class _PublicHttpsHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
         kwargs = {'context': self._context}
@@ -230,6 +220,7 @@ class _PublicHttpsHandler(urllib.request.HTTPSHandler):
         return self.do_open(_PublicHttpsConnection, req, **kwargs)
 
 
+
 class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urllib.parse.urljoin(req.full_url, newurl)
@@ -237,6 +228,7 @@ class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
         if urllib.parse.urlsplit(req.full_url).scheme.lower() == "https" and urllib.parse.urlsplit(target).scheme.lower() != "https":
             raise ValueError("HTTPS_REDIRECT_DOWNGRADE")
         return super().redirect_request(req, fp, code, msg, headers, target)
+
 
 
 def _request_with_url(url: str, timeout: int = 20, public_only: bool = False) -> tuple[bytes, str, str]:
@@ -291,8 +283,10 @@ def _request_with_url(url: str, timeout: int = 20, public_only: bool = False) ->
     raise RuntimeError("NETWORK_RETRY_EXHAUSTED")
 
 
+
 def _request(url: str) -> bytes:
     return _request_with_url(url)[0]
+
 
 
 def _safe_source_error(exc: Exception) -> str:
@@ -324,11 +318,13 @@ def _safe_source_error(exc: Exception) -> str:
     return type(exc).__name__.upper()
 
 
+
 class PDFText(str):
     def __new__(cls, value: str, ocr_used: bool = False):
         instance = super().__new__(cls, value)
         instance.ocr_used = ocr_used
         return instance
+
 
 
 def _extract_pdf_text(payload: bytes, timeout: int = 15) -> str:
@@ -371,6 +367,7 @@ def _extract_pdf_text(payload: bytes, timeout: int = 15) -> str:
     return PDFText(text, ocr_used=ocr_used)
 
 
+
 class GoogleArticleParamsParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -380,6 +377,7 @@ class GoogleArticleParamsParser(HTMLParser):
         values = dict(attrs)
         if tag == "div" and all(key in values for key in ("data-n-a-id", "data-n-a-sg", "data-n-a-ts")):
             self.params = values
+
 
 
 def decode_google_news_url(url: str) -> str:
@@ -428,6 +426,7 @@ def decode_google_news_url(url: str) -> str:
     if target.scheme not in {"http", "https"} or not target.hostname or target.hostname.endswith("google.com"):
         raise ValueError("Google News returned no publisher article URL")
     return decoded
+
 
 
 class PublisherArticleParser(HTMLParser):
@@ -582,13 +581,18 @@ class PublisherArticleParser(HTMLParser):
             self.anchor["text"].append(data)
 
 
+
 OFFICIAL_SOURCE_DOMAINS = {
     "cbr.ru", "kremlin.ru", "government.ru", "publication.pravo.gov.ru", "pravo.gov.ru",
     "duma.gov.ru", "minfin.gov.ru", "nalog.gov.ru", "fas.gov.ru", "rosfinmonitoring.gov.ru",
     "sec.gov", "cftc.gov", "federalreserve.gov", "ecb.europa.eu", "ec.europa.eu",
     "eur-lex.europa.eu", "esma.europa.eu", "eba.europa.eu", "fca.org.uk",
 }
+
+
 OFFICIAL_SOURCE_SUFFIXES = (".gov", ".gov.ru", ".gov.uk", ".gov.au", ".gov.ca", ".gov.in", ".gov.sg", ".gov.br", ".gouv.fr")
+
+
 PRIMARY_LINK_LABEL = re.compile(
     r"(?:пресс.?релиз|официальн\w+\s+(?:сообщени\w+|заявлени\w+|документ\w*)|"
     r"законопроект|постановлени\w+|приказ\w+|указ\w+|документ\w+|текст\s+закона|"
@@ -604,7 +608,7 @@ def _is_official_source_host(host: str) -> bool:
     return any(host == domain or host.endswith("." + domain) for domain in OFFICIAL_SOURCE_DOMAINS) or host.endswith(OFFICIAL_SOURCE_SUFFIXES)
 
 
-# Identity comes from the fetched host, never the RSS publisher label or canonical tag.
+
 ORIGINAL_REPORTING_PUBLISHERS = {
     "tass.ru": r"ТАСС", "ria.ru": r"РИА\s+Новости", "interfax.ru": r"Интерфакс(?:у|а)?",
     "rbc.ru": r"РБК", "kommersant.ru": r"(?:Коммерсант(?:ъ|у|а)?|Ъ)",
@@ -632,12 +636,14 @@ def _original_reporting_kind(url: str, content: str) -> str | None:
     return None
 
 
+
 def _looks_like_pdf_url(url: str) -> bool:
     parsed = urllib.parse.urlsplit(url)
     path = urllib.parse.unquote(parsed.path).lower()
     query = urllib.parse.parse_qs(parsed.query)
     return (path.endswith(".pdf") or any(".pdf" in value.lower() for values in query.values() for value in values)
             or query.get("type", [""])[0].lower() == "application/pdf")
+
 
 
 def _embedded_document_candidates(parser: PublisherArticleParser, article_url: str) -> list[dict]:
@@ -676,6 +682,7 @@ def _embedded_document_candidates(parser: PublisherArticleParser, article_url: s
     return results
 
 
+
 def _primary_link_candidates(links: list[dict], article_url: str) -> list[dict]:
     article_host = (urllib.parse.urlsplit(article_url).hostname or "").lower()
     ranked = []
@@ -697,6 +704,7 @@ def _primary_link_candidates(links: list[dict], article_url: str) -> list[dict]:
         if official or document_label or explicit_document_url:
             ranked.append((0 if document_label or direct_pdf or explicit_document_url else 1, index, target, "OFFICIAL" if official else "LINKED_DOCUMENT"))
     return [{"url": entry[2], "kind": entry[3]} for entry in sorted(ranked)[:4]]
+
 
 
 def _fetch_bybit_restricted_counterparty_pdf(url: str, publisher_name: str,
@@ -748,6 +756,7 @@ def _fetch_bybit_restricted_counterparty_pdf(url: str, publisher_name: str,
     }
 
 
+
 def fetch_publisher_article(url: str, publisher_name: str, published_at: str | None,
                             discover_primary: bool = True, timeout: int = 20,
                             public_only: bool = False) -> dict:
@@ -772,11 +781,13 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
     return save(article)
 
 
+
 def _jina_retryable(exc):
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in {403, 406, 429, 503}
     return isinstance(exc, ValueError) and str(exc) in {
         'PUBLISHER_BROWSER_CHALLENGE', 'Publisher page has no readable article text'}
+
 
 
 def _fetch_publisher_article_native(url: str, publisher_name: str, published_at: str | None,
@@ -895,10 +906,12 @@ def _fetch_publisher_article_native(url: str, publisher_name: str, published_at:
     return article
 
 
+
 class FetchedItems(list):
     def __init__(self, values=(), diagnostics=None):
         super().__init__(values)
         self.diagnostics = diagnostics or []
+
 
 
 MULTI_LEVEL_SUFFIXES = {"ac.uk", "co.uk", "gov.uk", "org.uk", "com.au", "net.au", "org.au", "co.nz",
@@ -914,54 +927,6 @@ def _registrable_domain(host: str) -> str:
         return ".".join(labels[-3:])
     return suffix
 
-
-def _independent_candidates(item: dict, candidates: list[dict], trusted_domains: set[str], limit: int = 2) -> list[dict]:
-    """Select matching publisher articles on distinct domains, excluding known syndication."""
-    own_host = (urllib.parse.urlsplit(item.get("url", "")).hostname or "").lower()
-    primary_host = (urllib.parse.urlsplit(item.get("primary_source_url", "")).hostname or "").lower()
-    own_domain = _registrable_domain(own_host) if own_host else ""
-    primary_domain = _registrable_domain(primary_host) if primary_host else ""
-    trusted_domains = {_registrable_domain(domain) for domain in trusted_domains}
-    own_primary = canonicalize(item.get("primary_source_url") or "") if item.get("primary_source_url") else ""
-    own_title = item.get("title", "")
-    ranked = []
-    seen = set()
-    for candidate in candidates:
-        candidate_url = candidate.get("url", "")
-        candidate_host = (urllib.parse.urlsplit(candidate_url).hostname or "").lower()
-        if not candidate_host or not own_host:
-            continue
-        candidate_domain = _registrable_domain(candidate_host)
-        if candidate_domain in {own_domain, primary_domain}:
-            continue
-        reputable_publisher = candidate_domain in trusted_domains
-        if not reputable_publisher and not _is_official_source_host(candidate_host):
-            continue
-        candidate_primary = candidate.get("primary_source_url") or ""
-        candidate_primary_host = (urllib.parse.urlsplit(candidate_primary).hostname or "").lower()
-        same_input_source = canonicalize(candidate_primary) == canonicalize(item.get("url", ""))
-        same_primary_domain = bool(primary_host and _registrable_domain(candidate_primary_host) == primary_domain)
-        if candidate_primary and (same_input_source or (own_primary and canonicalize(candidate_primary) == own_primary) or same_primary_domain):
-            continue
-        canonical_url = canonicalize(candidate_url)
-        if not canonical_url or canonical_url == canonicalize(item.get("url", "")) or canonical_url in seen:
-            continue
-        title_score = similarity(own_title, candidate.get("title", ""))
-        shared_terms = terms(own_title) & terms(candidate.get("title", ""))
-        if title_score < 0.16 or len(shared_terms) < 2:
-            continue
-        own_content = (item.get("content") or item.get("description") or "")[:2400]
-        other_content = (candidate.get("content") or candidate.get("description") or "")[:2400]
-        if own_content and other_content and similarity(own_content, other_content) >= 0.82:
-            continue
-        seen.add(canonical_url)
-        ranked.append((title_score, {"publisher": candidate.get("publisher_name") or candidate_host,
-                                     "title": candidate.get("title", ""), "url": candidate_url,
-                                     "published_at": candidate.get("published_at"),
-                                     "primary_source_url": candidate_primary or None,
-                                     "primary_source_title": candidate.get("primary_source_title"),
-                                     "content": other_content[:3000]}))
-    return [entry for _, entry in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit]]
 
 
 def fetch_google_news(url: str, *, read_articles=True) -> list[dict]:
@@ -1017,6 +982,8 @@ def fetch_google_news(url: str, *, read_articles=True) -> list[dict]:
     diagnostics = [diagnostic for _, diagnostic in fetched if diagnostic]
     return FetchedItems(result, diagnostics)
 
+
+
 def _read_discovery_links(links: list[dict], max_results: int = 8, page_timeout: int = 20) -> list[dict]:
     """Read a bounded set of search results concurrently, preserving result order."""
     candidates = [link for link in links[:max(1, min(8, int(max_results)))]
@@ -1040,6 +1007,7 @@ def _read_discovery_links(links: list[dict], max_results: int = 8, page_timeout:
     result = [article for article, _ in fetched if article is not None]
     diagnostics = [diagnostic for _, diagnostic in fetched if diagnostic]
     return FetchedItems(result, diagnostics)
+
 
 
 def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
@@ -1129,6 +1097,7 @@ def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
     return _read_discovery_links(links, max_results=max_results, page_timeout=page_timeout)
 
 
+
 def fetch_x_recent(query: str, x_settings: dict) -> list[dict]:
     """Fetch public recent X posts and retain the API text as the direct source."""
     token = get_api_key({"api_key_env": x_settings.get("token_env", "X_BEARER_TOKEN"),
@@ -1165,6 +1134,7 @@ def fetch_x_recent(query: str, x_settings: dict) -> list[dict]:
     return result
 
 
+
 def fetch_rss(url: str) -> list[dict]:
     payload = _request(url)
     root = ET.fromstring(payload)
@@ -1194,6 +1164,7 @@ def fetch_rss(url: str) -> list[dict]:
     return result
 
 
+
 class FeedLinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -1205,6 +1176,7 @@ class FeedLinkParser(HTMLParser):
         if tag.lower() == "link" and "alternate" in a.get("rel", "").lower() and ("rss" in feed_hint or "atom" in feed_hint):
             if a.get("href"):
                 self.links.append(a["href"])
+
 
 
 class TelegramPreviewParser(HTMLParser):
@@ -1267,9 +1239,11 @@ class TelegramPreviewParser(HTMLParser):
                 self.current["active_link"]["text"] += data
 
 
+
 class TelegramBatch(list):
     recovery_before = None
     recovery_error = None
+
 
 
 def fetch_telegram(channel_url: str, since: str | None = None,
@@ -1326,6 +1300,7 @@ def fetch_telegram(channel_url: str, since: str | None = None,
     return batch
 
 
+
 def fetch_web(url: str) -> list[dict]:
     """Use a publisher's advertised RSS/Atom endpoint; never scrape page lists as if they were feeds."""
     parser = FeedLinkParser()
@@ -1336,11 +1311,13 @@ def fetch_web(url: str) -> list[dict]:
     return fetch_rss(feed_url)
 
 
+
 STOP = set("это как который которая которые чтобы если что где когда после перед было быть для при они она оно его ее их мы вы они тот эта эти этот а и в во на по из к от за с со под над до не ни или же но также заявил сообщает сообщила сообщают".split())
 
 
 def terms(value: str) -> set[str]:
     return {word.lower() for word in re.findall(r"[а-яёa-z0-9]{3,}", value) if word.lower() not in STOP}
+
 
 
 def is_relevant(text: str, configured_terms: list[str]) -> bool:
@@ -1366,71 +1343,6 @@ def is_relevant(text: str, configured_terms: list[str]) -> bool:
     return False
 
 
-def is_non_news_telegram_format(source: dict, item: dict) -> bool:
-    """Reject channel roundups and entertainment posts as standalone news candidates."""
-    try:
-        source_type = source["type"]
-    except (KeyError, IndexError, TypeError):
-        source_type = None
-    title = html.unescape(str(item.get("title") or "")).strip()
-    normalized = re.sub(r"^\s*(?:[^\wа-яё#]+\s*)+", "", title, flags=re.IGNORECASE)
-    roundup = re.compile(
-        r"^(?:#КАЛЕНДАРЬ|КАЛЕНДАРЬ\s+(?:КЛЮЧЕВЫХ\s+)?СОБЫТИЙ|ЧТО\s+СЛУЧИЛОСЬ\s+НА\s+КРИПТОРЫНКЕ|(?:УТРЕННИЙ|ВЕЧЕРНИЙ)\s+ОБЗОР|ТОП\s+(?:ДНЯ|НЕДЕЛИ)|ДАЙДЖЕСТ|ГЛАВНОЕ\s+ЗА\s+(?:ДЕНЬ|НЕДЕЛЮ)|ИТОГИ\s+ДНЯ|НОВОСТИ\s+ДНЯ)(?:\b|\s|:)",
-        re.IGNORECASE,
-    )
-    entertainment = re.compile(
-        r"^(?:#фильмынавыходные|(?:#[\w]+\s*)*(?:фильмы(?:\s+и\s+сериалы)?|сериалы|подборка\s+фильмов|что\s+посмотреть|книги\s+на\s+выходные|игры\s+на\s+выходные))\b",
-        re.IGNORECASE,
-    )
-    return bool(roundup.search(normalized) or entertainment.search(normalized))
-
-
-def similarity(a: str, b: str) -> float:
-    left, right = terms(a), terms(b)
-    return len(left & right) / max(1, len(left | right))
-
-
-def _limit_headline(headline: str, maximum: int = 115) -> str:
-    headline = re.sub(r"\s+", " ", html.unescape(headline)).strip()
-    if len(headline) <= maximum:
-        return headline
-    budget = max(1, maximum - 1)
-    excerpt = headline[:budget]
-    boundary = excerpt.rfind(" ")
-    if boundary >= int(budget * 0.55):
-        excerpt = excerpt[:boundary]
-    return excerpt.rstrip(" ,;:—-") + "…"
-
-
-def make_post(headline: str, description: str, source_name: str, url: str, max_length: int, *, preserve_content=False) -> str:
-    host = (urllib.parse.urlsplit(url).hostname or "").lower().removeprefix("www.")
-    brands = {"tass.ru":"ТАСС", "ria.ru":"РИА Новости", "rbc.ru":"РБК", "interfax.ru":"Интерфакс",
-              "cbr.ru":"Банк России", "minfin.gov.ru":"Минфин России", "duma.gov.ru":"Госдума", "rg.ru":"Российская газета"}
-    source_name = brands.get(host, re.sub(r"\s*\((?:Telegram|RSS)\)\s*$", "", source_name))
-    headline = headline.strip() if preserve_content else _limit_headline(headline)
-    body = html.unescape(description).replace("\r\n", "\n").replace("\r", "\n")
-    paragraphs = [re.sub(r"[ \t]+", " ", part).strip() for part in re.split(r"\n\s*\n", body)]
-    # Citation is assembled once by the application, even if the model returned
-    # its own footer while following the human-facing editorial standard.
-    body = "\n\n".join(part for part in paragraphs if part and not part.startswith(('Источник:', 'Источники:')))
-    if body.casefold() == headline.casefold():
-        body = ""
-    elif body.casefold().startswith(headline.casefold()):
-        body = body[len(headline):].lstrip(" —–:;,.\t\n")
-    footer = f"Источник: [{source_name}]({url})"
-    budget = max(80, max_length - len(footer) - len(headline) - 4)
-    if len(body) > budget and not preserve_content:
-        excerpt = body[:budget]
-        minimum_boundary = int(budget * 0.60)
-        boundaries = [match.end() for match in re.finditer(r"[.!?…](?:[»”\"')\]]*)\s+", excerpt)]
-        boundaries.extend(match.start() for match in re.finditer(r"\n\n", excerpt))
-        safe_boundary = max((point for point in boundaries if point >= minimum_boundary), default=0)
-        if not safe_boundary:
-            safe_boundary = excerpt.rfind(" ", minimum_boundary)
-        truncated = excerpt[:safe_boundary or budget - 1].rstrip(" ,;:\n")
-        body = truncated + "…"
-    return f"{headline}\n\n{body + chr(10) + chr(10) if body else ''}{footer}"
-
 
 def _primary_source_from_item(item: dict, status: str) -> dict | None:
     if not item.get("primary_source_url") or not item.get("primary_source_content"):
@@ -1447,6 +1359,7 @@ def _primary_source_from_item(item: dict, status: str) -> dict | None:
         **({"document_url": item["primary_source_document_url"]}
            if item.get("primary_source_document_url") else {}),
     }
+
 
 
 def _read_feed_article(item: dict, publisher_name: str) -> str:
@@ -1477,6 +1390,7 @@ def _read_feed_article(item: dict, publisher_name: str) -> str:
         "primary_source_status": article.get("primary_source_status", "NO_LINK"),
     })
     return item["content"]
+
 
 
 def _read_telegram_primary(item: dict, source) -> str:
@@ -1569,6 +1483,7 @@ def _read_telegram_primary(item: dict, source) -> str:
     return item.get("content") or item["title"]
 
 
+
 def _stored_primary(item: dict, primary: dict | None, status: str) -> str:
     record = dict(primary or {"status": status, "error": item.get("primary_source_error")})
     record["_material_read"] = item.get("material_read") is True
@@ -1579,105 +1494,6 @@ def _stored_primary(item: dict, primary: dict | None, status: str) -> str:
         record["_telegram_forwarded"] = item.get("telegram_forwarded", False)
     return json.dumps(record, ensure_ascii=False)
 
-
-def _impact_evidence_is_grounded(ai_result: dict, primary_source: dict | None) -> bool:
-    evidence = re.sub(r"\s+", " ", str(ai_result.get("impact_evidence") or "").strip().strip('"“”«»'))
-    source_text = re.sub(r"\s+", " ", str((primary_source or {}).get("content") or "").strip())
-    from .knowledge import grounded_span
-    return grounded_span(evidence, source_text, min_length=1) is not None
-
-
-def _restore_exact_social_headline_evidence(ai_result: dict, item: dict,
-                                            primary_source: dict | None) -> dict:
-    """Repair a missing quote only when the read post contains its exact headline."""
-    if not primary_source or not str(primary_source.get("type", "")).startswith("ORIGINAL_SOCIAL_"):
-        return ai_result
-    audit = ai_result.get("original_reporting_check") or {}
-    evidence = str(audit.get("evidence") or "").strip()
-    source_text = re.sub(r"\s+", " ", str(primary_source.get("content") or "")).strip()
-    if (audit.get("central_claim_supported") is True and len(evidence) >= 24
-            and " ".join(evidence.casefold().split()) in " ".join(source_text.casefold().split())):
-        return ai_result
-    headline = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()
-    if (len(headline) >= 24
-            and " ".join(headline.casefold().split()) in " ".join(source_text.casefold().split())
-            and audit.get("attribution_preserved") is True
-            and ai_result.get("facts")
-            and all(f.get("claim_type") in {"CLAIM", "REPORT", "OPINION"}
-                    for f in ai_result["facts"])):
-        ai_result["original_reporting_check"] = {
-            **audit, "central_claim_supported": True, "evidence": headline,
-        }
-        ai_result["_evidence_repair"] = "EXACT_READ_SOCIAL_HEADLINE"
-    return ai_result
-
-
-def _source_evidence_issues(result: dict, content: str, *, analysis_only=False) -> list[str]:
-    audit = result.get('original_reporting_check') or {}
-    quote = str(audit.get('evidence') or '')
-    issues = []
-    if audit.get('central_claim_supported') is not True:
-        issues.append('Не подтверждено центральное утверждение прочитанным материалом.')
-    from .knowledge import grounded_span
-    if grounded_span(quote, content, min_length=1) is None:
-        issues.append('Нужна подтверждающая выдержка из фактически прочитанного материала.')
-    if not analysis_only and audit.get('attribution_preserved') is not True:
-        issues.append('Не подтверждено сохранение атрибуции автора сообщения.')
-    claims = result.get('facts') or []
-    if not claims or any(f.get('claim_type') not in {'CLAIM', 'REPORT', 'OPINION'} for f in claims):
-        issues.append('Сообщения, заявления и мнения должны оставаться REPORT, CLAIM или OPINION; не повышайте их до FACT.')
-    return issues
-
-
-def require_primary_source_review(ai_result: dict | None, source_status: str, primary_source: dict | None = None,
-                                  publisher_report: dict | None = None, *, analysis_only=False) -> dict | None:
-    if ai_result is None or ai_result.get("action") == "DUPLICATE" or ai_result.get("publication_recommendation") == "DO_NOT_PUBLISH":
-        return ai_result
-    result = dict(ai_result)
-    if publisher_report:
-        supported = attributed_report_supported(publisher_report, result, analysis_only=analysis_only)
-        if not supported or result.get("publication_recommendation") == "WAIT_FOR_AUTOMATION":
-            result['source_review_issues'] = _source_evidence_issues(result, publisher_report.get('content', ''), analysis_only=analysis_only)
-            result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
-            result["source_review_required"] = True
-            return result
-    elif source_status != "READ" or not primary_source or not primary_source.get("url") or not primary_source.get("content"):
-        result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
-        result["source_review_required"] = True
-        result["primary_source_missing"] = True
-        result['source_review_issues'] = ['Нет сохранённого прочитанного материала с URL и текстом для проверки.']
-        return result
-    if primary_source and primary_source.get("type", "").startswith(("ORIGINAL_MEDIA_", "ORIGINAL_SOCIAL_")):
-        # Require an explicit editorial decision about the central claim, with a
-        # verbatim supporting excerpt; a stray interview marker alone is insufficient.
-        audit = result.get("original_reporting_check") or {}
-        quote = audit.get("evidence", "")
-        supported = (audit.get("central_claim_supported") is True
-                     and bool(quote.strip())
-                     and " ".join(quote.casefold().split()) in " ".join(primary_source["content"].casefold().split())
-                     and (analysis_only or audit.get("attribution_preserved") is True)
-                     and result.get("facts")
-                     and all(f.get("claim_type") in {"CLAIM", "REPORT", "OPINION"} for f in result["facts"]))
-        if not supported or result.get("publication_recommendation") == "WAIT_FOR_AUTOMATION":
-            result['source_review_issues'] = _source_evidence_issues(result, primary_source['content'], analysis_only=analysis_only)
-            result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
-            result["source_review_required"] = True
-            return result
-    independent_check = result.get("independent_check", "NOT_ASSESSED")
-    # A second publisher is useful corroboration, but waiting for it can make a breaking story stale.
-    # Keep material conflicts for an editor; absence of corroboration alone is advisory.
-    if independent_check == "CONFLICT":
-        result["independent_check_required"] = True
-        result["source_review_required"] = True
-        result["publication_recommendation"] = "DO_NOT_PUBLISH"
-    else:
-        result["independent_check_required"] = False
-
-    return result
-
-
-def _likely_local(item):
-    return bool(re.search(r"росси|\bрф\b|совфед|минфин|госдум|банк\s+россии|шейкин|аксаков|набиуллин|сбер(?:банк)?|втб|газпромбанк|мособлбанк|москва|снг|беларус|казахстан", (item.get("title", "") + " " + item.get("description", "")), re.I))
 
 
 class _WebSearchQuota:
@@ -1736,389 +1552,12 @@ class _WebSearchQuota:
         return fetch_web_search(query, {**ai_settings, '_work_stage': 'recovery_search'})
 
 
-def _recover_primary(db, item, settings, *, steps=False):
-    """Source recovery candidates still pass the normal factual/editorial gates."""
-    from .source_search import recover
-    return recover(db, item, settings, fetch_google_news,
-                   settings.get("_web_search_quota") or fetch_web_search, terms, similarity, steps=steps)
-
-
-def _agent_recover_primary(db, item, settings, source, item_id=None, *, steps=False):
-    from .workflow import drive
-    generator = _agent_recover_steps(db, item, settings, source, item_id)
-    return generator if steps else drive(generator, settings.get('_runtime'))
-
-
-def _agent_recover_steps(db, item, settings, source, item_id=None):
-    """Let the bounded research agent choose a recovery step for unreadable news.
-
-    Search results are not evidence until their publisher page is read. The
-    agent can only read URLs returned by its own allowlisted search tool; the
-    ordinary editor and publication gates remain authoritative.
-    """
-    from .agent import run_research_agent
-    from .workflow import Work, resolve_steps
-    from .runtime import BudgetDeferred
-
-    quota = settings.get("_web_search_quota")
-    searched: dict[str, dict] = {}
-    read: dict[str, dict] = {}
-    history: list[dict] = []
-
-    def search(args):
-        revision_hash = digest(str(item.get("title", "")) + "\n" + str(item.get("content", "")))
-        prior = db.execute("SELECT MAX(attempt) FROM source_search_log WHERE item_url=? AND revision_hash=? AND outcome NOT IN ('STARTED','DEFERRED')",
-                           (item["url"], revision_hash)).fetchone()[0] or 0
-        if prior >= 3:
-            return {"status": "BUDGET_LIMIT", "results": []}
-        if settings.get("_recovery_search_budget", 0) <= 0:
-            item["_source_search_deferred"] = True
-            return {"status": "DEFERRED", "results": []}
-        if not quota or not quota.reserve_primary_recovery():
-            return {"status": "DEFERRED", "results": []}
-        settings["_recovery_search_budget"] -= 1
-        attempt = prior + 1
-        from .source_search import log as log_source_search
-        try:
-            db.commit()
-            results = yield Work('collector', fetch_web_search,
-                (args["query"], {**settings, '_work_stage':'recovery_search', "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))}),
-                {"max_results": 3, "page_timeout": 8})
-        except BudgetDeferred:
-            item['_source_search_deferred'] = True
-            item['_budget_deferred'] = True
-            log_source_search(db, item['url'], attempt, 'AGENT_SEARCH_WEB', args['query'], 'DEFERRED', [], revision_hash)
-            db.commit()
-            raise
-        except Exception as exc:
-            log_source_search(db, item["url"], attempt, "AGENT_SEARCH_WEB", args["query"],
-                              "ERROR", [{"error_code": type(exc).__name__}], revision_hash)
-            db.commit()
-            raise
-        rows = []
-        checked = []
-        for result in results[:6]:
-            url = result.get("material_url") or result.get("url")
-            if not url or not str(url).startswith(("https://", "http://")):
-                continue
-            searched[url] = result
-            checked.append({key: result.get(key) for key in ("url", "title", "content", "publisher_name",
-                              "published_at", "material_read", "primary_source_url",
-                              "primary_source_content", "primary_source_status", "primary_source_type")})
-            rows.append({"title": result.get("title", "")[:240], "url": url,
-                         "publisher": result.get("publisher_name", "")[:120],
-                         "published_at": result.get("published_at")})
-        log_source_search(db, item["url"], attempt, "AGENT_SEARCH_WEB", args["query"],
-                          "FOUND_CANDIDATE" if rows else "NOT_FOUND", checked, revision_hash)
-        db.commit()
-        return {"status": "OK" if rows else "NO_RESULTS", "results": rows}
-
-    def read_url(args):
-        url = args["url"]
-        result = searched.get(url)
-        if result is None:
-            return {"status": "REJECTED", "reason": "URL_NOT_FROM_SEARCH"}
-        article = result
-        content = str(article.get("content") or "")
-        if result.get("material_read") is not True or not content.strip():
-            parsed = urllib.parse.urlsplit(url)
-            try:
-                db.commit()
-                article = yield Work('collector', fetch_publisher_article,
-                    (url, result.get("publisher_name") or parsed.hostname or "Издание", result.get("published_at")),
-                    {'discover_primary': True, 'timeout': 8, 'public_only': True})
-                content = str(article.get("content") or "")
-            except Exception as exc:
-                code = _safe_source_error(exc)
-                article = {"url": url, "title": result.get("title", ""),
-                           "content": "", "publisher_name": result.get("publisher_name", ""),
-                           "material_read": False, "read_error": code}
-                content = ""
-
-        revision_hash = digest(str(item.get("title", "")) + "\n" + str(item.get("content", "")))
-        prior_search = db.execute(
-            "SELECT attempt,query FROM source_search_log WHERE item_url=? AND revision_hash=? "
-            "ORDER BY search_id DESC LIMIT 1", (item["url"], revision_hash),
-        ).fetchone()
-        attempt = int(prior_search["attempt"] or 1) if prior_search else 1
-        from .source_search import log as log_source_search
-        primary_content = str(article.get("primary_source_content") or "")
-        article_readable = article.get("material_read") is True and bool(content.strip())
-        primary_readable = (article.get("primary_source_status") == "READ"
-                            and bool(primary_content.strip()))
-        readable = article_readable or primary_readable
-        checked = [{"url": article.get("url") or url, "title": article.get("title", ""),
-                    "publisher_name": article.get("publisher_name", ""),
-                    "published_at": article.get("published_at"),
-                    "content": content[:12000], "material_read": article_readable,
-                    "primary_source_url": article.get("primary_source_url"),
-                    "primary_source_title": article.get("primary_source_title"),
-                    "primary_source_content": primary_content[:12000],
-                    "primary_source_status": article.get("primary_source_status", "NOT_CHECKED"),
-                    "primary_source_type": article.get("primary_source_type"),
-                    **({"error_code": article.get("read_error")} if article.get("read_error") else {})}]
-        log_source_search(db, item["url"], attempt, "AGENT_READ_URL", url,
-                          "READ" if readable else "UNREADABLE", checked, revision_hash)
-        db.commit()
-        if not readable:
-            return {"status": "UNREADABLE", "url": url,
-                    "error_code": article.get("read_error", "ARTICLE_TEXT_TOO_SHORT")}
-
-        article = {**article, "url": article.get("url") or url, "content": content,
-                   "publisher_name": article.get("publisher_name") or result.get("publisher_name"),
-                   "material_read": article_readable}
-        read[url] = article
-        read[article["url"]] = article
-        primary_url = article.get("primary_source_url")
-        if (primary_url and article.get("primary_source_status") == "READ"
-                and bool(primary_content.strip())):
-            read[primary_url] = {
-                "url": primary_url, "title": article.get("primary_source_title") or "",
-                "publisher_name": article.get("primary_source_publisher") or "",
-                "content": primary_content[:12000], "material_read": True,
-                "primary_source_status": "READ",
-                "primary_source_type": article.get("primary_source_type"),
-            }
-        return {"status": "READ" if article_readable else "PRIMARY_SOURCE_READ",
-                "title": article.get("title", "")[:240],
-                "url": article["url"], "publisher": article.get("publisher_name", "")[:120],
-                "published_at": article.get("published_at"),
-                "content": content[:8000],
-                "primary_source_url": primary_url or "",
-                "primary_source_title": article.get("primary_source_title", "")[:240],
-                "primary_source_status": article.get("primary_source_status", "NOT_CHECKED"),
-                "primary_source_content_excerpt": primary_content[:3000]}
-
-    def check_history(args):
-        query = args["query"]
-        rows = db.execute("SELECT story_id,headline,canonical_topic,latest_information,last_published_at "
-                          "FROM stories ORDER BY last_updated_at DESC LIMIT 1000").fetchall()
-        matches = sorted(((similarity(query, " ".join(str(row[k] or "") for k in
-                          ("headline", "canonical_topic", "latest_information"))), row) for row in rows),
-                         key=lambda pair: pair[0], reverse=True)[:5]
-        history[:] = [{"story_id": row["story_id"], "headline": row["headline"],
-                       "latest_information": row["latest_information"][:800],
-                       "last_published_at": row["last_published_at"], "similarity": round(score, 3)}
-                      for score, row in matches if score >= 0.2]
-        return {"status": "OK", "matches": history}
-
-    def record_agent_event(event):
-        _trace_item(item, "Исследователь", event.get("status", "ШАГ"),
-                    event.get("rationale") or event.get("tool", ""),
-                    tool=event.get("tool"), step=event.get("step"))
-        _log_timing("research_agent_action_timing", item_id=item_id,
-                    tool=event.get("tool"), outcome=event.get("status"),
-                    model_seconds=event.get("model_seconds"),
-                    tool_seconds=event.get("tool_seconds"))
-
-    try:
-        result = yield from resolve_steps(run_research_agent(
-            {"title": item.get("title", ""), "description": item.get("description", "")[:1500],
-             "source": source["name"], "source_url": item.get("url", ""),
-             "published_at": item.get("published_at"), "read_text": str(item.get("content") or "")[:3000],
-             "goal": "Найти прочитанный первоисточник или пригодный материал СМИ для проверки этой свежей новости."},
-            {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))},
-            {"search_web": search, "read_url": read_url, "check_story_history": check_history},
-            max_steps=int(settings.get("research_agent_max_steps", 4)), execute_tools=True,
-            on_event=record_agent_event, steps=True))
-    except BudgetDeferred:
-        item['_source_search_deferred'] = True
-        item['_budget_deferred'] = True
-        return None
-    except Exception as exc:
-        _trace_item(item, "Исследователь", "Ошибка", type(exc).__name__)
-        return None
-
-    selected = result.get("selected_primary_url") or result.get("selected_report_url")
-    material = read.get(selected)
-    if not material:
-        return None
-    if (len(terms(item.get("title", "")) & terms(material.get("title", ""))) < 3
-            or similarity(item.get("title", ""), material.get("title", "")) < 0.2):
-        _trace_item(item, "Исследователь", "Несовпадение", "Найденная страница не совпала с заголовком исходной новости.")
-        return None
-    host = urllib.parse.urlsplit(selected).hostname or ""
-    article_text = str(material.get("content") or "")[:12000]
-    if not article_text.strip():
-        _trace_item(item, "Исследователь", "Непрочитанный результат",
-                    "Не передаю поисковую страницу в редакторский этап без читаемого текста.")
-        return None
-    publisher = material.get("publisher_name") or host
-    if _is_official_source_host(host):
-        return {"primary_source_url": selected, "primary_source_title": material.get("title", ""),
-                "primary_source_content": article_text, "primary_source_type": "OFFICIAL",
-                "primary_source_publisher": publisher, "primary_source_status": "READ",
-                "primary_source_published_at": material.get("published_at"),
-                "material_read": True, "content": article_text, "url": selected,
-                "title": material.get("title", ""), "publisher_name": publisher,
-                "published_at": material.get("published_at")}
-    return {"material_read": True, "content": article_text, "url": selected,
-            "title": material.get("title", ""), "publisher_name": publisher,
-            "published_at": material.get("published_at")}
-
-
-def _shadow_research_agent(item, settings, source, *, steps=False):
-    from .workflow import drive
-    generator = _shadow_research_steps(item, settings, source)
-    return generator if steps else drive(generator, settings.get('_runtime'))
-
-
-def _shadow_research_steps(item, settings, source):
-    """Record one proposed recovery action without invoking its tool."""
-    from .agent import run_research_agent
-    from .workflow import resolve_steps
-    try:
-        return (yield from resolve_steps(run_research_agent(
-            {"title": item.get("title", ""), "description": item.get("description", "")[:1500],
-             "source": source["name"], "source_url": item.get("url", ""),
-             "published_at": item.get("published_at"), "read_text": str(item.get("content") or "")[:3000],
-             "goal": "Выбрать следующий полезный шаг для восстановления читаемого источника."},
-            {**settings, "timeout_seconds": min(25, int(settings.get("timeout_seconds", 45)))},
-            {}, max_steps=1, execute_tools=False,
-            on_event=lambda event: _trace_item(item, "Исследователь · тень", event.get("status", "ШАГ"),
-                                                event.get("tool", ""), tool=event.get("tool"),
-                                                step=event.get("step")), steps=True)))
-    except Exception as exc:
-        _trace_item(item, "Исследователь · тень", "Ошибка", type(exc).__name__)
-        return None
-
-
-def _history_context(db, item):
-    # Archive scope is explicit: lack of a match must not be called a web investigation.
-    names = set(re.findall(r"\b[А-ЯЁ][а-яё]{4,}\b", item.get("title", "")))
-    rows = db.execute("SELECT title,url,published_at,content FROM items WHERE published_at<? AND disposition IN ('NEW_STORY','UPDATE_CANDIDATE') ORDER BY published_at DESC LIMIT 300", (item.get("published_at") or NOW(),)).fetchall()
-    matches = [dict(r) for r in rows if any(name in r["title"] for name in names)]
-    return [{"scope":"local_archive","title":r["title"],"url":r["url"],"published_at":r["published_at"],"content":r["content"][:1200]} for r in matches[:4]]
-
-
-def _editorial_examples(db, item: dict, item_id: int, limit: int = 12,
-                        story_id: int | None = None) -> list[dict]:
-    """Prefer feedback tied to this story or similar coverage over merely recent notes."""
-    current = " ".join(str(item.get(key) or "") for key in ("title", "description"))
-    if story_id is None:
-        story = db.execute("SELECT story_id FROM items WHERE item_id=?", (item_id,)).fetchone()
-        story_id = story["story_id"] if story else None
-    columns = ("feedback_id,feedback_type,reason,item_title,substr(post_text,1,900) AS post_text,"
-               "item_id,story_id,created_at")
-    related = db.execute(
-        f"SELECT {columns} FROM editorial_feedback WHERE item_id=? OR (? IS NOT NULL AND story_id=?) "
-        "ORDER BY created_at DESC LIMIT 200", (item_id, story_id, story_id),
-    ).fetchall()
-    recent = db.execute(
-        f"SELECT {columns} FROM editorial_feedback ORDER BY created_at DESC LIMIT 400"
-    ).fetchall()
-    rows_by_id = {row["feedback_id"]: row for row in (*related, *recent)}
-    rows = list(rows_by_id.values())
-    scored = []
-    general = []
-    for row in rows:
-        exact_item = row["item_id"] == item_id
-        same_story = bool(story_id and row["story_id"] == story_id)
-        topic_score = max(similarity(current, row["item_title"] or ""),
-                          0.65 * similarity(current, row["reason"] or ""))
-        # Owner-authored notes and confirmed/refined lessons can express style
-        # preferences across topics; the editor prompt still forbids using them
-        # as evidence for facts in the current story.
-        is_general = row["feedback_type"] in {
-            "OTHER", "TELEGRAM_LINK_FEEDBACK", "TELEGRAM_EDIT_CONFIRMATION",
-            "TELEGRAM_EDIT_REFINEMENT",
-        }
-        score = (2.0 if exact_item else 0.0) + (1.4 if same_story else 0.0) + topic_score
-        if is_general:
-            # A direct owner note about a post or a refinement of the agent's
-            # inferred lesson is a stronger editorial signal than a generic
-            # recent comment. Keep that signal in the small cross-topic slice.
-            owner_priority = {
-                "TELEGRAM_EDIT_REFINEMENT": 3,
-                "TELEGRAM_LINK_FEEDBACK": 2,
-                "TELEGRAM_EDIT_CONFIRMATION": 1,
-            }.get(row["feedback_type"], 0)
-            general.append((owner_priority, score, row))
-        if score > 0.05 and not is_general:
-            scored.append((score, row))
-    scored.sort(key=lambda pair: (pair[0], pair[1]["created_at"] or ""), reverse=True)
-    general.sort(key=lambda pair: (pair[0], pair[1], pair[2]["created_at"] or ""), reverse=True)
-    general_limit = min(3, limit)
-    selected = [row for _, row in scored[:max(0, limit - general_limit)]]
-    selected_ids = {row["feedback_id"] for row in selected}
-    for _, _, row in general:
-        if sum(candidate["feedback_type"] in {
-                "OTHER", "TELEGRAM_LINK_FEEDBACK", "TELEGRAM_EDIT_CONFIRMATION",
-                "TELEGRAM_EDIT_REFINEMENT",
-        } for candidate in selected) >= general_limit:
-            break
-        if row["feedback_id"] not in selected_ids:
-            selected.append(row)
-            selected_ids.add(row["feedback_id"])
-    for _, row in scored:
-        if len(selected) >= limit:
-            break
-        if row["feedback_id"] not in selected_ids:
-            selected.append(row)
-            selected_ids.add(row["feedback_id"])
-    return [{key: row[key] for key in ("feedback_type", "reason", "item_title", "post_text")}
-            for row in selected[:limit]]
-
 
 def _archive_item_revision(db, item_id: int, prior_row) -> None:
-    analysis = db.execute("SELECT model,created_at,result_json FROM item_analysis WHERE item_id=?", (item_id,)).fetchone()
-    retry_keys = (f"triage:{item_id}", f"selection_retry:{item_id}", f"editor_retry:{item_id}")
-    retry_state = {}
-    for key in retry_keys:
-        state = db.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
-        if state:
-            retry_state[key] = state["value"]
     source_snapshot = dict(prior_row)
-    revision_hash = digest("\n".join((source_snapshot.get("title") or "", source_snapshot.get("content") or "",
-                                       source_snapshot.get("description") or "")))
+    revision_hash = digest("\n".join((source_snapshot.get("title") or "", source_snapshot.get("content") or "", source_snapshot.get("description") or "")))
     db.execute("INSERT INTO item_revisions(item_id,observed_at,revision_hash,source_snapshot_json,decision_snapshot_json) VALUES(?,?,?,?,?)",
-               (item_id, NOW(), revision_hash, json.dumps(source_snapshot, ensure_ascii=False),
-                json.dumps({"analysis": dict(analysis) if analysis else None,
-                            "retry_state": retry_state,
-                            "disposition": source_snapshot.get("disposition"),
-                            "processed_at": source_snapshot.get("processed_at")}, ensure_ascii=False)))
-
-
-def _trace_item(item: dict, stage: str, outcome: str, reason: str, **details) -> None:
-    """Keep a compact, user-readable trace alongside the immutable decision snapshot."""
-    trace = item.setdefault("_audit_trace", [])
-    event = {"stage": stage[:80], "outcome": outcome[:60], "reason": str(reason or "")[:400]}
-    for key, value in details.items():
-        if value is None or value == "":
-            continue
-        event[key] = value[:400] if isinstance(value, str) else value
-    trace.append(event)
-
-
-def _read_material_work(item, source, publisher_name):
-    import copy
-    local = copy.deepcopy(item)
-    body = (_read_telegram_primary(local, source) if source["type"] == "telegram"
-            else _read_feed_article(local, publisher_name))
-    return {"body": body, "item": local}
-
-
-def _editor_history_revision(db, item):
-    from .runtime import cache_key
-    # Include feedback and publication changes, including edits, which can
-    # invalidate a decision even when no new story has appeared.
-    candidate = " ".join(str(item.get(key) or "") for key in ("title", "description", "content"))
-    related = [dict(row) for row in db.execute("SELECT * FROM stories")
-               if similarity(candidate, row['canonical_topic'] + ' ' + row['headline'] + ' ' + row['latest_information']) >= .12]
-    ids = [row['story_id'] for row in related]
-    # Collection counters and timestamps do not change the event evidence.
-    # Real story content, facts, publications and coverage still invalidate it.
-    semantic_fields = ('story_id', 'canonical_topic', 'headline', 'status',
-                       'latest_information', 'known_facts', 'entities', 'keywords')
-    snapshots = {"stories": [{key: row[key] for key in semantic_fields} for row in related]}
-    for table in ("posts", "story_facts", "publication_coverage"):
-        marks = ','.join('?' for _ in ids) or 'NULL'
-        published_only = " AND status='PUBLISHED'" if table == 'posts' else ''
-        snapshots[table] = [tuple(row) for row in db.execute(f"SELECT * FROM {table} WHERE story_id IN ({marks}){published_only}", ids)]
-    # Unrelated feedback does not invalidate a material. Registered rules are
-    # versioned independently by the policy dependency.
-    snapshots['feedback'] = []
-    return cache_key("editor-history", snapshots)
+               (item_id, NOW(), revision_hash, json.dumps(source_snapshot, ensure_ascii=False), '{}'))
 
 
 def _save_item(db, source, item, existing_item_id=None):
@@ -2178,9 +1617,6 @@ def _save_item(db, source, item, existing_item_id=None):
                            (item["url"], item["title"], item.get("description", ""), body, item.get("author"),
                             item.get("published_at"), item.get("updated_at"), content_hash, title_hash,
                             feed_content_hash, _stored_primary(item, primary_source, source_status), ingest_revision, item_id))
-                db.execute("DELETE FROM item_analysis WHERE item_id=?", (item_id,))
-                db.executemany("DELETE FROM app_state WHERE key=?", [(f"triage:{item_id}",),
-                                 (f"selection_retry:{item_id}",), (f"editor_retry:{item_id}",)])
         else:
             item_id = existing_item_id
             prior = db.execute("SELECT * FROM items WHERE item_id=?", (item_id,)).fetchone()
@@ -2205,1363 +1641,6 @@ def _save_item(db, source, item, existing_item_id=None):
     db.execute('INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING',
                (f"material_received:{item_id}:{saved['ingest_revision']}", json.dumps({'at': receipt})))
     return item_id
-
-
-def process_item(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
-                 initial_backfill_minutes: int | None = None, relevance_terms: list[str] | None = None,
-                 ai_settings: dict | None = None, existing_item_id: int | None = None,
-                 post_ready_callback=None) -> str:
-    from .workflow import drive
-    return drive(process_item_steps(db, source, item, threshold, max_length, freshness_hours,
-        initial_backfill_minutes, relevance_terms, ai_settings, existing_item_id, post_ready_callback),
-        (ai_settings or {}).get("_runtime"), {"item_id": existing_item_id,
-        "category": (ai_settings or {}).get("_work_category", "fresh")})
-
-
-def process_item_steps(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
-                 initial_backfill_minutes: int | None = None, relevance_terms: list[str] | None = None,
-                 ai_settings: dict | None = None, existing_item_id: int | None = None,
-                 post_ready_callback=None) -> str:
-    timings = {"primary_source_read_seconds": 0.0, "ai_seconds": 0.0,
-               "research_agent_seconds": 0.0}
-    started = time.perf_counter()
-    post_ids_ready = []
-    post_ready_item_id = None
-    outcome = "INTERRUPTED"
-    try:
-        outcome = yield from _process_item_steps(db, source, item, threshold, max_length, freshness_hours,
-                                initial_backfill_minutes, relevance_terms, ai_settings, timings, existing_item_id)
-        row = db.execute("SELECT item_id,disposition FROM items WHERE source_id=? AND canonical_url=?",
-                         (source["source_id"], canonicalize(item["url"]))).fetchone()
-        if row and row["disposition"] == outcome:
-            if item.get('_technical_error'):
-                outcome = 'TECHNICAL_ERROR'
-                db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (outcome, NOW(), row['item_id']))
-            if outcome in {"PRIMARY_RETRY", "AI_RETRY", "WAITING_CONFIRMATION"} and item.get('_flow_block_kind') == 'transport':
-                from .material_flow import transport_retry
-                exhausted, delay = transport_retry(db, row['item_id'], item.get('_retry_reason', 'Ошибка внешнего запроса'))
-                item['_retry_without_count'] = True
-                item['_retry_delay_seconds'] = delay
-                if exhausted:
-                    outcome = 'TECHNICAL_ERROR'
-                    item['_retry_reason'] = 'Технические повторы исчерпаны; требуется восстановление сервиса. ' + item.get('_retry_reason', '')
-                    db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (outcome, NOW(), row['item_id']))
-            if outcome in {"PRIMARY_RETRY", "AI_RETRY", "WAITING_CONFIRMATION"}:
-                retry_without_count = bool(item.get("_retry_without_count") or item.get("_source_search_deferred"))
-                retry_delay = (item.get('_retry_delay_seconds', (ai_settings or {}).get('_retry_cycle_delay_seconds'))
-                               if retry_without_count else
-                               (ai_settings or {}).get('_text_repair_delay_seconds')
-                               if item.get('_text_repair_ready') else None)
-                attempts = schedule_retry(
-                    db, row["item_id"], outcome,
-                    retry=existing_item_id is not None and not item.get('_workflow_first_attempt') and not retry_without_count,
-                    reason=item.get("_retry_reason"),
-                    delay_seconds=retry_delay,
-                )
-                if attempts >= MAX_AUTOMATIC_RETRIES:
-                    exhausted_reason = (f"Исчерпан лимит: {attempts} автоматических повторных проверок; "
-                                        "эта версия закрыта без публикации.")
-                    item["_retry_reason"] = exhausted_reason
-                    _trace_item(item, "Лимит повторов", "Закрыт", exhausted_reason,
-                                attempts=attempts, limit=MAX_AUTOMATIC_RETRIES)
-                    retry_key = f"selection_retry:{row['item_id']}"
-                    retry_row = db.execute("SELECT value FROM app_state WHERE key=?", (retry_key,)).fetchone()
-                    if retry_row:
-                        try:
-                            retry_state = json.loads(retry_row["value"] or "{}")
-                        except (TypeError, json.JSONDecodeError):
-                            retry_state = {}
-                        retry_state.update({"reason": exhausted_reason, "outcome": "REJECTED", "next_at": NOW()})
-                        db.execute("UPDATE app_state SET value=? WHERE key=?",
-                                   (json.dumps(retry_state, ensure_ascii=False), retry_key))
-                    db.execute("UPDATE items SET disposition='REJECTED',processed_at=? WHERE item_id=?",
-                               (NOW(), row["item_id"]))
-                    outcome = "REJECTED"
-            else:
-                schedule_retry(db, row["item_id"], outcome)
-            trace = item.get("_audit_trace", [])
-            last_reason = trace[-1].get("reason") if trace else ""
-            summary = (item.get("_retry_reason") or last_reason or {
-                "NEW_STORY": "Создан новый сюжет; черновик передан на автоматический допуск.",
-                "UPDATE_CANDIDATE": "Добавлено новое сообщение к известному сюжету; черновик передан на автоматический допуск.",
-                "DUPLICATE": "Новое существенное сведение не найдено.",
-                "NOISE": "Материал отсеян до публикации.",
-                "REJECTED": "Автоматическая обработка завершена по лимиту повторных проверок.",
-                "STORE_ONLY": "Свидетельство сохранено в памяти; нового повода для поста нет.",
-            }.get(outcome, "Обработка завершена."))
-            _trace_item(item, "Итог обработки", outcome, summary)
-            from .material_flow import finish_attempt
-            finish_attempt(db, row['item_id'], outcome, item)
-            audit = {}
-            if item.get("_audit_trace"):
-                audit["audit_trace"] = item["_audit_trace"]
-            if item.get("_audit_triage"):
-                audit["audit_triage"] = item["_audit_triage"]
-            from .decisions import record
-            record(db, row["item_id"], outcome, (ai_settings or {}).get("model"), extra=audit)
-            db.commit()
-        if outcome in {"NEW_STORY", "UPDATE_CANDIDATE"} and post_ready_callback:
-            item_row = db.execute("SELECT item_id FROM items WHERE source_id=? AND canonical_url=?",
-                                  (source["source_id"], canonicalize(item["url"]))).fetchone()
-            if item_row:
-                post_ready_item_id = item_row["item_id"]
-                post_ids_ready = [entry["post_id"] for entry in db.execute(
-                    "SELECT post_id FROM posts WHERE origin_item_id=? AND status='PENDING' ORDER BY post_id",
-                    (item_row["item_id"],)).fetchall()]
-                if post_ids_ready:
-                    db.commit()
-    except Exception as exc:
-        outcome = "ERROR"
-        db.rollback()
-        from .decisions import record_failure
-        record_failure(db, item, source['source_id'], (ai_settings or {}).get('model'), type(exc).__name__)
-        db.commit()
-        raise
-    finally:
-        try:
-            item_row = db.execute("SELECT item_id,discovered_at FROM items WHERE source_id=? AND canonical_url=?",
-                                  (source["source_id"], canonicalize(item["url"]))).fetchone()
-        except Exception:
-            item_row = None
-        _log_timing("item_processing_timing", item_id=item_row["item_id"] if item_row else None,
-                    source=source["name"], source_type=source["type"], outcome=outcome,
-                    source_published_at=item.get("published_at"),
-                    source_updated_at=item.get("updated_at"),
-                    discovered_at=item_row["discovered_at"] if item_row else None,
-                    processed_at=NOW(), total_seconds=round(time.perf_counter() - started, 3),
-                    primary_source_read_seconds=round(timings["primary_source_read_seconds"], 3),
-                    ai_seconds=round(timings["ai_seconds"], 3),
-                    research_agent_seconds=round(timings["research_agent_seconds"], 3))
-        if (timings["primary_source_read_seconds"] > 0 or timings["ai_seconds"] > 0
-                or timings["research_agent_seconds"] > 0
-                or outcome not in {"DUPLICATE", "NOISE", "STALE", "UNDATED", "BASELINE_SKIPPED"}):
-            _log_timing("news_processing_timing", source=source["name"],
-                        title=item.get("title", "")[:160], outcome=outcome,
-                        primary_source_read_seconds=round(timings["primary_source_read_seconds"], 3),
-                        ai_seconds=round(timings["ai_seconds"], 3),
-                        research_agent_seconds=round(timings["research_agent_seconds"], 3),
-                        total_seconds=round(time.perf_counter() - started, 3))
-    if post_ids_ready and post_ready_callback:
-        try:
-            post_ready_callback(post_ids_ready)
-        except Exception as callback_error:
-            _log_timing("post_ready_callback_error", item_id=post_ready_item_id,
-                        error_type=type(callback_error).__name__)
-    return outcome
-
-
-def _read_material_report(source, item: dict, body: str) -> dict | None:
-    """A read secondary account is evidence of a report, never proof of its claims.
-
-    Read provenance comes from the page/post reader, not source rank or an AI flag.
-    Metadata, RSS summaries and search snippets cannot take this path.
-    """
-    role = source["source_role"] if "source_role" in source.keys() else "aggregator"
-    url = item.get("material_url") or item.get("url", "")
-    if (item.get("material_read") is not True or not (body or "").strip()
-            or not str(url).startswith(("https://", "http://"))):
-        return None
-    return {"publisher": item.get("publisher_name") or source["name"], "url": url,
-            "title": item.get("title", ""), "content": body, "type": "ATTRIBUTED_REPORT",
-            "material_read": True, "source_role": role,
-            "published_at": item.get("published_at"),
-            "updated_at": item.get("updated_at"),
-            "source_timezone": item.get("source_timezone"),
-            "forwarded": bool(item.get("telegram_forwarded")),
-            "priority": int(source["priority"]), "reputation": source["reputation"]}
-
-
-def _process_item_steps(db, source, item: dict, threshold: float, max_length: int, freshness_hours: int,
-                  initial_backfill_minutes: int | None, relevance_terms: list[str] | None,
-                  ai_settings: dict | None, timings: dict[str, float], existing_item_id: int | None = None) -> str:
-    now = NOW()
-    from .workflow import Work, resolve_steps
-    from .runtime import BudgetDeferred, cache_key
-    memory_mode = (ai_settings or {}).get("memory_mode", "off")
-    memory_enforced = memory_mode == "enforce"
-    publisher_name = item.get("publisher_name") or source["name"]
-    editor_source = dict(source)
-    editor_source["name"] = publisher_name
-    if item.get("publisher_name") and not (int(source["priority"]) == 3
-            and source["reputation"] == "reputable_media"
-            and (source["source_role"] if "source_role" in source.keys() else "aggregator") == "publisher"):
-        editor_source["reputation"] = "unknown"
-    body = item.get("content") or item.get("description") or item["title"]
-    content_hash, title_hash = digest(body), digest(item["title"].lower().strip())
-    source_status = item.get("primary_source_status") or "NOT_CHECKED"
-    primary_source = _primary_source_from_item(item, source_status)
-    item_id = _save_item(db, source, item, existing_item_id)
-    if item_id is None:
-        return "DUPLICATE"
-    db.commit()
-    from .keyword_filter import screen as screen_keywords
-    from contextlib import nullcontext
-    filter_runtime = (ai_settings or {}).get('_runtime')
-    with (filter_runtime.measure('keyword_filter', 'filter', {'item_id': item_id, 'source_id': source['source_id']})
-          if filter_runtime else nullcontext()):
-        keyword_outcome = screen_keywords(db, item_id, item, ai_settings or {})
-    if keyword_outcome:
-        _trace_item(item, 'Первый фильтр', keyword_outcome, item['_retry_reason'])
-        return keyword_outcome
-    intake_authoritative = (ai_settings or {}).get('_keyword_prefilter', {}).get('mode') == 'intake_rules'
-    if is_non_news_telegram_format(source, item):
-        _trace_item(item, "Формат материала", "Отсеян", "Сообщение не является новостной публикацией.")
-        db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
-        db.commit()
-        return "NOISE"
-    from .policy import admission
-    date_pending = not item.get('published_at')
-    date_issue = admission(db, item_id, item, source, freshness_hours, initial_backfill_minutes)
-    age_hours = 0  # Admission owns date decisions; queue waiting is never article age.
-    if date_issue:
-        outcome, reason = date_issue
-        item['_retry_reason'] = reason
-        _trace_item(item, 'Окно поступления', outcome, reason)
-        db.execute('UPDATE items SET disposition=?,processed_at=? WHERE item_id=?', (outcome, now, item_id))
-        db.commit()
-        return outcome
-    # Use the headline and publisher's summary for topic screening; long article bodies can mention unrelated keywords.
-    relevance_text = f"{item['title']} {item.get('description', '')}"
-    if source["type"] == "manual" and item.get("material_read") is True:
-        # A manually submitted page has no RSS summary. Use only its opening excerpt
-        # for the cheap topic prefilter; the normal AI triage and full checks still decide relevance.
-        excerpt_limit = 12000 if item.get("screening_primary_source") is True else 2200
-        relevance_text += " " + str(item.get("screening_excerpt") or "")[:excerpt_limit]
-    thematic = (ai_settings or {}).get('_topic_registry')
-    if thematic is not None:
-        relevance_terms = []  # Ignore legacy terms embedded in persisted jobs.
-        if not thematic.get('topics'):
-            _trace_item(item, "Тематический фильтр", "Отсеян", "В таблице нет включённых тем мониторинга.")
-            item["_retry_reason"] = "В темнике нет включённых тем; настройка требует исправления."
-            db.execute("UPDATE items SET disposition='TECHNICAL_ERROR',processed_at=? WHERE item_id=?", (now, item_id))
-            db.commit()
-            return "TECHNICAL_ERROR"
-    # Local keyword intake has already passed. The later editor evaluates the
-    # read material's meaning; no AI triage runs before reading.
-    from .material_flow import load_draft_context
-    resume_context = load_draft_context(db, item_id, item, ai_settings or {})
-    if resume_context:
-        _trace_item(item, 'Продолжение обработки', 'Написание',
-                    'Сохранённый анализ действителен; чтение и полный анализ не повторяются.')
-        return (yield from _finish_post_steps(db, item, ai_settings or {}, resume_context))
-    selection = None
-    if source["type"] in {"rss", "web", "google_news", "web_search", "x", "telegram"} and item.get("primary_source_status") is None:
-        stage_started = time.perf_counter()
-        db.commit()
-        read_key = cache_key("read", {"item": {key: value for key, value in item.items() if not key.startswith('_')},
-                                     "source": {key: dict(source).get(key) for key in ('name','type','source_role','priority','reputation')},
-                                     "reader_version": 1})
-        read = yield Work("collector", _read_material_work, (dict(item), dict(source), publisher_name),
-                          key=read_key, ttl=180)
-        body = read["body"]
-        item.update(read["item"])
-        timings["primary_source_read_seconds"] += time.perf_counter() - stage_started
-        source_status = item.get("primary_source_status", "ARTICLE_UNREADABLE")
-        primary_source = _primary_source_from_item(item, source_status)
-        read_reason = ("Материал прочитан; текст сохранён для проверки." if source_status == "READ" or item.get('material_read') is True
-                       else f"Не удалось прочитать материал ({source_status}).")
-        _trace_item(item, "Чтение материала", source_status, read_reason)
-        content_hash = digest(body)
-        title_hash = digest(item["title"].lower().strip())
-        duplicate = db.execute('SELECT item_id FROM items WHERE source_id=? AND content_hash=? AND item_id<>?',
-                               (source['source_id'], content_hash, item_id)).fetchone()
-        if duplicate:
-            # Distinct discovery URLs may resolve to the same publisher text.
-            # Preserve this read under its own version before closing the copy;
-            # do not overwrite the original item or invent a different hash.
-            from .material_flow import put
-            put(db, item_id, 'reading', read_key, read)
-            _trace_item(item, 'Повтор материала', 'Дубликат',
-                        'Прочитанный текст совпадает с ранее сохранённым материалом этого источника.')
-            db.execute("UPDATE items SET disposition='DUPLICATE',processed_at=? WHERE item_id=?", (now, item_id))
-            db.commit()
-            return 'DUPLICATE'
-        db.execute("""UPDATE items SET title=?,description=?,content=?,content_hash=?,title_hash=?,primary_source_json=?,published_at=?
-                      WHERE item_id=?""",
-                   (item["title"], item.get("description", ""), body, content_hash, title_hash,
-                    _stored_primary(item, primary_source, source_status), item.get('published_at'),
-                    item_id))
-
-    publisher_report = (_read_material_report(source, item, body)
-                        if not primary_source or source_status != "READ" else None)
-    # Linked originals have already been attempted. Search recovery must not hold
-    # an otherwise readable account hostage to an unavailable original.
-    if not publisher_report and (not primary_source or source_status != "READ") and ai_settings and _likely_local(item) and (selection is None or selection["decision"] == "KEEP"):
-        agent_mode = ai_settings.get("research_agent_mode", "active")
-        if (web_search_enabled(ai_settings) and agent_mode in {"active", "shadow"}
-                and int(ai_settings.get("_research_agent_budget", 0)) > 0):
-            ai_settings["_research_agent_budget"] -= 1
-            agent_started = time.perf_counter()
-            if agent_mode == "active":
-                recovered = yield from resolve_steps(_agent_recover_primary(db, item, ai_settings, source, item_id, steps=True))
-            else:
-                yield from resolve_steps(_shadow_research_agent(item, ai_settings, source, steps=True))
-                recovered = yield from resolve_steps(_recover_primary(db, item, ai_settings, steps=True))
-            timings["research_agent_seconds"] += time.perf_counter() - agent_started
-        else:
-            recovered = yield from resolve_steps(_recover_primary(db, item, ai_settings, steps=True))
-        if recovered:
-            recovered_status = recovered.get("primary_source_status") or "NOT_CHECKED"
-            if (recovered_status == "READ" and recovered.get("primary_source_url")
-                    and recovered.get("primary_source_content")):
-                item.update({key: value for key, value in recovered.items() if key.startswith("primary_source_")})
-                source_status = recovered_status
-                primary_source = _primary_source_from_item(item, source_status)
-                db.execute("UPDATE items SET primary_source_json=? WHERE item_id=?",
-                           (_stored_primary(item, primary_source, source_status), item_id))
-            elif (recovered.get("material_read") is True
-                  and str(recovered.get("content") or "").strip()):
-                publisher_report = {
-                    "publisher": recovered.get("publisher_name") or "Издание",
-                    "url": recovered["url"], "title": recovered.get("title", ""),
-                    "content": recovered["content"], "type": "ATTRIBUTED_REPORT",
-                    "material_read": True,
-                    "published_at": recovered.get("published_at"),
-                    "source_role": source["source_role"] if "source_role" in source.keys() else "aggregator",
-                    "forwarded": False,
-                }
-                # Preserve the actual recovered account for a resumed editor;
-                # another retry must not discard already-read evidence.
-                body = recovered['content']
-                item.update(content=body, material_read=True, material_url=recovered['url'],
-                            publisher_name=publisher_report['publisher'])
-                db.execute('UPDATE items SET content=?,content_hash=?,primary_source_json=? WHERE item_id=?',
-                           (body, digest(body), _stored_primary(item, primary_source, source_status), item_id))
-            _trace_item(item, "Резервный поиск источника",
-                        "Первоисточник прочитан" if primary_source and source_status == "READ" else "Прочитан материал другого СМИ",
-                        "Найденный полный текст передан на обычную проверку с сохранением ссылки и атрибуции.",
-                        recovered_url=recovered.get("primary_source_url") or recovered.get("url"),
-                        recovered_publisher=recovered.get("primary_source_publisher") or recovered.get("publisher_name"))
-
-    if publisher_report:
-        # Retain the original's actual status in items; use only the read report
-        # for evidence, memory and the citation (never unread/OCR document text).
-        primary_source = None
-    if (not primary_source or source_status != "READ") and not publisher_report:
-        held = "PRIMARY_RETRY"
-        _trace_item(item, "Проверка источника", held,
-                    "Для следующего этапа пока нет прочитанного пригодного материала.",
-                    source_status=source_status)
-        db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (held, now, item_id))
-        db.commit()
-        return held
-
-    date_issue = admission(db, item_id, item, source, freshness_hours,
-                           initial_backfill_minutes, after_read=True)
-    if date_issue:
-        outcome, reason = date_issue
-        item['_retry_reason'] = reason
-        _trace_item(item, 'Дата источника после чтения', outcome, reason)
-        db.execute('UPDATE items SET disposition=?,processed_at=? WHERE item_id=?', (outcome, now, item_id))
-        db.commit()
-        return outcome
-
-    story_rows = db.execute("SELECT * FROM stories ORDER BY last_updated_at DESC LIMIT 1000").fetchall()
-    candidate = f"{item['title']} {item.get('description','')} {body}"
-    best, score = None, 0.0
-    ranked = []
-    for story in story_rows:
-        s = similarity(candidate, story["canonical_topic"] + " " + story["headline"] + " " + story["latest_information"])
-        ranked.append((s, story))
-        if s > score:
-            best, score = story, s
-    ai_result = None
-    ai_settings = ai_settings or {}
-    if not ai_settings.get("_disabled_for_cycle") and ai_settings.get("_analysis_budget", 1) > 0 and get_api_key(ai_settings):
-        if "_analysis_budget" in ai_settings:
-            ai_settings["_analysis_budget"] -= 1
-        shortlist = [row for _, row in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:8]]
-        if memory_mode in {"shadow", "enforce"}:
-            from .knowledge import related_story_ids
-            related = related_story_ids(db, candidate + ' ' + (primary_source or publisher_report or {}).get('content',''))
-            structured = [db.execute('SELECT * FROM stories WHERE story_id=?',(sid,)).fetchone() for sid in related]
-            shortlist = (structured + [row for row in shortlist if row['story_id'] not in related])[:12]
-            story_rows = list(story_rows) + [row for row in structured if row['story_id'] not in {s['story_id'] for s in story_rows}]
-        from .compact_editor import enabled as compact_editor_enabled
-        compact_editor = compact_editor_enabled(ai_settings)
-        if compact_editor:
-            shortlist = shortlist[:4]
-        ai_candidates = [{"story_id": str(s["story_id"]), "headline": s["headline"],
-                          "latest_information": s["latest_information"][:1200], "version": s["version"],
-                          "publication_count": s["publication_count"],
-                          "last_published_at": s["last_published_at"]} for s in shortlist]
-        ai_options = dict(ai_settings)
-        ai_options['_analysis_only'] = True
-        ai_options["max_post_length"] = max_length
-        try:
-            ai_input = {key: value for key, value in item.items()
-                        if key not in {"_audit_trace", "_audit_triage"}}
-            ai_input["primary_source"] = primary_source
-            ai_input["primary_source_status"] = source_status
-            ai_input["publisher_report_exception"] = bool(publisher_report)
-            ai_input["publisher_report"] = publisher_report
-            ai_input["independent_sources"] = item.get("independent_sources", [])
-            ai_input["history_context"] = [] if compact_editor else _history_context(db, item)
-            from .interests import learning_context
-            ai_input["interest_profile"] = {}
-            if memory_mode in {"shadow", "enforce"}:
-                if compact_editor:
-                    from .compact_editor import context
-                else:
-                    from .knowledge import context
-                ai_input["knowledge_context"] = context(db, [s['story_id'] for s in shortlist])
-            ai_input['editorial_examples'] = []
-            previous_analysis = db.execute("SELECT result_json FROM item_analysis WHERE item_id=?", (item_id,)).fetchone()
-            ai_input['editorial_feedback'] = []
-            if previous_analysis:
-                previous_result = json.loads(previous_analysis["result_json"])
-                ai_input["editorial_feedback"] = [
-                    issue for key in ("editorial_issues", "memory_issues", "source_review_issues")
-                    for issue in (previous_result.get(key) if isinstance(previous_result.get(key), list) else [])
-                    if isinstance(issue, str)
-                ]
-                evidence_source = primary_source or publisher_report or {}
-                if (previous_result.get('source_review_required') is True
-                        and not previous_result.get('source_review_issues')
-                        and (publisher_report or str(evidence_source.get('type', '')).startswith(('ORIGINAL_MEDIA_', 'ORIGINAL_SOCIAL_')))):
-                    ai_input['editorial_feedback'].extend(_source_evidence_issues(
-                        previous_result, str(evidence_source.get('content') or '')))
-                from .material_flow import verification_questions
-                ai_input["editorial_feedback"].extend(verification_questions(previous_result))
-                date_check = previous_result.get("development_date_check")
-                if isinstance(date_check, dict) and isinstance(date_check.get("reason"), str):
-                    ai_input["editorial_feedback"].append("Проверка даты события: " + date_check["reason"])
-            stage_started = time.perf_counter()
-            history_revision = _editor_history_revision(db, item)
-            from .ai import _load_editorial_rules
-            rules = _load_editorial_rules(ai_options)
-            if compact_editor:
-                rules += _load_editorial_rules(ai_options, 'drafting')
-            logic = (Path(__file__).resolve().parent.parent / "AGENT_LOGIC.md").read_text()
-            semantic_settings = {key: value for key, value in ai_options.items()
-                                 if key in {"model", "max_output_tokens", "max_post_length", "memory_mode"}}
-            from .ai import analysis_input
-            analysis_key = cache_key("editor", {"input": analysis_input(ai_input, editor_source, ai_candidates, ai_options),
-                "settings": semantic_settings,
-                "rules": digest(rules), "logic": digest(logic), "filter_version": FILTER_VERSION,
-                "prompt_code": digest((Path(__file__).resolve().parent / 'ai.py').read_text()
-                                      + (Path(__file__).resolve().parent / 'knowledge.py').read_text()
-                                      + (Path(__file__).resolve().parent / 'compact_editor.py').read_text()),
-                "date": now[:10]})
-            db.commit()
-            try:
-                try:
-                    ai_result = yield Work("editor", analyze_with_ai, (ai_input, editor_source, ai_candidates, ai_options),
-                                           key=analysis_key, ttl=21600,
-                                           stage='editorial_draft' if compact_editor else 'editorial')
-                except AIResponseError as exc:
-                    if exc.code != "OUTPUT_TOKEN_LIMIT":
-                        raise
-                    retry_options = dict(ai_options)
-                    retry_options["max_output_tokens"] = max(8000, int(ai_options.get("max_output_tokens", 1800)) * 3)
-                    ai_result = yield Work("editor", analyze_with_ai, (ai_input, editor_source, ai_candidates, retry_options),
-                                           key=analysis_key, ttl=21600,
-                                           stage='editorial_draft' if compact_editor else 'editorial')
-            finally:
-                timings["ai_seconds"] += time.perf_counter() - stage_started
-            if (ai_result is not None and ai_result.get('action') != 'NOISE'
-                    and _editor_history_revision(db, item) != history_revision):
-                item["_retry_without_count"] = True
-                item['_history_changed'] = True
-                item["_retry_reason"] = "Разбор отложен: история сюжета или публикаций изменилась во время анализа"
-                db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
-                db.commit()
-                return "AI_RETRY"
-        except BudgetDeferred as exc:
-            item["_retry_without_count"] = True
-            item['_budget_deferred'] = exc.reason != 'concurrency'
-            item['_retry_delay_seconds'] = exc.delay_seconds
-            item["_retry_reason"] = "ИИ-разбор отложен: "+exc.user_reason
-            item['_flow_block_kind'] = exc.block_kind
-            ai_result = None
-        except Exception as exc:
-            http_status = re.search(r"HTTP (\d{3})", str(exc))
-            if http_status:
-                reason = f"HTTP {http_status.group(1)}"
-            elif isinstance(exc, AIResponseError):
-                reason = exc.code
-            else:
-                reason = _safe_source_error(exc.__cause__ or exc)
-            db.execute("INSERT INTO errors(source_id,timestamp,message) VALUES(?,?,?)",
-                       (source["source_id"], NOW(), f"AI editor unavailable ({reason}); item held for automatic retry."))
-            db.commit()
-            from .diagnostics import error_location
-            db.execute("INSERT INTO app_state(key,value) VALUES('ai_last_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       (json.dumps({"at":NOW(),"code":reason,"location":error_location(exc)}),))
-            db.commit()
-            # Item-level errors must not stall unrelated material. Shared
-            # account failures are held centrally by runtime admission.
-            from .runtime import account_unavailable
-            if account_unavailable(reason):
-                ai_settings["_disabled_for_cycle"] = True
-            ai_result = None
-            from .material_flow import technical_error
-            item['_technical_error'] = technical_error(exc)
-            item['_flow_block_kind'] = 'account' if account_unavailable(reason) else 'technical' if item['_technical_error'] else 'transport'
-            item["_retry_reason"] = f"ИИ-разбор не завершён: {reason}"
-            item["_retry_without_count"] = account_unavailable(reason)
-            if account_unavailable(reason):
-                item['_retry_delay_seconds'] = getattr(ai_settings.get('_runtime'), 'account_cooldown_seconds', 900)
-            _trace_item(item, "Редакторский ИИ-разбор", "Ошибка", item["_retry_reason"])
-        if ai_result is not None:
-            if intake_authoritative:
-                ai_result['is_relevant'] = True
-            _trace_item(item, "Редакторский ИИ-разбор", "Завершён",
-                        "ИИ подготовил результат редакторского разбора.",
-                        action=ai_result.get("action"), recommendation=ai_result.get("publication_recommendation"))
-            db.execute("INSERT INTO app_state(key,value) VALUES('ai_last_success',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (NOW(),))
-            # Missing evidence is not evidence of irrelevance. Keep plausible local
-            # stories for source recovery; duplicates need no new publication evidence.
-            missing_local_source = (selection is None and not publisher_report and (source_status != "READ" or not primary_source)
-                and ai_result.get("action") != "DUPLICATE"
-                and (_likely_local(item) or (ai_result.get("is_relevant") and ai_result.get("geographic_scope") in {"RUSSIA","CIS","RUSSIA_CIS"})))
-            if missing_local_source:
-                ai_result["action"] = "NEW_STORY"
-                ai_result["is_relevant"] = True
-                ai_result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
-            # Reject irrelevant entries even when their source cannot be read.
-            if not intake_authoritative and not missing_local_source and ai_result.get("action") != "DUPLICATE" and (ai_result.get("is_relevant") is False or ai_result.get("action") == "NOISE"
-                    or ("_topic_registry" not in ai_settings and ai_result.get("geographic_scope") in {"OTHER", "GLOBAL"}
-                        and ai_result.get("russia_cis_impact") in {"NONE", "INDIRECT"})):
-                ai_result["action"] = "NOISE"
-                ai_result["publication_recommendation"] = "DO_NOT_PUBLISH"
-            if memory_enforced and ai_result.get('action') == 'DUPLICATE':
-                ai_result['proposed_action'] = 'DUPLICATE'
-                ai_result['action'] = 'UPDATE' if ai_result.get('story_id') else 'NEW_STORY'
-            ai_result = _restore_exact_social_headline_evidence(ai_result, item, primary_source)
-            ai_result = require_primary_source_review(ai_result, source_status, primary_source,
-                                                       publisher_report=publisher_report,
-                                                       analysis_only=(ai_result.get('_needs_post_draft') is True
-                                                                      or ai_result.get('_combined_editor') is True))
-            independent_audit = [
-                {"publisher": candidate.get("publisher"), "title": candidate.get("title"),
-                 "url": candidate.get("url"), "published_at": candidate.get("published_at"),
-                 "primary_source_url": candidate.get("primary_source_url"),
-                 "content_sha256": digest(candidate.get("content", ""))}
-                for candidate in item.get("independent_sources", [])
-            ]
-            db.execute("INSERT INTO item_analysis(item_id,model,created_at,result_json) VALUES(?,?,?,?) "
-                       "ON CONFLICT(item_id) DO UPDATE SET model=excluded.model,created_at=excluded.created_at,result_json=excluded.result_json",
-                       (item_id, ai_options.get("model", "gpt-6-luna"), now,
-                        json.dumps({**ai_result, "_filter_version": FILTER_VERSION,
-                                    "_independent_sources": independent_audit}, ensure_ascii=False)))
-            date_issue = _development_date_issue(ai_result, primary_source or publisher_report,
-                                                 freshness_hours, item.get('published_at'))
-            if date_issue:
-                severity, reason = date_issue
-                ai_result["development_date_check"] = {"status": severity.upper(), "reason": reason}
-                if severity == "stale":
-                    ai_result["publication_recommendation"] = "DO_NOT_PUBLISH"
-                    disposition = "REJECTED"
-                else:
-                    ai_result["publication_recommendation"] = "WAIT_FOR_AUTOMATION"
-                    ai_result["source_review_required"] = True
-                    disposition = "WAITING_CONFIRMATION"
-                _trace_item(item, "Проверка даты события", disposition, reason,
-                            development_date=ai_result.get("development_date"))
-                db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                           (json.dumps({**ai_result, "_filter_version": FILTER_VERSION,
-                                        "_independent_sources": independent_audit}, ensure_ascii=False), item_id))
-                db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?",
-                           (disposition, now, item_id))
-                db.commit()
-                return disposition
-
-    if ai_result is None:
-        held = "AI_RETRY" if (source_status == "READ" and primary_source) or publisher_report else "PRIMARY_RETRY"
-        if not item.get("_retry_reason"):
-            if ai_settings.get("_disabled_for_cycle"):
-                item["_retry_reason"] = "ИИ-разбор отложен: модель временно недоступна в этом цикле"
-                item["_retry_without_count"] = True
-            elif ai_settings.get("_analysis_budget", 1) <= 0:
-                item["_retry_reason"] = "ИИ-разбор отложен: исчерпан лимит проверок текущего цикла"
-                item["_retry_without_count"] = True
-                item['_budget_deferred'] = True
-            else:
-                item["_retry_reason"] = "ИИ-разбор отложен: проверьте настройки доступа модели"
-                item["_retry_without_count"] = True
-        _trace_item(item, "Редакторский ИИ-разбор", "Ожидает повтора", item["_retry_reason"])
-        db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (held, now, item_id))
-        db.commit()
-        return held
-
-    if (ai_result and ai_result.get("publication_recommendation") == "WAIT_FOR_AUTOMATION"
-            and (source_status != "READ" or not primary_source) and not publisher_report):
-        _trace_item(item, "Проверка источника", "Ожидает повтора",
-                    "Разбор завершён, но нет прочитанного материала, на котором можно обосновать публикацию.",
-                    source_status=source_status)
-        db.execute("UPDATE items SET disposition='PRIMARY_RETRY',processed_at=? WHERE item_id=?", (now, item_id))
-        db.commit()
-        return "PRIMARY_RETRY"
-
-    ai_story = None
-    if ai_result:
-        chosen_id = ai_result.get("story_id")
-        ai_story = next((s for s in story_rows if str(s["story_id"]) == chosen_id), None)
-        action = ai_result.get("action")
-        if action == "DUPLICATE" and not memory_enforced:
-            _trace_item(item, "Сверка с опубликованными сюжетами", "Дубликат",
-                        "ИИ сопоставил материал с уже опубликованным сюжетом.")
-            if ai_story:
-                db.execute("UPDATE items SET story_id=?,disposition='DUPLICATE',processed_at=? WHERE item_id=?",
-                           (ai_story["story_id"], now, item_id))
-            else:
-                db.execute("UPDATE items SET disposition='DUPLICATE',processed_at=? WHERE item_id=?", (now, item_id))
-            db.commit()
-            return "DUPLICATE"
-        category = ai_result.get("topic_category")
-        concrete_tech = category in {"PRODUCT_FEATURE", "TECHNICAL_DEVELOPMENT"}
-        geographic_scope = ai_result.get("geographic_scope")
-        implementation_stage = ai_result.get("implementation_stage")
-        allowed_tech_stages = {"OPERATIONAL", "RELEASED", "PILOT", "DETAILED_PLAN"}
-        tech_not_in_scope = concrete_tech and (
-            not ai_result.get("is_concrete") or geographic_scope not in {"RUSSIA", "CIS", "RUSSIA_CIS"}
-            or implementation_stage not in allowed_tech_stages
-        )
-        outside_target_market = geographic_scope not in {"RUSSIA", "CIS", "RUSSIA_CIS"}
-        evidence_source = primary_source or publisher_report
-        direct_impact = ai_result.get("russia_cis_impact") == "DIRECT" and _impact_evidence_is_grounded(ai_result, evidence_source)
-        if intake_authoritative:
-            direct_impact = item.get('_intake_filter', {}).get('passed') is True
-            tech_not_in_scope = outside_target_market = False
-        elif '_topic_registry' in ai_settings:
-            from .topic_registry import grounded_match
-            direct_impact = grounded_match(ai_result, ai_settings['_topic_registry'], evidence_source)
-            tech_not_in_scope = False
-            outside_target_market = False
-        legacy_price_excluded = '_topic_registry' not in ai_settings and category == 'PRICE_FORECAST'
-        if ((not intake_authoritative and (not ai_result.get("is_relevant") or action == "NOISE")) or not direct_impact or legacy_price_excluded
-                or tech_not_in_scope or outside_target_market):
-            filter_reasons = []
-            if not ai_result.get("is_relevant") or action == "NOISE":
-                filter_reasons.append("ИИ не подтвердил тематическую значимость")
-            if not direct_impact:
-                filter_reasons.append("не подтверждена связь с включённой темой таблицы" if "_topic_registry" in ai_settings else "не подтверждено прямое влияние на Россию/СНГ")
-            if legacy_price_excluded:
-                filter_reasons.append("ценовой прогноз исключён редакционными правилами")
-            if tech_not_in_scope:
-                filter_reasons.append("техническая новость не прошла требования к конкретности, географии или стадии")
-            if outside_target_market:
-                filter_reasons.append("событие вне целевой географии")
-            _trace_item(item, "Тематический и географический допуск", "Отсеян",
-                        "; ".join(filter_reasons) or "Не выполнены условия допуска.",
-                        geographic_scope=geographic_scope, category=category,
-                        impact=ai_result.get("russia_cis_impact"), evidence=ai_result.get("impact_evidence"))
-            db.execute("UPDATE items SET disposition='NOISE',processed_at=? WHERE item_id=?", (now, item_id))
-            db.commit()
-            return "NOISE"
-        if memory_enforced:
-            from .knowledge import exact_story, MemoryInvalid
-            try:
-                resolved_story_id = exact_story(db, ai_result.get('memory'))
-            except MemoryInvalid as exc:
-                ai_result['memory_issues'] = [str(exc)]
-                _trace_item(item, "Проверка памяти сюжетов", "Нужна повторная проверка", str(exc))
-                db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                           (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
-                db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION',processed_at=? WHERE item_id=?",(now,item_id))
-                db.commit()
-                return 'WAITING_CONFIRMATION'
-            if resolved_story_id:
-                ai_story = db.execute('SELECT * FROM stories WHERE story_id=?',(resolved_story_id,)).fetchone()
-                action = ai_result['action'] = 'UPDATE'
-                ai_result['story_id'] = str(resolved_story_id)
-        if (action == "UPDATE" or (memory_enforced and action == "DUPLICATE")) and ai_story:
-            best = ai_story
-        elif action == "NEW_STORY":
-            best = None
-        elif action == "UPDATE":
-            # Reject a model reference to an unavailable story; create a distinct story instead.
-            best = None
-
-    if best and (ai_result is not None or score >= threshold):
-        has_previous_publication = int(best["publication_count"] or 0) > 0
-        story_id = best["story_id"]
-        # The AI's explicit UPDATE decision may share most of the old wording while adding one crucial fact.
-        # Use similarity as a repeat filter only when there is no explicit material-update decision.
-        if (not memory_enforced and (ai_result is None or ai_result.get("action") != "UPDATE")
-                and similarity(candidate, best["latest_information"]) > 0.8):
-            _trace_item(item, "Сверка с известным сюжетом", "Дубликат",
-                        "Существенное новое сведение не найдено; содержание совпадает с уже известным сюжетом.")
-            db.execute("UPDATE items SET story_id=?,disposition='DUPLICATE',processed_at=? WHERE item_id=?",
-                       (story_id, now, item_id))
-            db.commit()
-            return "DUPLICATE"
-        db.execute("UPDATE items SET story_id=?,disposition='UPDATE_CANDIDATE',processed_at=? WHERE item_id=?", (story_id, now, item_id))
-        db.execute("UPDATE stories SET last_updated_at=?, last_source_published_at=COALESCE(?,last_source_published_at), latest_information=?, source_count=(SELECT COUNT(DISTINCT source_id) FROM items WHERE story_id=?) WHERE story_id=?",
-                   (now, item.get("published_at"), body[:2000], story_id, story_id))
-        db.execute("INSERT OR IGNORE INTO story_timeline(story_id,item_id,timestamp,source_name,new_information,confidence) VALUES(?,?,?,?,?,?)",
-                   (story_id, item_id, item.get("published_at") or now, publisher_name, body[:2000], min(0.99, score + 0.45)))
-        status = "UPDATE_CANDIDATE"
-        headline = (ai_result.get("headline_ru") or best["headline"]) if ai_result else best["headline"]
-    else:
-        cur = db.execute("INSERT INTO stories(canonical_topic,headline,first_seen_at,last_updated_at,last_source_published_at,latest_information,keywords) VALUES(?,?,?,?,?,?,?)",
-                         (item["title"], item["title"], now, now, item.get("published_at"), body[:2000], json.dumps(sorted(terms(candidate)), ensure_ascii=False)))
-        story_id = cur.lastrowid
-        db.execute("UPDATE items SET story_id=?,disposition='NEW_STORY',processed_at=? WHERE item_id=?", (story_id, now, item_id))
-        db.execute("INSERT INTO story_timeline(story_id,item_id,timestamp,source_name,new_information,confidence) VALUES(?,?,?,?,?,?)",
-                   (story_id, item_id, item.get("published_at") or now, publisher_name, body[:2000], 0.6))
-        status = "NEW_STORY"
-        headline = ai_result.get("headline_ru") or item["title"] if ai_result else item["title"]
-    _trace_item(item, "Сюжет и черновик", status,
-                "Новое событие передано на автоматический допуск." if status == "NEW_STORY"
-                else "Новые сведения добавлены к известному сюжету и переданы на автоматический допуск.",
-                what_is_new=(ai_result or {}).get("what_is_new"))
-    memory_diff = None
-    if memory_mode in {"shadow", "enforce"}:
-        from .knowledge import ingest, MemoryInvalid
-        try:
-            memory_diff = ingest(db, item_id, story_id, ai_result, primary_source or publisher_report,
-                                 publisher_report=bool(publisher_report))
-        except MemoryInvalid as exc:
-            ai_result['memory_issues'] = [str(exc)]
-            _trace_item(item, "Проверка памяти сюжетов", "Нужна повторная проверка", str(exc))
-            if memory_enforced:
-                ai_result['publication_recommendation'] = 'WAIT_FOR_AUTOMATION'
-        else:
-            ai_result['story_diff'] = memory_diff
-            if memory_enforced and memory_diff['conflict_state'] != 'NONE':
-                ai_result['publication_recommendation'] = 'WAIT_FOR_AUTOMATION'
-                queued_corrections = []
-                correction_owner = str(ai_settings.get("_correction_owner_chat_id") or "")
-                changed_fact_ids = list(dict.fromkeys(
-                    memory_diff.get("contradicted_facts", []) + memory_diff.get("changed_facts", [])))
-                if correction_owner and primary_source and source_status == "READ" and changed_fact_ids:
-                    old_claims = db.execute(
-                        "SELECT DISTINCT p.post_id FROM fact_relations r "
-                        "JOIN post_facts pf ON pf.fact_id=r.old_fact_id "
-                        "JOIN posts p ON p.post_id=pf.post_id "
-                        "WHERE r.new_fact_id IN (" + ",".join("?" for _ in changed_fact_ids) + ") "
-                        "AND r.relation IN ('CONTRADICTS','SUPERSEDES','RETRACTS') "
-                        "AND p.story_id=? AND p.status='PUBLISHED' "
-                        "ORDER BY p.published_at DESC LIMIT 3",
-                        (*changed_fact_ids, story_id),
-                    ).fetchall()
-                    if old_claims:
-                        from .review import enqueue_agent_fact_correction
-                        for claim in old_claims:
-                            correction_id = enqueue_agent_fact_correction(
-                                db, item_id=item_id, story_id=story_id,
-                                post_id=claim["post_id"], owner_chat_id=correction_owner)
-                            if correction_id:
-                                queued_corrections.append(correction_id)
-                if queued_corrections:
-                    disposition = "AGENT_CORRECTION_QUEUED"
-                    _trace_item(item, "Самостоятельная проверка опубликованного поста", disposition,
-                                "Новый прочитанный источник противоречит факту в опубликованном посте; правка поставлена в обычную редакторскую очередь.",
-                                correction_ids=queued_corrections)
-                    db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?",
-                               (disposition, now, item_id))
-                    db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                               (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
-                    db.commit()
-                    return disposition
-                _trace_item(item, "Проверка памяти сюжетов", "Нужна повторная проверка",
-                            "Найден конфликт между новым материалом и сохранёнными сведениями.",
-                            conflict_state=memory_diff.get('conflict_state'))
-            elif memory_enforced and not memory_diff['significant_update']:
-                disposition = 'STORE_ONLY' if memory_diff['unpublished_facts'] else 'DUPLICATE'
-                _trace_item(item, "Проверка новизны сюжета", disposition,
-                            "Нового существенного повода для отдельной публикации не найдено.")
-                if memory_diff['unpublished_facts'] and ai_result.get('publication_recommendation') == 'AUTO_PUBLISH':
-                    ai_result['memory_issues'] = ['PUBLICATION_RECOMMENDATION_WITHOUT_MATERIAL_FACT: оцените существенность для читателя, а не новизну для памяти; REPEAT неопубликованного факта допускает material=true']
-                    disposition = 'WAITING_CONFIRMATION'
-                    _trace_item(item, "Проверка допуска", disposition,
-                                "Рекомендация к публикации не подтверждена существенным новым фактом.")
-                db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (disposition,now,item_id))
-                db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                           (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
-                db.commit()
-                return disposition
-        db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                   (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
-    if ai_result:
-        recommendation = ai_result.get("publication_recommendation")
-        if recommendation != "AUTO_PUBLISH" or ai_result.get("source_review_required") is True:
-            if recommendation == "WAIT_FOR_AUTOMATION":
-                if (source_status != "READ" or not primary_source) and not publisher_report:
-                    disposition = "PRIMARY_RETRY"
-                else:
-                    retries = db.execute("SELECT CAST(value AS INTEGER) FROM app_state WHERE key=?", ("editor_retry:"+str(item_id),)).fetchone()
-                    disposition = "REJECTED" if retries and int(retries[0]) >= 3 else "WAITING_CONFIRMATION"
-            else:
-                disposition = "REJECTED"
-            from .material_flow import verification_questions
-            questions = verification_questions(ai_result)
-            ai_result['verification_questions'] = questions
-            reasons = list(questions)
-            if ai_result.get("memory_issues"):
-                reasons.extend(str(value) for value in ai_result["memory_issues"][:3])
-            if ai_result.get("source_review_required"):
-                reasons.append("нужна дополнительная проверка источника или доказательства")
-            if ai_result.get("independent_check_required"):
-                reasons.append("нужна сверка выявленного расхождения")
-            if not reasons:
-                reasons.append(f"редакторская рекомендация: {recommendation or 'не задана'}")
-            item["_retry_reason"] = "; ".join(reasons)
-            item["_flow_block_kind"] = "verification"
-            _trace_item(item, "Автоматический редакторский допуск", disposition,
-                        "; ".join(reasons))
-            db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (disposition, now, item_id))
-            db.commit()
-            return disposition
-    context = {
-        'ai_result': ai_result, 'item_id': item_id, 'primary_source': primary_source,
-        'publisher_report': publisher_report, 'status': status,
-        'has_previous_publication': has_previous_publication if best else False,
-        'headline': headline, 'source_status': source_status, 'publisher_name': publisher_name,
-        'memory_mode': memory_mode, 'memory_diff': memory_diff, 'memory_enforced': memory_enforced,
-        'story_id': story_id, 'best': dict(best) if best else None, 'body': body,
-        'source': dict(source), 'max_length': max_length,
-    }
-    if ai_result:
-        from .material_flow import save_draft_context
-        save_draft_context(db, item_id, item, ai_settings, context)
-    return (yield from _finish_post_steps(db, item, ai_settings, context))
-
-
-def _finish_post_steps(db, item, ai_settings, context):
-    from .workflow import Work
-    from .material_flow import mark
-    now = NOW()
-    ai_options = dict(ai_settings)
-    ai_options['_analysis_only'] = True
-    ai_options['max_post_length'] = context['max_length']
-    ai_result = context['ai_result']
-    item_id = context['item_id']
-    primary_source = context['primary_source']
-    publisher_report = context['publisher_report']
-    status = context['status']
-    has_previous_publication = context['has_previous_publication']
-    headline = context['headline']
-    source_status = context['source_status']
-    publisher_name = context['publisher_name']
-    memory_mode = context['memory_mode']
-    memory_diff = context['memory_diff']
-    memory_enforced = context['memory_enforced']
-    story_id = context['story_id']
-    best = context['best']
-    body = context['body']
-    source = context['source']
-    max_length = context['max_length']
-    material_ids = set((memory_diff or {}).get('material_unpublished_facts', []))
-    draft_source = primary_source or publisher_report or {}
-    draft_citation_name = draft_source.get('publisher') or ('Первоисточник' if primary_source else publisher_name)
-    draft_citation_url = draft_source.get('url') or item['url']
-    ai_options['_draft_contract'] = {
-        'dates': __import__('newsroom.policy', fromlist=['saved_date_context']).saved_date_context(context, item, draft_source, source),
-        'source_footer': make_post('', '', draft_citation_name, draft_citation_url, max_length, preserve_content=True).splitlines()[-1],
-        'text_field': 'what_is_new' if status == 'UPDATE_CANDIDATE' and has_previous_publication else 'summary_ru',
-        'has_previous_publication': bool(has_previous_publication),
-        'material_facts': [dict(row) for row in db.execute(
-            'SELECT fact_id,subject,predicate,value,statement,fact_type FROM story_facts WHERE fact_id IN ('
-            + (','.join('?' for _ in material_ids) or 'NULL') + ')', list(material_ids))],
-    }
-    if ai_result:
-        if ai_result.get('_needs_post_draft'):
-            from .ai import draft_post
-            mark(db, item_id, 'drafting', 'RUNNING')
-            db.commit()
-            try:
-                from .runtime import cache_key
-                from .ai import _load_editorial_rules
-                draft_key = cache_key('drafting', {'decision': ai_result, 'source': primary_source or publisher_report,
-                    'rules': _load_editorial_rules(ai_options, 'drafting'), 'model': ai_options.get('model'),
-                    'max_post_length': max_length, 'contract': ai_options['_draft_contract'],
-                    'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text())})
-                try:
-                    draft = yield Work('editor', draft_post,
-                        (ai_result, primary_source or publisher_report, ai_options), key=draft_key, ttl=21600)
-                except AIResponseError as exc:
-                    if exc.code != 'OUTPUT_TOKEN_LIMIT':
-                        raise
-                    retry_options = dict(ai_options)
-                    retry_options['max_output_tokens'] = max(8000, int(ai_options.get('max_output_tokens', 1800)) * 3)
-                    draft = yield Work('editor', draft_post,
-                        (ai_result, primary_source or publisher_report, retry_options), key=draft_key, ttl=21600)
-            except Exception as exc:
-                from .runtime import BudgetDeferred, account_unavailable
-                account_blocked = account_unavailable(getattr(exc, 'code', None))
-                item['_retry_without_count'] = isinstance(exc, BudgetDeferred) or account_blocked
-                if isinstance(exc, BudgetDeferred):
-                    item['_retry_delay_seconds'] = exc.delay_seconds
-                elif account_blocked:
-                    item['_retry_delay_seconds'] = getattr(ai_settings.get('_runtime'), 'account_cooldown_seconds', 900)
-                from .material_flow import technical_error
-                item['_technical_error'] = technical_error(exc)
-                item['_flow_block_kind'] = 'account' if account_blocked else 'technical' if item['_technical_error'] else exc.block_kind if isinstance(exc, BudgetDeferred) else 'transport'
-                item['_retry_reason'] = 'Написание поста отложено: ' + (exc.user_reason if isinstance(exc, BudgetDeferred) else getattr(exc, 'code', type(exc).__name__))
-                mark(db, item_id, 'drafting', 'WAITING', item['_retry_reason'],
-                     block_kind=item['_flow_block_kind'])
-                _trace_item(item, 'Написание поста', 'AI_RETRY', item['_retry_reason'])
-                db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
-                db.commit()
-                return 'AI_RETRY'
-            ai_result.update(draft)
-            ai_result['_needs_post_draft'] = False
-            ai_result['_validation_pending'] = True
-            context['ai_result'] = ai_result
-            from .material_flow import save_draft_context
-            save_draft_context(db, item_id, item, ai_settings, context)
-        draft = {key: ai_result.get(key, '') for key in ('headline_ru', 'summary_ru', 'what_is_new', 'editorial_check')}
-        from .policy import absolute_narration_dates
-        for key in ('headline_ru', 'summary_ru', 'what_is_new'):
-            draft[key] = absolute_narration_dates(draft.get(key, ''), ai_options['_draft_contract']['dates'])
-        from .runtime import cache_key
-        # Final validation checks freely written text; it does not repeat selection.
-        from .ai import validate_draft
-        field = ai_options['_draft_contract']['text_field']
-        text_to_check = make_post(draft.get('headline_ru', ''), draft.get(field, ''),
-                                  draft_citation_name, draft_citation_url, max_length,
-                                  preserve_content=True)
-        check_draft = {**draft, 'post_text': text_to_check}
-        mark(db, item_id, 'gate', 'RUNNING', 'Проверка фактов готового текста.')
-        db.commit()
-        try:
-            from .policy import relative_date_words
-            if relative_date_words(text_to_check):
-                checked = {'issues': ['Относительная дата без подтверждённой даты источника: укажи проверяемый абсолютный срок или изложи событие без придуманного календарного дня.'],
-                           'editorial_check': {}, 'covered_claims': []}
-            else:
-                check_key = cache_key('final-assembled-text', {'text': text_to_check, 'source': draft_source,
-                    'binding_retry': ai_result.get('_binding_check_attempt', 0),
-                    'contract': ai_options['_draft_contract'],
-                    'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text()),
-                    'policy': __import__('newsroom.policy', fromlist=['snapshot']).snapshot(ai_options)})
-                checked = yield Work('editor', validate_draft, (ai_result, draft_source, check_draft, ai_options),
-                                     key=check_key, ttl=21600, stage='verification')
-            from .knowledge import validate_post_bindings
-            bindings = validate_post_bindings(checked, material_ids, text_to_check)
-        except __import__('newsroom.knowledge', fromlist=['MemoryInvalid']).MemoryInvalid as exc:
-            # The checker produced an invalid binding, not a network failure.
-            # Retain the draft and bypass the cached malformed check on retry.
-            ai_result['_binding_check_attempt'] = int(ai_result.get('_binding_check_attempt', 0)) + 1
-            ai_result['_validation_pending'] = True
-            ai_result['editorial_issues'] = [str(exc)]
-            ai_result.pop('final_text_check', None)
-            context['ai_result'] = ai_result
-            from .material_flow import save_draft_context
-            save_draft_context(db, item_id, item, ai_settings, context)
-            item['_retry_reason'] = 'Исправление привязки фактов финальной проверки: ' + str(exc)
-            item['_flow_block_kind'] = 'verification'
-            item['_text_repair_ready'] = True
-            mark(db, item_id, 'gate', 'WAITING', item['_retry_reason'], block_kind='verification')
-            db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                       (json.dumps(ai_result, ensure_ascii=False), item_id))
-            db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION',processed_at=? WHERE item_id=?", (NOW(), item_id))
-            db.commit()
-            return 'WAITING_CONFIRMATION'
-        except Exception as exc:
-            from .runtime import BudgetDeferred, account_unavailable
-            from .material_flow import technical_error
-            account = account_unavailable(getattr(exc, 'code', None))
-            item['_technical_error'] = technical_error(exc)
-            item['_retry_without_count'] = isinstance(exc, BudgetDeferred) or account
-            item['_flow_block_kind'] = ('account' if account else 'technical' if item['_technical_error']
-                                       else exc.block_kind if isinstance(exc, BudgetDeferred) else 'transport')
-            item['_retry_reason'] = 'Проверка текста отложена: ' + (exc.user_reason if isinstance(exc, BudgetDeferred)
-                                                                  else getattr(exc, 'code', type(exc).__name__))
-            if isinstance(exc, BudgetDeferred): item['_retry_delay_seconds'] = exc.delay_seconds
-            db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
-            db.commit()
-            return 'AI_RETRY'
-        if checked['issues']:
-            item['_text_repair_ready'] = True
-            ai_result['editorial_issues'] = checked['issues']
-            ai_result['_needs_post_draft'] = True
-            ai_result['_validation_pending'] = False
-            ai_result.pop('final_text_check', None)
-            item['_retry_reason'] = '; '.join(checked['issues'])
-            context['ai_result'] = ai_result
-            from .material_flow import save_draft_context
-            save_draft_context(db, item_id, item, ai_settings, context)
-            db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                       (json.dumps(ai_result, ensure_ascii=False), item_id))
-            mark(db, item_id, 'drafting', 'WAITING', item['_retry_reason'], block_kind='verification')
-            db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION',processed_at=? WHERE item_id=?", (NOW(), item_id))
-            db.commit()
-            return 'WAITING_CONFIRMATION'
-        draft['editorial_check'] = checked['editorial_check']
-        if memory_diff:
-            memory_diff = {**memory_diff, 'post_claims': bindings}
-            context['memory_diff'] = memory_diff
-        ai_result['final_text_check'] = {'text_sha256': digest(text_to_check),
-                                       'assembled_sha256': digest(text_to_check),
-                                       'covered_claims': bindings}
-        mark(db, item_id, 'drafting', 'DONE', 'Текст подготовлен.')
-        ai_result.update(draft)
-        if isinstance(ai_result.get('original_reporting_check'), dict):
-            # Evidence was checked before writing. This flag now describes
-            # the writer's check of the actual text, not an unwritten draft.
-            ai_result['original_reporting_check'] = {
-                **ai_result['original_reporting_check'],
-                'attribution_preserved': (draft.get('editorial_check') or {}).get('attribution_preserved') is True,
-            }
-        ai_result['_needs_post_draft'] = False
-        from .material_flow import save_draft_context
-        context['ai_result'] = ai_result
-        save_draft_context(db, item_id, item, ai_settings, context)
-        headline = ai_result['headline_ru']
-        _trace_item(item, 'Написание поста', 'Завершён', 'Текст подготовлен после проверки актуальности и новизны.')
-        db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-            (json.dumps({**ai_result, '_filter_version': FILTER_VERSION}, ensure_ascii=False), item_id))
-        source_is_report = (bool(primary_source and str(primary_source.get("type") or "").startswith(("ORIGINAL_MEDIA_", "ORIGINAL_SOCIAL_")))
-                            if primary_source else bool(publisher_report))
-        # Check the assembled text, including the normalized source footer,
-        # before creating a post. The send boundary checks this same format.
-        preview = text_to_check
-        checked_headline, _, checked_body = preview.partition('\n')
-        issues = editorial_issues(checked_headline, checked_body, ai_result,
-                                 source_is_report=source_is_report)
-        from .news_series import split as split_news
-        try:
-            split_news(preview, max_length)
-        except ValueError as exc:
-            issues.append(str(exc))
-        if issues:
-            ai_result["editorial_issues"] = issues
-            item['_text_repair_ready'] = True
-            ai_result['_needs_post_draft'] = True
-            from .material_flow import save_draft_context
-            context['ai_result'] = ai_result
-            save_draft_context(db, item_id, item, ai_settings, context)
-            mark(db, item_id, 'drafting', 'WAITING', '; '.join(issues), block_kind='verification')
-            _trace_item(item, "Автоматическая проверка текста", "Нужна повторная проверка",
-                        "; ".join(issues), issues=issues)
-            db.execute("UPDATE item_analysis SET result_json=? WHERE item_id=?",
-                       (json.dumps({**ai_result, "_filter_version": FILTER_VERSION}, ensure_ascii=False), item_id))
-            retries = db.execute("SELECT CAST(value AS INTEGER) FROM app_state WHERE key=?", ("editor_retry:"+str(item_id),)).fetchone()
-            disposition = "REJECTED" if retries and int(retries[0]) >= 3 else "WAITING_CONFIRMATION"
-            db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (disposition,now,item_id))
-            db.commit()
-            return disposition
-        post = text_to_check
-        primary_source_record = None
-        if primary_source:
-            primary_source_record = {key: value for key, value in primary_source.items() if key != "content"}
-            primary_source_record["content_sha256"] = digest(primary_source["content"])
-        facts_json = json.dumps({"mode": "AI", "_filter_version": FILTER_VERSION,
-                                 "policy": __import__("newsroom.policy", fromlist=["snapshot"]).snapshot(ai_settings),
-                                 "final_text_check": ai_result.get("final_text_check"),
-                                 "intake_filter": item.get('_intake_filter'),
-                                 "topic_registry": {"version": ai_settings["_topic_registry"].get("version"), "match": ai_result.get("topic_match"), "checked": True} if "_topic_registry" in ai_settings and ai_settings.get('_keyword_prefilter', {}).get('mode') != 'intake_rules' else None,
-                                 "memory_mode": memory_mode, "story_diff": memory_diff,
-                                 "primary_source": primary_source_record,
-                                 "primary_source_status": source_status,
-                                 "citation_is_report": source_is_report,
-                                 "publisher_report_exception": bool(publisher_report),
-                                 "publisher_report": (dict(publisher_report) | {"content_sha256": digest(publisher_report["content"]), "evidence": (ai_result.get("original_reporting_check") or {}).get("evidence", "")}) if publisher_report else None,
-                                 "source_review_required": bool(ai_result.get("source_review_required")),
-                                 "independent_check_required": bool(ai_result.get("independent_check_required")),
-                                 "confidence": ai_result.get("confidence"),
-                                 "importance": ai_result.get("importance"),
-                                 "event_status": ai_result.get("event_status"), "freshness": ai_result.get("freshness"),
-                                 "topic_category": ai_result.get("topic_category"), "is_concrete": ai_result.get("is_concrete"),
-                                 "implementation_stage": ai_result.get("implementation_stage"), "geographic_scope": ai_result.get("geographic_scope"),
-                                 "russia_cis_impact": ai_result.get("russia_cis_impact"), "impact_evidence": ai_result.get("impact_evidence", ""),
-                                 "original_reporting_check": ai_result.get("original_reporting_check"),
-                                 "editorial_check": ai_result.get("editorial_check"),
-                                 "facts": ai_result.get("facts", []), "what_is_new": ai_result.get("what_is_new", ""),
-                                 "independent_check": ai_result.get("independent_check", "NOT_ASSESSED"),
-                                 "independent_check_note": ai_result.get("independent_check_note", ""),
-                                 "independent_sources": [{key: source.get(key) for key in ("publisher", "title", "url", "published_at", "primary_source_url")}
-                                                         for source in item.get("independent_sources", [])]}, ensure_ascii=False)
-    else:
-        citation_url = primary_source["url"] if primary_source else item["url"]
-        citation_name = (primary_source.get("publisher") or "Первоисточник") if primary_source else publisher_name
-        post = make_post(headline, body, citation_name, citation_url, max_length, preserve_content=True)
-        primary_source_record = None
-        if primary_source:
-            primary_source_record = {key: value for key, value in primary_source.items() if key != "content"}
-            primary_source_record["content_sha256"] = digest(primary_source["content"])
-        facts_json = json.dumps({"mode": "RULE_BASED", "primary_source": primary_source_record,
-                                 "primary_source_status": source_status,
-                                 "source_review_required": not bool(primary_source and source_status == "READ")}, ensure_ascii=False)
-    if ai_result and ai_result.get('final_text_check'):
-        # The saved representation is exactly what the final checker received.
-        stored_facts = json.loads(facts_json)
-        stored_facts['material_revision'] = db.execute('SELECT ingest_revision FROM items WHERE item_id=?', (item_id,)).fetchone()[0]
-        facts_json = json.dumps(stored_facts, ensure_ascii=False)
-    post_hash = digest(post)
-    db.execute('SAVEPOINT memory_post')
-    cur = db.execute("INSERT OR IGNORE INTO posts(story_id,origin_item_id,text,status,created_at,version,source_ids,post_hash,fact_check_result) VALUES(?,?,?, 'PENDING', ?,?,?,?,?)",
-               (story_id, item_id, post, now, (best["version"] + 1 if best else 1), json.dumps([source["source_id"]]), post_hash, facts_json))
-    if memory_diff and memory_enforced:
-        from .knowledge import bind_post, MemoryInvalid
-        try:
-            bind_post(db, cur.lastrowid, item_id, memory_diff, post)
-        except MemoryInvalid as exc:
-            db.execute('ROLLBACK TO memory_post')
-            db.execute('RELEASE memory_post')
-            ai_result['memory_issues'] = [str(exc)]
-            ai_result['editorial_issues'] = [str(exc)]
-            ai_result['_needs_post_draft'] = True
-            item['_retry_reason'] = str(exc)
-            from .material_flow import save_draft_context
-            context['ai_result'] = ai_result
-            save_draft_context(db, item_id, item, ai_settings, context)
-            mark(db, item_id, 'drafting', 'WAITING', str(exc), block_kind='verification')
-            _trace_item(item, 'Проверка фактов в готовом тексте', 'Нужна правка текста', str(exc))
-            db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
-                       (json.dumps({**ai_result, '_filter_version':FILTER_VERSION},ensure_ascii=False),item_id))
-            db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION',processed_at=? WHERE item_id=?",(now,item_id))
-            db.commit()
-            return 'WAITING_CONFIRMATION'
-    db.execute('RELEASE memory_post')
-    db.commit()
-    discovered_row = db.execute("SELECT discovered_at FROM items WHERE item_id=?", (item_id,)).fetchone()
-    ready_post = db.execute("SELECT post_id FROM posts WHERE origin_item_id=? AND post_hash=? AND status='PENDING' ORDER BY post_id DESC LIMIT 1", (item_id, post_hash)).fetchone()
-    used_source_published_at = (item.get("published_at")
-                                or (primary_source or {}).get("published_at")
-                                or (publisher_report or {}).get("published_at")
-                                or item.get("updated_at"))
-    _log_timing("post_ready", post_id=ready_post["post_id"] if ready_post else None, item_id=item_id,
-                source_published_at=used_source_published_at,
-                item_discovered_at=discovered_row["discovered_at"] if discovered_row else None)
-    return status
-
-
-def _saved_material(row, source):
-    try:
-        primary = json.loads(row["primary_source_json"] or "{}")
-    except (TypeError, json.JSONDecodeError):
-        primary = {}
-    item = {key: row[key] for key in ("url", "title", "description", "content", "author", "published_at", "updated_at")}
-    item["material_read"] = primary.get("_material_read") is True
-    item["material_url"] = primary.get("_material_url", row["url"])
-    if primary.get("_material_publisher"):
-        item["publisher_name"] = primary["_material_publisher"]
-    if source["type"] == "manual" and item["material_read"]:
-        item["screening_excerpt"] = str(item.get("content") or "")[:2200]
-    if "_discovery_links" in primary:
-        item["discovery_links"] = primary["_discovery_links"]
-        item["telegram_forwarded"] = primary.get("_telegram_forwarded", False)
-    retry_primary = primary.get("status") != "READ" and not item["material_read"]
-    item.update({
-        "primary_source_url": None if retry_primary else primary.get("url"),
-        "primary_source_title": None if retry_primary else primary.get("title"),
-        "primary_source_content": "" if retry_primary else primary.get("content", ""),
-        "primary_source_type": None if retry_primary else primary.get("type"),
-        "primary_source_publisher": None if retry_primary else primary.get("publisher"),
-        "primary_source_status": None if retry_primary else primary.get("status", "NOT_CHECKED"),
-    })
-    return item
-
-
-def _retry_ai_held_items(db, source_by_id: dict[int, object], config: dict, limit: int = 20, coordinator=None) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    if not source_by_id or limit <= 0:
-        return counts
-    # Retries share model budgets with fresh stories. Keep a small retry slice so
-    # held items cannot consume the entire cycle before current feeds arrive.
-    limit = min(limit, max(0, int(config.get("newsroom", {}).get("retry_items_per_cycle", 2))))
-    ai_settings = config.get("ai", {})
-    if "_analysis_budget" in ai_settings:
-        limit = min(limit, max(0, int(ai_settings.get("_analysis_budget", 0))))
-    if limit <= 0:
-        return counts
-    placeholders = ",".join("?" for _ in source_by_id)
-    # Apply due times before LIMIT, so sleeping retries cannot starve fresh work.
-    due_filter = " AND COALESCE(julianday((SELECT CASE WHEN json_valid(value) THEN json_extract(value,'$.next_at') END FROM app_state WHERE key='selection_retry:'||items.item_id)),0)<=julianday('now') "
-    # Exclude inactive sources before LIMIT and rotate by last attempt.
-    rows = db.execute(
-        f"SELECT * FROM items WHERE (disposition IN ('AI_RETRY','PRIMARY_RETRY') OR "
-        "(disposition='WAITING_CONFIRMATION' "
-        "AND COALESCE((SELECT CAST(value AS INTEGER) FROM app_state WHERE key='editor_retry:'||items.item_id),0)<3)) "
-        f"AND source_id IN ({placeholders}) {due_filter} "
-        "AND NOT EXISTS(SELECT 1 FROM processing_jobs j WHERE j.item_id=items.item_id AND j.status IN ('PENDING','WAITING','RUNNING')) "
-        "ORDER BY COALESCE(processed_at, discovered_at), discovered_at, item_id LIMIT ?",
-        (*source_by_id, limit),
-    ).fetchall()
-    for row in rows:
-        source = source_by_id.get(row["source_id"])
-        if not source:
-            continue
-        item = _saved_material(row, source)
-        if row["disposition"] == "WAITING_CONFIRMATION" and coordinator is None:
-            db.execute("INSERT INTO app_state(key,value) VALUES(?, '1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", ("editor_retry:"+str(row["item_id"]),))
-        if coordinator is not None:
-            from .workflow import enqueue
-            enqueue(db, row['item_id'], item, source, {
-                'threshold': config['newsroom'].get('similarity_threshold', .35),
-                'max_length': config['newsroom'].get('max_post_length', 3500),
-                'freshness_hours': config['newsroom'].get('freshness_window_hours', 24),
-                'initial_backfill_minutes': None, 'relevance_terms': config['newsroom'].get('relevance_terms', []),
-            }, category='retry')
-            continue
-        try:
-            outcome = process_item(db, source, item, config["newsroom"].get("similarity_threshold", 0.35),
-                                   config["newsroom"].get("max_post_length", 3500),
-                                   config["newsroom"].get("freshness_window_hours", 24), None,
-                                   config["newsroom"].get("relevance_terms", []), config.get("ai", {}),
-                                   existing_item_id=row["item_id"],
-                                   post_ready_callback=config.get("_publish_ready_callback"))
-            counts[outcome] = counts.get(outcome, 0) + 1
-        except Exception as exc:
-            db.rollback()
-            # A failed attempt must also move to the back of the retry queue.
-            db.execute("UPDATE items SET processed_at=? WHERE item_id=?", (NOW(), row["item_id"]))
-            counts["ERROR"] = counts.get("ERROR", 0) + 1
-            attempts = schedule_retry(db, row["item_id"], "ERROR")
-            if attempts >= MAX_AUTOMATIC_RETRIES:
-                db.execute("UPDATE items SET disposition='REJECTED',processed_at=? WHERE item_id=?",
-                           (NOW(), row["item_id"]))
-            db.execute("INSERT INTO errors(source_id,timestamp,message) VALUES(?,?,?)",
-                       (source["source_id"], NOW(), _safe_source_error(exc)))
-            db.commit()
-    return counts
-
-
-def _close_exhausted_retries(db) -> int:
-    """Move legacy or newly exhausted held items out of visible retry stages."""
-    db.execute("""UPDATE items SET disposition='REJECTED',processed_at=?
-        WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION')
-          AND (
-            COALESCE((SELECT CASE WHEN json_valid(value)
-                THEN CAST(json_extract(value,'$.attempts') AS INTEGER) ELSE 0 END
-                FROM app_state WHERE key='selection_retry:'||items.item_id),0)>=?
-            OR (disposition='WAITING_CONFIRMATION' AND
-                COALESCE((SELECT CAST(value AS INTEGER) FROM app_state
-                    WHERE key='editor_retry:'||items.item_id),0)>=?)
-          )""", (NOW(), MAX_AUTOMATIC_RETRIES, MAX_AUTOMATIC_RETRIES))
-    count = db.execute("SELECT changes()").fetchone()[0]
-    db.commit()
-    return count
-
-
-def _reconcile_legacy_retry_loops(db) -> int:
-    """Close unchanged items already analyzed past the automatic retry limit.
-
-    Older builds confused an enriched article body with a changed feed entry,
-    which reset retry state on every poll. Use the append-only snapshots once
-    to enforce the existing retry limit for those same unchanged versions.
-    """
-    marker = "retry_enrichment_reconciled_v2"
-    if db.execute("SELECT 1 FROM app_state WHERE key=?", (marker,)).fetchone():
-        return 0
-
-    rows = db.execute("""SELECT item_id,title,description,author,published_at,updated_at,content,disposition
-        FROM items WHERE disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION')""").fetchall()
-    closed = 0
-    for item in rows:
-        revisions = db.execute("""SELECT source_snapshot_json,decision_snapshot_json
-            FROM item_revisions WHERE item_id=? ORDER BY revision_id""", (item["item_id"],)).fetchall()
-        completed = 0
-        for revision in revisions:
-            try:
-                source = json.loads(revision["source_snapshot_json"])
-                decision = json.loads(revision["decision_snapshot_json"])
-            except (TypeError, json.JSONDecodeError):
-                continue
-            same_version = all(source.get(key) == item[key]
-                               for key in ("title", "description", "author", "published_at", "updated_at"))
-            if same_version and decision.get("analysis"):
-                completed += 1
-        current_analysis = db.execute("SELECT 1 FROM item_analysis WHERE item_id=?", (item["item_id"],)).fetchone()
-        if current_analysis:
-            completed += 1
-        if completed <= 0:
-            continue
-
-        prior = db.execute("SELECT value FROM app_state WHERE key=?",
-                           (f"selection_retry:{item['item_id']}",)).fetchone()
-        try:
-            retry = json.loads(prior[0]) if prior else {}
-        except (TypeError, json.JSONDecodeError):
-            retry = {}
-        prior_attempts = int(retry.get("attempts") or 0)
-        attempts = max(prior_attempts, min(MAX_AUTOMATIC_RETRIES, completed - 1))
-        attempts_updated = attempts > prior_attempts
-        if attempts_updated:
-            retry["attempts"] = attempts
-            retry["reason"] = f"По журналу версий учтено {completed} завершённых разборов этой версии."
-        if attempts < MAX_AUTOMATIC_RETRIES:
-            if attempts_updated:
-                db.execute("INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                           (f"selection_retry:{item['item_id']}", json.dumps(retry, ensure_ascii=False)))
-            continue
-
-        reason = (f"Эта версия уже прошла {MAX_AUTOMATIC_RETRIES} повторных проверок; "
-                  "дальнейшие автоматические попытки остановлены.")
-        retry.update({"attempts": MAX_AUTOMATIC_RETRIES, "outcome": item["disposition"], "reason": reason})
-        retry["next_at"] = NOW()
-        db.execute("INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                   (f"selection_retry:{item['item_id']}", json.dumps(retry, ensure_ascii=False)))
-        db.execute("UPDATE items SET disposition='REJECTED',processed_at=? WHERE item_id=?",
-                   (NOW(), item["item_id"]))
-        from .decisions import record
-        record(db, item["item_id"], "REJECTED", extra={
-            "reason": reason,
-            "reason_code": "RETRY_HISTORY_RECONCILIATION",
-            "completed_analyses_for_unchanged_version": completed,
-        })
-        closed += 1
-
-    db.execute("INSERT INTO app_state(key,value) VALUES(?,?)",
-               (marker, json.dumps({"at": NOW(), "closed": closed}, ensure_ascii=False)))
-    db.commit()
-    return closed
-
-
-def _requeue_social_quote_repairs(db, ai_settings, freshness_hours: int) -> int:
-    """Legacy repair only: activated v1 must never reopen a final rejection."""
-    if '_policy_baseline' in (ai_settings or {}):
-        return 0
-    if not get_api_key(ai_settings or {}):
-        return 0
-    rows = db.execute("SELECT i.*,a.result_json FROM items i JOIN item_analysis a USING(item_id) "
-                      "WHERE i.disposition='REJECTED' AND "
-                      "julianday(COALESCE(i.updated_at,i.published_at))>=julianday('now',?)",
-                      ("-" + str(int(freshness_hours)) + " hours",)).fetchall()
-    queued = 0
-    now = datetime.now(timezone.utc)
-    for row in rows:
-        try:
-            analysis = json.loads(row["result_json"] or "{}")
-            primary = json.loads(row["primary_source_json"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if int(analysis.get("_filter_version", 0) or 0) >= FILTER_VERSION:
-            continue
-        if (not str(primary.get("type", "")).startswith("ORIGINAL_SOCIAL_")
-                or primary.get("status") != "READ"):
-            continue
-        audit = analysis.get("original_reporting_check") or {}
-        if (audit.get("central_claim_supported") is not False
-                or audit.get("attribution_preserved") is not True
-                or len(str(audit.get("evidence") or "").strip()) >= 24
-                or not analysis.get("is_relevant")
-                or analysis.get("geographic_scope") not in {"RUSSIA", "CIS", "RUSSIA_CIS"}
-                or analysis.get("russia_cis_impact") != "DIRECT"
-                or analysis.get("independent_check") == "CONFLICT"
-                or not _impact_evidence_is_grounded(analysis, primary)):
-            continue
-        title = " ".join(str(row["title"] or "").casefold().split())
-        source_text = " ".join(str(primary.get("content") or "").casefold().split())
-        if len(title) < 24 or title not in source_text:
-            continue
-        event_time = row["updated_at"] or row["published_at"]
-        if not event_time:
-            continue
-        try:
-            event_stamp = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
-            if event_stamp.tzinfo is None:
-                event_stamp = event_stamp.replace(tzinfo=timezone.utc)
-            age_hours = (now - event_stamp).total_seconds() / 3600
-        except ValueError:
-            continue
-        if age_hours > freshness_hours:
-            continue
-        marker = f"filter_reprocess:{FILTER_VERSION}:{row['item_id']}"
-        if db.execute("SELECT 1 FROM app_state WHERE key=?", (marker,)).fetchone():
-            continue
-        db.execute("INSERT INTO app_state(key,value) VALUES(?,?)", (marker, NOW()))
-        db.executemany("DELETE FROM app_state WHERE key=?", [(f"triage:{row['item_id']}",),
-                         (f"selection_retry:{row['item_id']}",), (f"editor_retry:{row['item_id']}",)])
-        db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=NULL WHERE item_id=?", (row["item_id"],))
-        queued += 1
-    db.commit()
-    return queued
 
 
 def run_cycle(config: dict) -> dict[str, int]:
@@ -3590,50 +1669,21 @@ def run_cycle(config: dict) -> dict[str, int]:
         raise
 
 
+
 def _run_cycle(config, db, cleanup):
-    config = {**config, "ai": {k: v for k, v in config.get("ai", {}).items() if k not in {"_disabled_for_cycle", "_triage_disabled"}}}
+    config = {**config, "ai": {k: v for k, v in config.get("ai", {}).items() if k not in {"_disabled_for_cycle", "_unused_legacy_flag"}}}
     from .source_registry import sync
-    from .topic_registry import sync as sync_topics, learn_cycle
+    from .topic_registry import sync as sync_topics
     sync_topics(db, config)
     sync(db, config)
     sync_topics(db, config)
-    learn_cycle(db, config)
-    from .editorial_registry import sync as sync_editorial, learn_cycle as learn_editorial
-    sync_editorial(db, config)
-    from .policy import attach as attach_policy
-    attach_policy(config)
-    learn_editorial(db, config)
-    owner_ids = config.get("telegram", {}).get("interest_owner_user_ids") or []
-    if owner_ids:
-        config["ai"]["_correction_owner_chat_id"] = str(owner_ids[0])
-    config["ai"]["_analysis_budget"] = int(config["newsroom"].get("analysis_per_cycle", 25))
-    config["ai"]["_research_agent_budget"] = max(
-        0, min(3, int(config["ai"].get("research_agent_per_cycle", 1))))
-    config["ai"]["_retry_cycle_delay_seconds"] = min(
-        180, max(30, int(config["newsroom"].get("poll_interval_seconds", 180))))
-    config["ai"]["_recovery_search_budget"] = 2
-    config["ai"]["_triage_budget"] = int(config["newsroom"].get("triage_per_cycle", 12))
-    watch_reserve = min(3, max(0, config['ai']['_analysis_budget']), max(0, config['ai']['_triage_budget'])) if config['newsroom'].get('story_watch_enabled') else 0
-    config['ai']['_analysis_budget'] -= watch_reserve
-    config['ai']['_triage_budget'] -= watch_reserve
-    retry_reserve = min(
-        max(0, int(config["newsroom"].get("retry_items_per_cycle", 2))),
-        max(0, config["ai"]["_analysis_budget"]),
-        max(0, config["ai"]["_triage_budget"])
-        if config["ai"].get("triage_enabled") else max(0, config["ai"]["_analysis_budget"]),
-    )
-    config["ai"]["_analysis_budget"] -= retry_reserve
-    if config["ai"].get("triage_enabled"):
-        config["ai"]["_triage_budget"] -= retry_reserve
+    config['_collection_only'] = True
     run_started = time.perf_counter()
     stage_times = {"retry_seconds": 0.0, "fetch_wait_seconds": 0.0,
                    "matching_seconds": 0.0, "processing_seconds": 0.0}
     from .runtime import attach
     attach(config)
     counts: dict[str, int] = {}
-    reconciled = 0 if config.get("_collection_only") else _reconcile_legacy_retry_loops(db)
-    if reconciled:
-        counts["RETRY_HISTORY_RECONCILED"] = reconciled
     sources = []
     active_configs = [
         (source_cfg, source_cfg.get("type", "rss"))
@@ -3672,13 +1722,6 @@ def _run_cycle(config, db, cleanup):
         marks = ','.join('?' for _ in processing_urls)
         source_by_id.update({row['source_id']: row for row in db.execute(
             f'SELECT * FROM sources WHERE active=1 AND url IN ({marks})', processing_urls)})
-    manual_retry_sources = db.execute(
-        "SELECT DISTINCT s.* FROM sources s JOIN items i USING(source_id) "
-        "WHERE s.type='manual' AND i.disposition IN ('AI_RETRY','PRIMARY_RETRY','WAITING_CONFIRMATION')"
-    ).fetchall()
-    source_by_id.update({source["source_id"]: source for source in manual_retry_sources})
-    if config.get('newsroom',{}).get('story_watch_enabled'):
-        source_by_id.update({r['source_id']:r for r in db.execute("SELECT * FROM sources WHERE url LIKE 'story-watch://%'")})
     # Breaking-news discovery shares one persistent search slot across source
     # feeds, source recovery, and story watch. Keep the effective cooldown at
     # or below the three-minute collection cadence so stale config cannot
@@ -3722,13 +1765,6 @@ def _run_cycle(config, db, cleanup):
         if source_type in {"rss", "web"} and source_cfg.get("reputation") == "reputable_media" and host:
             ORIGINAL_REPORTING_PUBLISHERS.setdefault(_registrable_domain(host), re.escape(source_cfg["name"]))
 
-    # Intake admission is revision-specific. Time spent in our queue must not
-    # silently turn an already accepted material into an editorial rejection.
-    requeued = _requeue_social_quote_repairs(
-        db, config.get("ai", {}), int(config["newsroom"].get("freshness_window_hours", 24)))
-    if requeued:
-        counts["FILTER_REPROCESS_QUEUED"] = requeued
-    _close_exhausted_retries(db)
     def fetch_one(source_info):
         source_cfg, source, first_check, source_type = source_info
         if source_type == "web_search":
@@ -3767,20 +1803,11 @@ def _run_cycle(config, db, cleanup):
         except Exception as exc:
             return None, time.perf_counter() - started, exc
 
-    # Reuse only already-read pages from configured reputable publishers as cross-check material.
-    independent_reference_items: list[dict] = []
-    trusted_independent_domains = {
-        (urllib.parse.urlsplit(source_cfg["url"]).hostname or "").lower()
-        for source_cfg, source_type in active_configs
-        if source_type in {"rss", "web"} and source_cfg.get("reputation") == "reputable_media"
-        and urllib.parse.urlsplit(source_cfg["url"]).hostname
-    }
-
     # Fetch concurrently and begin processing each source as soon as it returns;
     # waiting in configuration order would let one slow publisher hold up every
     # already available news item and consume the source-to-publication budget.
-    from .workflow import Coordinator, CollectionCoordinator, enqueue
-    coordinator = CollectionCoordinator() if config.get("_collection_only") else Coordinator(db, config, counts)
+    from .workflow import CollectionCoordinator, enqueue
+    coordinator = CollectionCoordinator()
     cleanup.callback(coordinator.abort)
     def completed_sources(pending):
         from concurrent.futures import wait, FIRST_COMPLETED
@@ -3820,25 +1847,11 @@ def _run_cycle(config, db, cleanup):
                         db.execute("INSERT INTO errors(source_id,timestamp,message) VALUES(?,?,?)",
                                    (source["source_id"], NOW(), error_code))
                     db.commit()
-                # Use the already-read Google News publisher pages to cross-check stories found in other feeds.
-                if source_type == "google_news":
-                    independent_reference_items = list(items)
                 # Process each discovered entry individually in event-time order.
                 items.sort(key=lambda x: (x.get("updated_at") or x.get("published_at") or ""), reverse=True)
                 for item in items:
-                    matching_started = time.perf_counter()
-                    peers = [candidate for candidate in independent_reference_items if candidate is not item]
-                    item["independent_sources"] = _independent_candidates(item, peers, trusted_independent_domains)
-                    stage_times["matching_seconds"] += time.perf_counter() - matching_started
                     try:
-                        queued = enqueue(db, None, item, source, {
-                            "threshold": config["newsroom"].get("similarity_threshold", .35),
-                            "max_length": config["newsroom"].get("max_post_length", 3500),
-                            "freshness_hours": config["newsroom"].get("freshness_window_hours", 24),
-                            "initial_backfill_minutes": config["newsroom"].get("initial_backfill_minutes",
-                                config["newsroom"].get("freshness_window_hours", 24) * 60) if first_check else None,
-                            "relevance_terms": config["newsroom"].get("relevance_terms", []),
-                        })
+                        queued = enqueue(db, None, item, source, {"settings": config.get("ai", {})})
                         if queued is None:
                             counts["DUPLICATE"] = counts.get("DUPLICATE", 0) + 1
                     except Exception as exc:
@@ -3901,43 +1914,5 @@ def _run_cycle(config, db, cleanup):
         db.execute("UPDATE sources SET last_checked_at=? WHERE type='web_search' AND active=1 AND url!=?",
                    (NOW(), scheduled_web_search_url))
         db.commit()
-    from .watch import run as run_story_watch
-    config['ai']['_analysis_budget'] += watch_reserve
-    config['ai']['_triage_budget'] += watch_reserve
-    story_watch_started = time.perf_counter()
-    def process_story_watch_item(db_, source_, item_, threshold_, max_length_, freshness_hours_, baseline_, relevance_, ai_):
-        queued = enqueue(db_, None, item_, source_, {'threshold': threshold_, 'max_length': max_length_,
-            'freshness_hours': freshness_hours_, 'initial_backfill_minutes': baseline_, 'relevance_terms': relevance_},
-            category='watch')
-        return 'QUEUED' if queued else 'DUPLICATE'
-    counts.update(run_story_watch(db, config, web_search_quota, process_story_watch_item))
-    watch_coordinator = CollectionCoordinator() if config.get('_collection_only') else Coordinator(db, config, counts, categories=('watch',), max_jobs=watch_reserve)
-    cleanup.callback(watch_coordinator.abort)
-    watch_coordinator.close()
-    stage_times["story_watch_seconds"] = time.perf_counter() - story_watch_started
-    if config.get('_collection_only'):
-        _log_timing('collection_stage_timing', total_seconds=round(time.perf_counter()-run_started, 3), **stage_times)
-        return counts
-    # Give newly fetched material and due story watches first access to the
-    # shared model budgets. Held-item retries are bounded and run afterward;
-    # their reserved slots remain available even when fresh work is heavy.
-    config['ai']['_analysis_budget'] += retry_reserve
-    if config['ai'].get("triage_enabled"):
-        config['ai']['_triage_budget'] += retry_reserve
-    retry_started = time.perf_counter()
-    retry_counts = {}
-    retry_config = {**config, 'ai': {key: value for key, value in config['ai'].items()
-                                   if key not in {'_disabled_for_cycle', '_triage_disabled'}}}
-    retry_coordinator = Coordinator(db, retry_config, retry_counts, categories=('retry',), max_jobs=retry_reserve)
-    cleanup.callback(retry_coordinator.abort)
-    for outcome, count in _retry_ai_held_items(db, source_by_id, retry_config, coordinator=retry_coordinator).items():
-        counts[outcome] = counts.get(outcome, 0) + count
-    retry_coordinator.close()
-    for outcome, count in retry_counts.items():
-        counts[outcome] = counts.get(outcome, 0) + count
-    stage_times["retry_seconds"] = time.perf_counter() - retry_started
-    total_seconds = time.perf_counter() - run_started
-    stage_times["other_seconds"] = max(0.0, total_seconds - sum(stage_times.values()))
-    _log_timing("collection_stage_timing", total_seconds=round(total_seconds, 3),
-                **{key: round(value, 3) for key, value in stage_times.items()})
+    _log_timing('collection_stage_timing', total_seconds=round(time.perf_counter()-run_started, 3), **stage_times)
     return counts

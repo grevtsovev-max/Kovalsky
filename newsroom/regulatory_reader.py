@@ -60,9 +60,11 @@ class DocumentHTML(HTMLParser):
         return '\n'.join(re.sub(r'\s+', ' ', line).strip() for line in ''.join(self.parts).splitlines() if line.strip())
 
 
+
 def attachment_url(url):
     path = urlsplit(url).path.lower()
     return any(part in path for part in ('.pdf','/file/','/document/','/bill/','/documents/'))
+
 
 
 def pdf_pages(payload):
@@ -90,8 +92,13 @@ def pdf_pages(payload):
     return result['pages'], result['ocr_pages']
 
 
+
 def read_source(url, archive=None):
-    from .regulatory import official, now
+    from datetime import datetime, timezone
+    def now(): return datetime.now(timezone.utc).isoformat()
+    def official(value):
+        host = (urlsplit(value).hostname or '').lower()
+        return urlsplit(value).scheme == 'https' and (host.endswith('.gov.ru') or host in {'cbr.ru','www.cbr.ru','pravo.gov.ru','publication.pravo.gov.ru'})
     if not official(url): raise ValueError('UNTRUSTED_URL')
     payload, final_url, mime = _request_with_url(url, timeout=20)
     if not official(final_url): raise ValueError('UNTRUSTED_REDIRECT')
@@ -126,3 +133,4 @@ def read_source(url, archive=None):
 
 def full_text(source):
     return '\n\n'.join('[Страница %d]\n%s' % (i+1, text) for i,text in enumerate(source['pages']))
+

@@ -1,39 +1,10 @@
 [newsroom]
-# Постоянные очереди этапов работают независимо от сбора.
-independent_processing = true
 database = "data/newsroom.sqlite3"
 poll_interval_seconds = 180
-retry_items_per_cycle = 2
-processing_workers = 2
-processing_cycle_seconds = 150
-analysis_per_cycle = 25
-triage_per_cycle = 12
-# Включать после переноса истории и проверки memory_mode=enforce.
-story_watch_enabled = false
-story_watch_per_cycle = 2
-story_watch_items_per_job = 3
-weekly_digest_title = "Крипторынок: главное за неделю"
-weekly_analysis_enabled = false
-weekly_analysis_time = "20:00"
-weekly_analysis_lookback_hours = 168
-weekly_analysis_max_output_tokens = 2400
-digest_title = "Крипторынок: главное за день"
-max_post_length = 3500
-similarity_threshold = 0.35
-freshness_window_hours = 24
 # При подключении источника проверять последние 48 часов.
 initial_backfill_minutes = 2880
-auto_publish_since = "ЗАДАЙТЕ_ДАТУ_СТАРТА_ISO8601"
-relevance_terms = ["криптовалют", "криптоактив", "crypto", "digital asset", "биткоин", "bitcoin", "ethereum", "эфириум", "токен", "блокчейн", "blockchain", "web3", "defi", "стейблкоин", "цифровой актив", "цифровая валюта", "цифровой рубль", "цфа", "майнинг", "смарт-контракт", "криптобиржа", "криптообменник", "bitget", "binance", "coinbase", "bybit", "okx", "kraken", "uniswap", "opensea", "metamask", "tether", "circle", "ripple", "solana"]
 
 [ai]
-# off / shadow / enforce. Переход на enforce требует переноса опубликованной истории.
-memory_mode = "off"
-# active / shadow / off. Исследователь выбирает следующий шаг, но публикация
-# остаётся за редактором и общим автоматическим допуском.
-research_agent_mode = "active"
-research_agent_per_cycle = 1
-research_agent_max_steps = 3
 model = "gpt-6-luna"
 api_key_env = "OPENAI_API_KEY"
 keychain_service = "KiperNewsroomOpenAI"
@@ -45,7 +16,6 @@ api_requests_per_window = 50
 api_budget_window_seconds = 180
 api_searches_per_window = 3
 api_retry_reserve = 4
-api_correction_reserve = 2
 api_background_per_window = 2
 api_account_cooldown_seconds = 900
 # Для известных моделей используется официальный тариф, проверенный 2026-10-06,

@@ -20,6 +20,7 @@ def error_location(exc):
             'sqlite_code': getattr(exc, 'sqlite_errorname', None)}
 
 
+
 def snapshot(db, config):
     root = Path(__file__).resolve().parent
     release = root.parent.name
@@ -58,12 +59,8 @@ def snapshot(db, config):
     return {'release': release if re.fullmatch('[0-9a-f]{40}', release) else None,
             'code_hashes': {name: hashlib.sha256((root/name).read_bytes()).hexdigest()
                             for name in ('workflow.py','runtime.py','core.py','cli.py','diagnostics.py')},
-            'independent_processing': bool(config.get('newsroom', {}).get('independent_processing')),
-            'processing_workers': max(1, min(8, int(config.get('newsroom', {}).get('processing_workers', 2)))),
-            'api_concurrency': max(1, min(8, int(config.get('ai', {}).get('api_concurrency', 2)))),
-            'processing_limits': {key: int(config.get('newsroom', {}).get(key, default))
-                                  for key, default in (('analysis_per_cycle', 25), ('triage_per_cycle', 12),
-                                                       ('retry_items_per_cycle', 2), ('processing_cycle_seconds', 150))},
+            'editorial': 'removed',
+            'independent_processing': False,
             'api_limits': {key: int(config.get('ai', {}).get(key, default))
                            for key, default in (('api_requests_per_window', 50), ('api_budget_window_seconds', 180),
                                                 ('api_retry_reserve', 4), ('timeout_seconds', 45))},

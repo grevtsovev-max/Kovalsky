@@ -74,8 +74,10 @@ class DeliveryUncertain(RuntimeError):
     pass
 
 
+
 class DeliveryRejected(RuntimeError):
     """Only a definitive rejection, or a failure before any request, is retryable."""
+
 
 
 from .runtime import BudgetDeferred
@@ -85,6 +87,7 @@ class DeliveryRateLimited(BudgetDeferred):
     """Telegram definitively refused this request and specified a wait."""
     def __init__(self, seconds):
         super().__init__('delivery', seconds)
+
 
 
 def telegram_rate_limit(response):
@@ -97,6 +100,7 @@ def telegram_rate_limit(response):
     return None
 
 
+
 class TelegramReceipt(str):
     def __new__(cls, response):
         obj = super().__new__(cls, str(response['message_id']))
@@ -104,8 +108,10 @@ class TelegramReceipt(str):
         return obj
 
 
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
 
 
 def channel(config):
@@ -114,6 +120,7 @@ def channel(config):
     if not target:
         raise DeliveryRejected('Telegram destination is missing')
     return str(target)
+
 
 
 def replace_unsent_digest_batch(db, batch_key, messages, news_count, period_end):
@@ -147,9 +154,11 @@ def replace_unsent_digest_batch(db, batch_key, messages, news_count, period_end)
         raise
 
 
+
 def event(db, attempt_id, status, detail=None):
     db.execute('INSERT INTO delivery_events(attempt_id,status,detail_json,created_at) VALUES(?,?,?,?)',
                (attempt_id, status, json.dumps(detail or {}, ensure_ascii=False), now()))
+
 
 
 def deliver(db, config, operation, text, send, post_id=None, verified_text=None):
@@ -215,34 +224,6 @@ def deliver(db, config, operation, text, send, post_id=None, verified_text=None)
             if not material or material[0] != facts['material_revision']:
                 db.commit()
                 raise DeliveryRejected('Source version changed before reservation')
-        if facts.get('policy') or db.execute("SELECT 1 FROM app_state WHERE key='policy_v1_cutover'").fetchone():
-            from .policy import publication_issues as policy_issues, attach
-            from .editorial_registry import attach_cached
-            policy_config = {**config, 'ai': dict(config.get('ai', {}))}
-            attach_cached(policy_config)
-            attach(policy_config)
-            if policy_issues(checked_text, facts, policy_config.get('ai', {})):
-                db.commit()
-                raise DeliveryRejected('Final policy or text proof changed before reservation')
-    if post_id is not None and db.execute('SELECT 1 FROM post_memory WHERE post_id=?', (post_id,)).fetchone():
-        # Recheck under the same write lock that reserves the send: two different
-        # drafts with the same fact cannot both pass an earlier unlocked check.
-        from .knowledge import publication_issues
-        issues = publication_issues(db, post_id, verified_text if verified_text is not None else text)
-        if issues:
-            db.commit()
-            raise DeliveryRejected('Publication memory gate: ' + ', '.join(issues))
-        diff_row = db.execute('SELECT d.payload_json FROM post_memory m JOIN story_diffs d USING(diff_id) WHERE m.post_id=?', (post_id,)).fetchone()
-        material_ids = json.loads(diff_row[0]).get('material_unpublished_facts', [])
-        placeholders = ','.join('?' for _ in material_ids) or 'NULL'
-        competing = db.execute(f"""SELECT a.attempt_id FROM post_facts ours
-            JOIN post_facts theirs ON theirs.fact_id=ours.fact_id AND theirs.post_id!=ours.post_id
-            JOIN publication_attempts a ON a.post_id=theirs.post_id
-            WHERE ours.post_id=? AND a.channel_id=? AND ours.fact_id IN ({placeholders}) AND a.status IN ('PREPARED','SENDING','SENT','CONFIRMED','UNKNOWN') LIMIT 1""",
-            (post_id,target,*material_ids)).fetchone()
-        if competing:
-            db.commit()
-            raise DeliveryUncertain('Another publication already reserved this fact; resend blocked')
     if not row:
         stamp = now()
         cur = db.execute('INSERT INTO publication_attempts(delivery_key,channel_id,post_id,text,content_hash,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)',
@@ -303,6 +284,7 @@ def confirm(db, config, operation):
         event(db, row['attempt_id'], 'CONFIRMED')
 
 
+
 def reconcile_posts(db, config):
     """Replay durable receipts; a series is published only when every part arrived."""
     db.commit()
@@ -337,6 +319,7 @@ def reconcile_posts(db, config):
         completed += 1
     db.commit()
     return completed
+
 
 
 def observe_channel_post(db, message, comparable_text):
@@ -375,3 +358,4 @@ def observe_channel_post(db, message, comparable_text):
                    "WHERE request_key=? AND status IN ('SENDING','UNKNOWN')",
                    (str(message_id), now(), request_key))
     return True
+

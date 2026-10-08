@@ -68,9 +68,10 @@ def normalize(value):
     return ' '.join(str(value).casefold().replace('ё', 'е').split())
 
 
+
 @lru_cache(maxsize=32768)
 def lemmas(word):
-    from .digest_language import _morphology
+    from .morphology import _morphology
     if re.fullmatch('[а-яё]+', word):
         return frozenset(p.normal_form.replace('ё', 'е') for p in _morphology().parse(word)[:3])
     return frozenset([word])
@@ -92,6 +93,7 @@ def lexical_match(text, keywords):
             if all(any(form & token for token in window) for form in forms):
                 return True
     return False
+
 
 
 def parse_tab(body, name):
@@ -131,6 +133,7 @@ def parse_tab(body, name):
     return result
 
 
+
 def parse_flat_keywords(rows):
     if len(rows) > 10001:
         raise ValueError('TOPIC_REGISTRY_HEADER_OR_SIZE')
@@ -157,8 +160,10 @@ def parse_flat_keywords(rows):
     return result
 
 
+
 def keyword_enabled(entry, names):
     return entry['enabled'] and (entry.get('flat') or entry['title'] in names)
+
 
 
 def parse_negative_keywords(body):
@@ -189,6 +194,7 @@ def parse_negative_keywords(body):
     return result
 
 
+
 def parse_filter_rules(body):
     rows = list(csv.reader(io.StringIO(body.decode('utf-8-sig'))))
     if not rows or rows[0] != FILTER_HEADERS or len(rows) > 101:
@@ -212,6 +218,7 @@ def parse_filter_rules(body):
     if len({r['name'] for r in rules}) != len(rules):
         raise ValueError('INTAKE_RULE_DUPLICATE')
     return rules
+
 
 
 def read_registry(settings):
@@ -244,6 +251,7 @@ def read_registry(settings):
     return {'sections': sections, 'checked_at': time.time(), 'version': version}
 
 
+
 def policy(snapshot, entities=()):
     sections = snapshot.get('sections', {})
     topics = [r for r in sections.get('Темы', []) if r['enabled']]
@@ -270,6 +278,7 @@ def policy(snapshot, entities=()):
     if FILTER_RULES in sections:
         result.update(selection_mode='intake_rules', intake_rules=[r for r in sections[FILTER_RULES] if r['enabled']])
     return result
+
 
 
 def apply_snapshot(config, snapshot, entities=()):
@@ -306,9 +315,8 @@ def apply_snapshot(config, snapshot, entities=()):
     return thematic
 
 
+
 def attach_cached(config):
-    from .editorial_registry import attach_cached as attach_editorial
-    attach_editorial(config)
     path = config.get('newsroom', {}).get('database')
     if not path or not Path(path).exists():
         return
@@ -349,6 +357,7 @@ def sync(db, config, force=False):
     return report(db)
 
 
+
 def configure(db, payload):
     settings = validate_settings(payload)
     if {t['name'] for t in settings['tabs']} != set(HEADERS) or len(settings['tabs']) != 4:
@@ -366,7 +375,7 @@ def configure(db, payload):
     save(db, ATTEMPT, snapshot['checked_at']); save(db, ERROR, None)
     # Old comments were already handled under a different authority. Start
     # with future comments, preserving the existing sheet rather than replaying.
-    for table, key, column in [('editorial_feedback','editorial','feedback_id'), ('interest_submissions','submission','submission_id'), ('interest_feedback','rating','item_id')]:
+    for table, key, column in [('interest_submissions','submission','submission_id'), ('interest_feedback','rating','item_id')]:
         save(db, 'topic_registry_cursor_'+key, db.execute(f'SELECT COALESCE(MAX({column}),0) FROM {table}').fetchone()[0])
     from datetime import datetime, timezone
     save(db, 'topic_registry_learning_since', datetime.now(timezone.utc).isoformat(timespec='seconds'))
@@ -390,10 +399,12 @@ def report(db):
             'applied':state(db,'topic_registry_applied',{})}
 
 
+
 def credentials_available(settings=None):
     settings = settings or {}
     return bool(settings.get('apps_script_file') and Path(settings['apps_script_file']).is_file()) or bool(settings.get('credentials_file') and Path(settings['credentials_file']).is_file()) or bool(os.getenv('GOOGLE_SHEETS_ACCESS_TOKEN') or
                 all(os.getenv(n) for n in ['GOOGLE_SHEETS_CLIENT_ID','GOOGLE_SHEETS_CLIENT_SECRET','GOOGLE_SHEETS_REFRESH_TOKEN']))
+
 
 
 def api(settings, method, suffix, data=None):
@@ -421,6 +432,7 @@ def api(settings, method, suffix, data=None):
         return json.load(response)
 
 
+
 def keyword_header_probe(settings):
     from .core import _request_with_url
     tab = next(t for t in settings['tabs'] if t['name'] == 'Ключевые слова')
@@ -439,15 +451,16 @@ def keyword_header_probe(settings):
             'searchByRegex': False, 'includeFormulas': False}
 
 
+
 def learned_topics(db):
     return [{'topic':r['topic'], 'search_terms':json.loads(r['search_terms'] or '[]')}
             for r in db.execute('SELECT topic,search_terms FROM monitoring_topics ORDER BY topic LIMIT 1000')]
 
 
+
 def collect_feedback(db):
     """Durable, idempotent capture from every learning inlet."""
     for table, kind, idcol, fields in [
-        ('editorial_feedback','editorial','feedback_id','feedback_type,reason,item_title,post_text'),
         ('interest_submissions','submission','submission_id','text'),
     ]:
         cursor = state(db, 'topic_registry_cursor_'+kind, 0)
@@ -524,6 +537,7 @@ def plan_learning(signal, kind, snapshot, settings):
                 raise ValueError('TOPIC_LEARNING_TARGET_MISSING')
             change['expected_description']=matches[0]['description']
     return changes
+
 
 
 def write_changes(settings, changes):
@@ -605,6 +619,7 @@ A retry after an unknown write checks the current sheet before adding anything.
     return len(requests)
 
 
+
 def learn_cycle(db, config):
     if not state(db,SETTINGS):
         return
@@ -653,69 +668,8 @@ def learn_cycle(db, config):
             save(db,key,job); db.commit()
 
 
-def grounded_match(result, thematic, source):
-    """Only a enabled Sheet topic with a quote from read material admits a post."""
-    match=result.get('topic_match',{})
-    if not isinstance(match,dict) or not isinstance(source,dict):
-        return False
-    if match.get('name') not in {t['name'] for t in thematic.get('topics',[])}:
-        return False
-    quote=match.get('evidence','')
-    if not isinstance(quote, str) or not isinstance(source.get('content', ''), str):
-        return False
-    from .knowledge import grounded_span
-    actual = grounded_span(quote, source.get('content', ''), min_length=1)
-    if actual is None:
-        return False
-    match['evidence'] = actual
-    return public_activity_allowed(match, thematic, source)
 
 
-def public_activity_allowed(match, thematic, source=None):
-    """Owner rule: person exception, otherwise brand + a separate topic keyword."""
-    if match.get('name') != PUBLIC_ACTIVITY:
-        return True
-    from .keyword_filter import match as keyword_match
-    subject = match.get('subject_name')
-    if not isinstance(subject, str) or not subject.strip():
-        return False
-    kind = match.get('subject_type')
-    people = {normalize(name) for name in thematic.get('people', [])}
-    organizations = {normalize(name) for name in thematic.get('organizations', [])}
-    name = normalize(subject)
-    if kind == 'PERSON':
-        if name not in people or name in organizations:
-            return False
-        return source is None or bool(keyword_match(source.get('content', ''), [subject]))
-    if kind != 'BRAND' or name not in organizations or match.get('crypto_related') is not True:
-        return False
-    evidence = match.get('crypto_evidence')
-    if not isinstance(evidence, str) or len(evidence.strip()) < 24:
-        return False
-    # A brand/another entity name cannot serve as the extra thematic keyword.
-    keywords = [word for word in thematic.get('activity_keywords', [])
-                if normalize(word) not in organizations | people]
-    if not keyword_match(evidence, keywords):
-        return False
-    if source is not None:
-        from .knowledge import grounded_span
-        text = source.get('content', '')
-        if not isinstance(text, str) or not keyword_match(text, [subject]):
-            return False
-        actual = grounded_span(evidence, text, min_length=24)
-        if actual is None:
-            return False
-        match['crypto_evidence'] = actual
-    return True
 
 
-def queue_rating(db, item_id):
-    if not state(db, SETTINGS):
-        return
-    row = db.execute('SELECT item_id,is_interesting,note,topics_json,updated_at FROM interest_feedback WHERE item_id=?',(item_id,)).fetchone()
-    if row is None:
-        return
-    record = dict(row)
-    key = 'topic_learning:rating:'+hashlib.sha256(json.dumps(record,sort_keys=True).encode()).hexdigest()
-    if not state(db, key):
-        save(db,key,{'status':'PENDING','signal':record,'kind':'rating','attempts':0})
+
