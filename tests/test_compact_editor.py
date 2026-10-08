@@ -82,6 +82,47 @@ class CompactEditorTests(unittest.TestCase):
         self.assertTrue(text.endswith('Источник: [Банк России](https://www.cbr.ru/crypto)'))
         self.assertNotIn('wrong.example', text)
 
+    def test_source_named_today_does_not_block_a_checked_post(self):
+        self.prepare()
+        self.article.update(primary_source_url='https://example.org/primary',
+                            primary_source_publisher='Россия сегодня')
+        with patch.object(ai, 'get_api_key', return_value='test'), \
+             patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.fetch_publisher_article', return_value=self.article), \
+             patch.object(ai, 'validate_draft', wraps=real_validate_draft), \
+             patch.object(ai, 'request_response', side_effect=self.provider) as request:
+            self.assertEqual(self.process(), 'NEW_STORY')
+        self.assertEqual(request.call_count, 2)
+        checked_text = json.loads(request.call_args.args[0]['input'])['post_text']
+        post = self.db.execute('SELECT * FROM posts').fetchone()
+        self.assertIn('Россия сегодня', checked_text)
+        self.assertEqual(post['text'], checked_text)
+        self.assertEqual(json.loads(post['fact_check_result'])['final_text_check']['text_sha256'], digest(checked_text))
+
+    def test_unknown_relative_date_repairs_only_text_before_paid_check(self):
+        self.prepare()
+        self.article.update(primary_source_url='https://example.org/primary')
+        self.value['summary_ru'] = 'Вчера ' + self.evidence
+        draft = dict(headline_ru=self.value['headline_ru'], summary_ru=self.evidence,
+                     what_is_new=self.evidence, editorial_check=self.audit)
+        with patch.object(ai, 'get_api_key', return_value='test'), \
+             patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.fetch_publisher_article', return_value=self.article) as reader, \
+             patch.object(ai, 'draft_post', return_value=draft) as writer, \
+             patch.object(ai, 'validate_draft', wraps=real_validate_draft) as check, \
+             patch.object(ai, 'request_response', side_effect=self.provider) as request:
+            self.assertEqual(self.process(), 'WAITING_CONFIRMATION')
+            check.assert_not_called()
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
+            row = self.db.execute('SELECT * FROM items').fetchone()
+            self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), 'NEW_STORY')
+        self.assertEqual(reader.call_count, 1)
+        self.assertEqual(writer.call_count, 1)
+        self.assertEqual(check.call_count, 1)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0], 1)
+
     def test_broken_evidence_never_reaches_writing_or_final_check(self):
         self.prepare()
         self.value['memory']['claims'][0]['source_quote'] = 'Выдуманная цитата о другом выпуске.'

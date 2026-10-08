@@ -93,6 +93,9 @@ def save_draft_context(db, item_id, item, settings, context):
     # Only the explicit post-finalization context enters the artifact; settings
     # are supplied afresh by the caller after dependency validation.
     from .policy import stage_signature
+    from .policy import saved_date_context
+    saved_date_context(context, item, context.get('primary_source') or context.get('publisher_report') or {},
+                       context.get('source') or {})
     context['_draft_policy_signature'] = stage_signature('drafting', settings)
     put(db, item_id, 'analysis', draft_dependency(db, item_id, item, settings), context)
     mark(db, item_id, 'analysis', 'DONE', 'Событие и доказательства проверены.')

@@ -3041,7 +3041,7 @@ def _finish_post_steps(db, item, ai_settings, context):
     draft_citation_name = draft_source.get('publisher') or ('Первоисточник' if primary_source else publisher_name)
     draft_citation_url = draft_source.get('url') or item['url']
     ai_options['_draft_contract'] = {
-        'dates': __import__('newsroom.policy', fromlist=['date_context']).date_context(item, draft_source, source),
+        'dates': __import__('newsroom.policy', fromlist=['saved_date_context']).saved_date_context(context, item, draft_source, source),
         'source_footer': make_post('', '', draft_citation_name, draft_citation_url, max_length, preserve_content=True).splitlines()[-1],
         'text_field': 'what_is_new' if status == 'UPDATE_CANDIDATE' and has_previous_publication else 'summary_ru',
         'has_previous_publication': bool(has_previous_publication),
@@ -3110,15 +3110,17 @@ def _finish_post_steps(db, item, ai_settings, context):
         mark(db, item_id, 'gate', 'RUNNING', 'Проверка фактов готового текста.')
         db.commit()
         try:
-            check_key = cache_key('final-assembled-text', {'text': text_to_check, 'source': draft_source,
-                'contract': ai_options['_draft_contract'],
-                'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text()),
-                'policy': __import__('newsroom.policy', fromlist=['snapshot']).snapshot(ai_options)})
-            checked = yield Work('editor', validate_draft, (ai_result, draft_source, check_draft, ai_options),
-                                 key=check_key, ttl=21600, stage='verification')
             from .policy import relative_date_words
             if relative_date_words(text_to_check):
-                checked['issues'].append('Относительная дата без подтверждённой даты источника: укажи проверяемый абсолютный срок или изложи событие без придуманного календарного дня.')
+                checked = {'issues': ['Относительная дата без подтверждённой даты источника: укажи проверяемый абсолютный срок или изложи событие без придуманного календарного дня.'],
+                           'editorial_check': {}, 'covered_claims': []}
+            else:
+                check_key = cache_key('final-assembled-text', {'text': text_to_check, 'source': draft_source,
+                    'contract': ai_options['_draft_contract'],
+                    'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text()),
+                    'policy': __import__('newsroom.policy', fromlist=['snapshot']).snapshot(ai_options)})
+                checked = yield Work('editor', validate_draft, (ai_result, draft_source, check_draft, ai_options),
+                                     key=check_key, ttl=21600, stage='verification')
             from .knowledge import validate_post_bindings
             bindings = validate_post_bindings(checked, material_ids, text_to_check)
         except Exception as exc:

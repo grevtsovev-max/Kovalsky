@@ -172,10 +172,45 @@ DRAFTING = (
 )
 
 
+def _date_text_parts(text):
+    """Separate narration from citations, URLs and balanced source quotations."""
+    protected = [match.span() for pattern in (
+        r'(?m)^[ \t]*(?:Источник|Источники):[^\n]*(?:\n[ \t]*)*\Z',
+        r'(?m)^[ \t]*>[^\n]*',
+        r'https?://[^\s)<>]+',
+    ) for match in re.finditer(pattern, text)]
+    pairs = {'«': '»', '“': '”', '„': '“', '"': '"'}
+    stack, start = [], None
+    for index, char in enumerate(text):
+        if stack and char == stack[-1]:
+            stack.pop()
+            if not stack:
+                protected.append((start, index + 1))
+        elif char in pairs:
+            if not stack:
+                start = index
+            stack.append(pairs[char])
+    # An unclosed quotation must not hide all subsequent narration.
+    merged = []
+    for start, end in sorted(protected):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    cursor = 0
+    for start, end in merged:
+        if start > cursor:
+            yield False, text[cursor:start]
+        yield True, text[start:end]
+        cursor = end
+    if cursor < len(text):
+        yield False, text[cursor:]
+
+
 def relative_date_words(text):
-    """Find calendar-relative words in narration, preserving quoted source text."""
-    unquoted = re.sub(r'«[^»]*»|“[^”]*”|"[^"\n]*"', '', text)
-    return re.findall(r'\b(?:сегодня|вчера|позавчера|завтра|послезавтра)\b', unquoted, re.I)
+    """Find relative dates only in narration, never in citation metadata."""
+    narration = '\n'.join(part for protected, part in _date_text_parts(text) if not protected)
+    return re.findall(r'\b(?:сегодня|вчера|позавчера|завтра|послезавтра)\b', narration, re.I)
 
 
 def absolute_narration_dates(text, dates):
@@ -191,10 +226,29 @@ def absolute_narration_dates(text, dates):
     def replace(match):
         value = day + timedelta(days=offsets[match[0].lower()])
         return f'{value.day} {months[value.month-1]} {value.year} года'
-    segments = re.split(r'(«[^»]*»|“[^”]*”|"[^"\n]*")', text)
-    return ''.join(segment if index % 2 else re.sub(
+    return ''.join(segment if protected else re.sub(
         r'\b(?:сегодня|вчера|позавчера|завтра|послезавтра)\b', replace, segment, flags=re.I)
-        for index, segment in enumerate(segments))
+        for protected, segment in _date_text_parts(text))
+
+
+def saved_date_context(context, item, citation, source):
+    """Reuse the source clock for unchanged evidence, including draft retries."""
+    import copy
+    source = dict(source)
+    identity = {
+        'citation_url': citation.get('url'),
+        'citation_published_at': citation.get('published_at'),
+        'citation_timezone': citation.get('source_timezone') or citation.get('timezone'),
+        'content_sha256': hashlib.sha256((citation.get('content') or '').encode()).hexdigest(),
+        'material_url': item.get('url'), 'canonical_url': item.get('canonical_url'),
+        'material_published_at': item.get('published_at'),
+        'material_timezone': item.get('source_timezone'), 'source_timezone': source.get('timezone'),
+    }
+    binding = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    if context.get('_date_context_binding') != binding or not isinstance(context.get('_source_date_context'), dict):
+        context['_source_date_context'] = date_context(item, citation, source)
+        context['_date_context_binding'] = binding
+    return copy.deepcopy(context['_source_date_context'])
 
 
 def date_context(item, citation, source):
