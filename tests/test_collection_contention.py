@@ -1,5 +1,7 @@
 import sqlite3
 import tempfile
+import threading
+import time
 from pathlib import Path
 from newsroom.workflow import enqueue
 import unittest
@@ -42,3 +44,23 @@ class DuplicateTransactionTests(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM resource_operations').fetchone()[0],1)
             finally:
                 observer.close();db.close()
+
+    def test_resource_receipt_waits_for_short_competing_writer(self):
+        from newsroom.db import connect
+        from newsroom.runtime import Runtime
+        with tempfile.TemporaryDirectory() as directory:
+            path=str(Path(directory)/'receipts.sqlite')
+            db=connect(path);db.close()
+            ready=threading.Event()
+            def hold_write_lock():
+                connection=sqlite3.connect(path)
+                connection.execute('BEGIN IMMEDIATE');ready.set()
+                time.sleep(.4);connection.commit();connection.close()
+            writer=threading.Thread(target=hold_write_lock);writer.start()
+            self.assertTrue(ready.wait(2))
+            try:
+                with Runtime(path,{}).measure('source_read','collector'):pass
+            finally:writer.join()
+            db=sqlite3.connect(path)
+            try:self.assertEqual(db.execute('SELECT COUNT(*) FROM resource_operations').fetchone()[0],1)
+            finally:db.close()

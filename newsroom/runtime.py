@@ -257,7 +257,10 @@ class Runtime:
                 parent['child_wall'] += elapsed
                 parent['child_cpu'] += cpu_used
             try:
-                with self.db(timeout=.2) as db:
+                with self.db(timeout=5) as db:
+                    # Acquire the write slot before reading provenance; a read
+                    # snapshot cannot always be upgraded while another writer commits.
+                    db.execute("BEGIN IMMEDIATE")
                     source_id = context.get('source_id')
                     if source_id is None and context.get('item_id') is not None:
                         item_source = db.execute('SELECT source_id FROM items WHERE item_id=?', (context['item_id'],)).fetchone()
