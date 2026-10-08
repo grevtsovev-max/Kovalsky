@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS items (
   UNIQUE(source_id, canonical_url), UNIQUE(source_id, content_hash)
 );
 CREATE INDEX IF NOT EXISTS items_story_idx ON items(story_id);
+CREATE INDEX IF NOT EXISTS items_discovered_idx ON items(discovered_at);
+CREATE INDEX IF NOT EXISTS items_discovered_julian_idx ON items(julianday(discovered_at));
 CREATE TABLE IF NOT EXISTS stories (
   story_id INTEGER PRIMARY KEY, canonical_topic TEXT NOT NULL, headline TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'ACTIVE', importance TEXT NOT NULL DEFAULT 'MEDIUM',

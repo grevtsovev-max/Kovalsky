@@ -98,6 +98,11 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.snapshot()['totals']['checked'], 0)
         self.assertEqual(self.snapshot(q='Материал 3')['totals']['received'], 1)
 
+    def test_materials_sort_by_instant_across_timezones(self):
+        self.add(1, discovered='2026-09-28T11:00:00+03:00')
+        self.add(2, discovered='2026-09-28T09:00:00+00:00')
+        self.assertEqual([item['item_id'] for item in self.snapshot()['items']], [2, 1])
+
     def test_work_attention_and_closed_buckets_filter_before_pagination(self):
         self.add(1, 'NOISE')
         self.add(2, 'STORE_ONLY')

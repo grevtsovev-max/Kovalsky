@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS processing_job_events (
  event_id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES processing_jobs(job_id),
  role TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS processing_job_events_job_idx ON processing_job_events(job_id,event_id DESC);
 CREATE TRIGGER IF NOT EXISTS processing_job_events_no_update BEFORE UPDATE ON processing_job_events
 BEGIN SELECT RAISE(ABORT, 'processing history is append only'); END;
 CREATE TRIGGER IF NOT EXISTS processing_job_events_no_delete BEFORE DELETE ON processing_job_events

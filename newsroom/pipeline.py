@@ -235,27 +235,39 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     story_expr = 'st.headline' if 'stories' in tables else 'NULL'
     retry_expr = 't.value' if 'app_state' in tables else 'NULL'
     triage_expr = 'tr.value' if 'app_state' in tables else 'NULL'
-    rows = db.execute('SELECT i.item_id,i.source_id,i.title,i.url,i.canonical_url,i.published_at,'
-        'i.discovered_at,i.processed_at,i.disposition,i.story_id,i.primary_source_json,'
+    revision_expr = 'i.ingest_revision' if any(r[1] == 'ingest_revision' for r in db.execute('PRAGMA table_info(items)')) else 'NULL'
+    # The cabinet needs read evidence, not the archived article body. Project it
+    # before SQLite sorts the rows so large source texts never fill the sorter.
+    primary_expr = "CASE WHEN json_valid(i.primary_source_json) THEN json_object(" + ','.join(
+        "'" + key + "',i.primary_source_json -> '$." + key + "'"
+        for key in ('status', 'url', '_material_read', '_material_url')
+    ) + ") ELSE '{}' END"
+    rows = db.execute('SELECT '+revision_expr+' AS ingest_revision,i.item_id,i.source_id,i.title,i.url,i.canonical_url,i.published_at,'
+        'i.discovered_at,i.processed_at,i.disposition,i.story_id,'+primary_expr+' AS primary_source_json,'
         's.name AS source_name,'+story_expr+' AS story_headline,a.created_at AS analyzed_at,a.result_json,'
         +retry_expr+' AS retry_json,'+triage_expr+' AS triage_json,f.is_interesting AS interest_vote '
         'FROM items i JOIN sources s USING(source_id) LEFT JOIN item_analysis a USING(item_id) '
         +story_join+' '+retry_join+' '+triage_join+' '
         'LEFT JOIN interest_feedback f USING(item_id) '
-        + where + ' ORDER BY i.discovered_at DESC,i.item_id DESC', args).fetchall()
+        + where + ' ORDER BY julianday(i.discovered_at) DESC,i.item_id DESC', args).fetchall()
     by_story = {}
     for post in posts:
         by_story.setdefault(post['story_id'], []).append(post)
     counts = dict.fromkeys(dict(STAGES), 0)
     totals = dict(received=0, first_filter=0, analyzed=0, primary_read=0, selected=0, drafted=0, checked=0, published=0)
+    revisions = {row['item_id']: row['ingest_revision'] for row in rows}
+    item_marks = 'SELECT value FROM json_each(?)'
+    item_ids = (json.dumps(list(revisions)),)
     keyword_passed = set()
     keyword_results = {}
     if 'material_stage_results' in tables:
         for r in db.execute(
-            "SELECT r.item_id,r.result_json FROM material_stage_results r JOIN items i USING(item_id) "
-            "WHERE r.revision=i.ingest_revision AND r.stage='screening' AND json_valid(r.result_json) "
-            "AND json_extract(r.result_json,'$.kind')='keyword_prefilter' ORDER BY r.created_at"):
-            result = obj(r[1])
+            "SELECT r.item_id,r.revision,r.result_json FROM material_stage_results r "
+            f"WHERE r.item_id IN ({item_marks}) AND r.stage='screening' AND json_valid(r.result_json) "
+            "AND json_extract(r.result_json,'$.kind')='keyword_prefilter' ORDER BY r.created_at", item_ids):
+            if r['revision'] != revisions[r['item_id']]:
+                continue
+            result = obj(r['result_json'])
             keyword_results[r[0]] = result
             if result.get('passed') is True:
                 keyword_passed.add(r[0])
@@ -263,8 +275,10 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     if 'material_stage_state' in tables:
         from .material_flow import LABELS
         for row in db.execute(
-            'SELECT f.* FROM material_stage_state f JOIN items i USING(item_id) '
-            'WHERE f.revision=i.ingest_revision ORDER BY f.updated_at'):
+            f'SELECT f.* FROM material_stage_state f WHERE f.item_id IN ({item_marks}) '
+            'ORDER BY f.updated_at', item_ids):
+            if row['revision'] != revisions[row['item_id']]:
+                continue
             point = {key: row[key] for key in row.keys() if key not in {'item_id', 'revision'}}
             point['label'] = LABELS.get(point['stage'], point['stage'])
             elapsed = max(0, (now - datetime.fromisoformat(point['updated_at'])).total_seconds())
@@ -276,6 +290,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     output = []
     for row in rows:
         item = dict(row)
+        item.pop('ingest_revision', None)
         if query and query not in (item['title'] + ' ' + item['source_name'] + ' ' + item['url']).casefold():
             continue
         analysis = obj(item.pop('result_json'))
