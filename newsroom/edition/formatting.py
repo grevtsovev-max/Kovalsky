@@ -2,6 +2,7 @@
 from __future__ import annotations
 import copy
 import html
+import json
 import re
 import unicodedata
 from urllib.parse import urlsplit
@@ -34,12 +35,36 @@ def citations(draft):
             *(citation for block in draft.get('blocks',[]) for citation in block.get('evidence',[]))]
 
 
+def material_source(material):
+    """Pair the actual material publisher with its own URL, never a monitoring feed label."""
+    metadata=material.get('primary_source_json') or {}
+    if isinstance(metadata,str):
+        try:metadata=json.loads(metadata)
+        except (ValueError,TypeError):metadata={}
+    if not isinstance(metadata,dict):metadata={}
+    def usable(value):
+        if not isinstance(value,str):return False
+        try:
+            parsed=urlsplit(value)
+            return parsed.scheme in ('http','https') and bool(parsed.hostname) and not parsed.username and not parsed.password
+        except ValueError:return False
+    saved=metadata.get('_material_url')
+    url=saved if usable(saved) else material.get('url','')
+    publisher=metadata.get('_material_publisher')
+    if not isinstance(publisher,str) or not publisher.strip():
+        publisher=material.get('source_name') or ''
+        if publisher.startswith('Упоминания:'):publisher=''
+    try:host=urlsplit(url).hostname
+    except ValueError:host=None
+    return (publisher.strip() or host or 'Источник',url)
+
+
 def source_list(draft,materials):
     used={c.get('material_id') for c in citations(draft)}
     result=[];seen=set()
     for material in materials:
         if material['material_id'] not in used:continue
-        pair=(material.get('source_name') or urlsplit(material['url']).hostname or 'Источник',material['url'])
+        pair=material_source(material)
         if pair not in seen:seen.add(pair);result.append(pair)
     return result
 

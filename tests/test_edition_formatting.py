@@ -1,6 +1,7 @@
 import copy
+import json
 import unittest
-from newsroom.edition.formatting import validate,render,normalize
+from newsroom.edition.formatting import validate,render,normalize,material_source
 from newsroom.edition import store
 from edition_helpers import EditionCase,draft,LEAD,BODY
 
@@ -81,6 +82,31 @@ class FormattingTests(EditionCase):
         self.draft['blocks'][0]['text']='  «Цена  0.10 USD» — Иванов.  '
         self.assertEqual(normalize(self.draft)['blocks'][0]['text'],'«Цена  0.10 USD» — Иванов.')
         self.assertEqual(self.draft['blocks'][0]['text'],'  «Цена  0.10 USD» — Иванов.  ')
+
+    def test_each_publisher_links_to_its_own_material(self):
+        second=copy.deepcopy(self.materials[0]);second['material_id']=999
+        for material,publisher,url in [(self.materials[0],'CoinDesk','https://coindesk.com/article-one'),(second,'Cointelegraph','https://cointelegraph.com/article-two')]:
+            material['source_name']='Упоминания: CoinDesk, Cointelegraph,'
+            material['url']='https://news.google.com/rss/articles/discovery'
+            material['primary_source_json']=json.dumps({'_material_publisher':publisher,'_material_url':url,'url':'https://unread-primary.example/','publisher':'Unrelated primary source'})
+        self.draft['blocks'][0]['evidence'].append({'material_id':999,'quote':BODY})
+        markup,_=render(self.draft,self.materials+[second])
+        self.assertIn('<a href="https://coindesk.com/article-one">CoinDesk</a>',markup)
+        self.assertIn('<a href="https://cointelegraph.com/article-two">Cointelegraph</a>',markup)
+        self.assertNotIn('Упоминания:',markup)
+        self.assertNotIn('unread-primary',markup)
+
+    def test_publisher_with_only_google_news_url_keeps_article_link(self):
+        material=self.materials[0]
+        material['url']='https://news.google.com/rss/articles/one'
+        material['primary_source_json']=json.dumps({'_material_publisher':'CoinDesk','_material_url':material['url']})
+        self.assertEqual(material_source(material),('CoinDesk',material['url']))
+
+    def test_malformed_metadata_and_unsafe_material_url_fall_back(self):
+        material=self.materials[0]
+        for metadata in ('broken','[]','null',json.dumps({'_material_url':'javascript:alert(1)'})):
+            material['primary_source_json']=metadata
+            self.assertEqual(material_source(material),('Проверенный источник',material['url']))
 
     def test_no_minimum_words(self):
         self.assertEqual(validate(self.draft,self.materials),[])

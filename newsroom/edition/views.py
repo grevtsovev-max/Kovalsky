@@ -2,6 +2,7 @@
 from __future__ import annotations
 from datetime import datetime,timezone
 from . import model,store
+from .formatting import material_source
 
 LABELS={'QUEUED':'Ожидает подготовки','PLANNING':'Группировка','DRAFTING':'Написание','CHECKING':'Проверка','READY':'Ожидает доставки',
         'SENDING':'Отправляется','PUBLISHED':'Опубликовано','INCOMPLETE':'Не завершено','REJECTED':'Не подготовлено','UNKNOWN':'Результат отправки неизвестен'}
@@ -21,7 +22,7 @@ def overview(db,config):
             docs.append({'document_id':d['document_id'],'subject':group.get('subject'),'state':d['state'],
                 'state_label':LABELS.get(d['state'],d['state']),'text':d['plain_text'],'draft':store.read(d['draft_json'],{}),
                 'repairs':d['repairs'],'reasons':store.read(d['reasons_json'],[]),'post_id':d['post_id'],
-                'sources':[{'material_id':m['material_id'],'url':m['url'],'name':m['source_name']} for m in store.read(d['materials_json'],[])]})
+                'sources':[{'material_id':m['material_id'],'url':material_source(m)[1],'name':material_source(m)[0]} for m in store.read(d['materials_json'],[])]})
         retryable=job['state'] in ('INCOMPLETE','REJECTED') and not any(d['state'] in ('UNKNOWN','SENDING','READY') for d in docs)
         if db.execute("SELECT 1 FROM edition_jobs WHERE retry_of=? AND state NOT IN ('INCOMPLETE','REJECTED')",(job['job_id'],)).fetchone():retryable=False
         jobs.append({'job_id':job['job_id'],'retry_of':job['retry_of'],'state':job['state'],'state_label':LABELS.get(job['state'],job['state']),
