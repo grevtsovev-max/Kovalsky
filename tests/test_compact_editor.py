@@ -140,6 +140,7 @@ class CompactEditorTests(unittest.TestCase):
 
     def test_text_repair_resumes_saved_facts_without_combined_rerun(self):
         self.prepare()
+        self.config['ai']['_text_repair_delay_seconds'] = 30
         checks = [dict(issues=['Исправить формулировку'], editorial_check=self.audit, covered_claims=[]),
                   dict(issues=[], editorial_check=self.audit,
                        covered_claims=[dict(fact_id=1, post_quote=self.evidence)])]
@@ -152,6 +153,12 @@ class CompactEditorTests(unittest.TestCase):
              patch.object(ai, 'validate_draft', side_effect=checks) as check, \
              patch.object(ai, 'request_response', side_effect=self.provider) as request:
             self.assertEqual(self.process(), 'WAITING_CONFIRMATION')
+            from datetime import datetime, timezone
+            state = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])
+            delay = (datetime.fromisoformat(state['next_at']) - datetime.now(timezone.utc)).total_seconds()
+            self.assertGreater(delay, 20)
+            self.assertLessEqual(delay, 30)
+            self.assertEqual(state['attempts'], 0)
             row = self.db.execute('SELECT * FROM items').fetchone()
             resumed = _saved_material(row, self.source)
             self.assertEqual(self.process(resumed, row['item_id']), 'NEW_STORY')
@@ -161,6 +168,30 @@ class CompactEditorTests(unittest.TestCase):
         self.assertEqual(check.call_count, 2)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0], 1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 1)
+
+    def test_fast_text_repair_keeps_three_retry_limit(self):
+        self.prepare()
+        self.config['ai']['_text_repair_delay_seconds'] = 30
+        draft = dict(headline_ru=self.value['headline_ru'], summary_ru=self.evidence,
+                     what_is_new=self.evidence, editorial_check=self.audit)
+        checked = dict(issues=['Не устранено искажение факта'], editorial_check=self.audit, covered_claims=[])
+        with patch.object(ai, 'get_api_key', return_value='test'), \
+             patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.fetch_publisher_article', return_value=self.article) as reader, \
+             patch.object(ai, 'draft_post', return_value=draft) as writer, \
+             patch.object(ai, 'validate_draft', return_value=checked) as check, \
+             patch.object(ai, 'request_response', side_effect=self.provider) as request:
+            self.assertEqual(self.process(), 'WAITING_CONFIRMATION')
+            for attempts, outcome in ((1, 'WAITING_CONFIRMATION'), (2, 'WAITING_CONFIRMATION'), (3, 'REJECTED')):
+                row = self.db.execute('SELECT * FROM items').fetchone()
+                self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), outcome)
+                state = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])
+                self.assertEqual(state['attempts'], attempts)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(reader.call_count, 1)
+        self.assertEqual(writer.call_count, 3)
+        self.assertEqual(check.call_count, 4)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
 
     def test_final_checker_failure_cannot_create_post(self):
         self.prepare()

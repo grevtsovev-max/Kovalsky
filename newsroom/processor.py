@@ -23,6 +23,8 @@ def prepare(config, db=None):
     config['ai'] = {k: v for k, v in config['ai'].items()
                     if k not in {'_analysis_budget', '_triage_budget', '_disabled_for_cycle', '_triage_disabled'}}
     config['ai']['_retry_cycle_delay_seconds'] = 30
+    # A text correction already has evidence; it need not wait for new facts.
+    config['ai']['_text_repair_delay_seconds'] = 30
     config['ai']['_research_agent_budget'] = 1
     config['ai']['_recovery_search_budget'] = 2
     if db is not None:

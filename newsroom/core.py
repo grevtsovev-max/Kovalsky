@@ -2244,11 +2244,15 @@ def process_item_steps(db, source, item: dict, threshold: float, max_length: int
                     db.execute("UPDATE items SET disposition=?,processed_at=? WHERE item_id=?", (outcome, NOW(), row['item_id']))
             if outcome in {"PRIMARY_RETRY", "AI_RETRY", "WAITING_CONFIRMATION"}:
                 retry_without_count = bool(item.get("_retry_without_count") or item.get("_source_search_deferred"))
+                retry_delay = (item.get('_retry_delay_seconds', (ai_settings or {}).get('_retry_cycle_delay_seconds'))
+                               if retry_without_count else
+                               (ai_settings or {}).get('_text_repair_delay_seconds')
+                               if item.get('_text_repair_ready') else None)
                 attempts = schedule_retry(
                     db, row["item_id"], outcome,
                     retry=existing_item_id is not None and not item.get('_workflow_first_attempt') and not retry_without_count,
                     reason=item.get("_retry_reason"),
-                    delay_seconds=item.get('_retry_delay_seconds', (ai_settings or {}).get("_retry_cycle_delay_seconds")) if retry_without_count else None,
+                    delay_seconds=retry_delay,
                 )
                 if attempts >= MAX_AUTOMATIC_RETRIES:
                     exhausted_reason = (f"Исчерпан лимит: {attempts} автоматических повторных проверок; "
@@ -3136,6 +3140,7 @@ def _finish_post_steps(db, item, ai_settings, context):
             db.commit()
             return 'AI_RETRY'
         if checked['issues']:
+            item['_text_repair_ready'] = True
             ai_result['editorial_issues'] = checked['issues']
             ai_result['_needs_post_draft'] = True
             ai_result['_validation_pending'] = False
@@ -3189,6 +3194,7 @@ def _finish_post_steps(db, item, ai_settings, context):
             issues.append(str(exc))
         if issues:
             ai_result["editorial_issues"] = issues
+            item['_text_repair_ready'] = True
             ai_result['_needs_post_draft'] = True
             from .material_flow import save_draft_context
             context['ai_result'] = ai_result
