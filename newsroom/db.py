@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import hashlib
-from functools import lru_cache
 from pathlib import Path
 
 
@@ -234,17 +232,6 @@ CREATE TABLE IF NOT EXISTS interest_feedback (
 """
 
 
-@lru_cache(maxsize=1)
-def _schema_signature():
-    # Any change to a schema owner or migration invalidates the fast path.
-    modules = ('db', 'runtime', 'workflow', 'material_flow', 'delivery', 'decisions',
-               'knowledge', 'source_search', 'watch', 'archive_memory')
-    digest = hashlib.sha256()
-    for name in modules:
-        digest.update((Path(__file__).parent / (name + '.py')).read_bytes())
-    return digest.hexdigest()
-
-
 def connect(path: str) -> sqlite3.Connection:
     db_path = Path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -253,35 +240,8 @@ def connect(path: str) -> sqlite3.Connection:
     # Service sandboxes may have no writable SQLite temporary directory.
     # Sorting and temporary indexes must not depend on filesystem access.
     db.execute("PRAGMA temp_store=MEMORY")
-    db.execute("PRAGMA foreign_keys=ON")
-    signature = _schema_signature()
-    try:
-        saved = db.execute("SELECT value FROM app_state WHERE key='database_schema_ready'").fetchone()
-    except sqlite3.OperationalError as exc:
-        if 'no such table' not in str(exc):
-            db.close()
-            raise
-        saved = None
-    cookie = db.execute('PRAGMA schema_version').fetchone()[0]
-    if saved:
-        try:
-            ready = json.loads(saved[0])
-        except (ValueError, TypeError):
-            ready = {}
-        if isinstance(ready, dict) and ready.get('signature') == signature and ready.get('cookie') == cookie:
-            return db
-    if db.execute('PRAGMA journal_mode').fetchone()[0] != 'wal':
-        db.execute("PRAGMA journal_mode=WAL")
-    try:
-        db.executescript(SCHEMA)
-    except sqlite3.OperationalError as exc:
-        if str(exc) != 'non-deterministic use of julianday() in an index':
-            raise
-        # Legacy data can contain literal SQLite clock words such as "now".
-        # Preserve that unknown date; an optional performance index must not
-        # prevent opening and migrating the whole database.
-        db.executescript(SCHEMA.replace(
-            'CREATE INDEX IF NOT EXISTS items_discovered_julian_idx ON items(julianday(discovered_at));', ''))
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(SCHEMA)
     from .runtime import SCHEMA as RUNTIME_SCHEMA, USAGE_COLUMNS, stamp
     from .workflow import SCHEMA as WORKFLOW_SCHEMA
     db.executescript(RUNTIME_SCHEMA)
@@ -363,9 +323,6 @@ def connect(path: str) -> sqlite3.Connection:
     db.execute("UPDATE interest_feedback SET previous_disposition='WAITING_CONFIRMATION' "
                "WHERE is_interesting=0 AND previous_disposition IS NULL AND note='Пользователь отметил как неинтересное' "
                "AND item_id IN (SELECT item_id FROM items WHERE disposition='NOISE')")
-    db.execute("INSERT INTO app_state(key,value) VALUES('database_schema_ready',?) "
-               "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-               (json.dumps({'signature': signature, 'cookie': db.execute('PRAGMA schema_version').fetchone()[0]}),))
     db.commit()
     return db
 

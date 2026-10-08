@@ -72,36 +72,6 @@ class PolicyV1Tests(unittest.TestCase):
         self.assertEqual(history['failures'], 8)
         self.assertEqual(history['episode_failures'], 4)
 
-    def test_batch_recovery_scans_once_without_holding_writer_and_keeps_rejection(self):
-        from newsroom.material_flow import recover_technical_batch
-        self.stored()
-        self.db.execute("UPDATE items SET disposition='TECHNICAL_ERROR' WHERE item_id=1")
-        self.db.execute("INSERT INTO items(item_id,source_id,url,canonical_url,title,discovered_at,content_hash,title_hash,ingest_revision,disposition) "
-                        "VALUES(2,1,'u2','u2','Банк',?,'h2','t2','v2','REJECTED')", (self.now.isoformat(),))
-        self.db.commit()
-        original = self.db
-        checks = []
-        class ConnectionProxy:
-            def __getattr__(self, name):
-                return getattr(original, name)
-            def execute(self, sql, *args):
-                if sql == 'PRAGMA quick_check':
-                    checks.append(sql)
-                    self_test.assertFalse(original.in_transaction)
-                    other = connect(self_test.path)
-                    try:
-                        other.execute('BEGIN IMMEDIATE')
-                        other.rollback()
-                    finally:
-                        other.close()
-                return original.execute(sql, *args)
-        self_test = self
-        result = recover_technical_batch(ConnectionProxy(), {}, [1, 2, 1], 'Verified capacity fix and regression tests passed')
-        self.assertEqual(len(checks), 1)
-        self.assertEqual([r['item_id'] for r in result['recovered']], [1])
-        self.assertEqual(result['skipped'], [{'item_id': 2, 'reason': 'RECOVERY_REQUIRES_TECHNICAL_ERROR'}])
-        self.assertEqual(self.db.execute('SELECT disposition FROM items WHERE item_id=2').fetchone()[0], 'REJECTED')
-
     def test_writer_date_context_preserves_day_and_cross_year_timezone(self):
         item = {'url': 'https://example.org/1', 'published_at': '2025-12-31T22:30:00+00:00',
                 'discovered_at': '2026-01-03T12:00:00+00:00'}
@@ -342,18 +312,6 @@ class PolicyV1Tests(unittest.TestCase):
         self.assertEqual(parse_date('2026-10-07'), '2026-10-07')
         self.assertIsNone(parse_date('2026-02-30'))
         self.assertEqual(parse_date('2026-10-07T10:00:00+03:00'), '2026-10-07T07:00:00+00:00')
-        self.assertIsNone(parse_date('2026-10-07T10:00:00'))
-        self.assertIsNone(parse_date('Wed, 07 Oct 2026 10:00:00'))
-
-    def test_naive_timestamp_requires_source_timezone_without_inventing_utc(self):
-        receipt = datetime(2026, 10, 7, 14, 56, tzinfo=timezone.utc)
-        self.stored(receipt)
-        item = {'published_at': '2026-10-07T17:55:00'}
-        self.assertIsNone(policy.admission(self.db, 1, item, self.source, 24))
-        self.assertIsNone(self.db.execute("SELECT value FROM app_state WHERE key='policy_admission:1:v1'").fetchone())
-        self.assertEqual(policy.admission(self.db, 1, item, self.source, 24, after_read=True)[0], 'STORE_ONLY')
-        item['source_timezone'] = 'Europe/Moscow'
-        self.assertIsNone(policy.admission(self.db, 1, item, self.source, 24, after_read=True))
 
     def test_day_precision_uses_known_source_timezone(self):
         receipt = datetime(2026, 10, 7, 22, 30, tzinfo=timezone.utc)

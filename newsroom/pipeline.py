@@ -271,8 +271,6 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             keyword_results[r[0]] = result
             if result.get('passed') is True:
                 keyword_passed.add(r[0])
-            else:
-                keyword_passed.discard(r[0])
     flow_by_item = {}
     if 'material_stage_state' in tables:
         from .material_flow import LABELS
@@ -371,22 +369,14 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                     reason = active_checkpoint['reason']
         counts[category] += 1
         proof = ((post.get('facts') or {}).get('final_text_check') or {}) if post else {}
-        # A Telegram edit changes the display, not the completed pre-send check.
-        # Drafts still require proof of their current text. Never infer a check
-        # merely from PUBLISHED: verify the stored original against its proof.
-        checked_text = ((post.get('saved_text', post.get('text')) if category == 'published'
-                         else post.get('text')) or '') if post else ''
         progress = {
             'received': True,
             'first_filter': item['item_id'] in keyword_passed,
             'analyzed': bool(item['analyzed_at']),
-            # Telegram intake already contains a read post, even before screening.
-            # Count only admitted current revisions as reaching the reading step.
-            'primary_read': item['item_id'] in keyword_passed and (
-                primary.get('status') == 'READ' or primary.get('_material_read') is True),
+            'primary_read': primary.get('status') == 'READ' or primary.get('_material_read') is True,
             'selected': analysis.get('is_relevant') is True or post is not None,
             'drafted': post is not None,
-            'checked': bool(post and proof.get('assembled_sha256') and proof['assembled_sha256'] == hashlib.sha256(checked_text.encode()).hexdigest()),
+            'checked': bool(post and proof.get('assembled_sha256') and proof['assembled_sha256'] == hashlib.sha256((post.get('text') or '').encode()).hexdigest()),
             'published': category == 'published',
         }
         in_counter_cohort = not counter_epoch or item['item_id'] > counter_epoch['after_item_id']
@@ -467,25 +457,25 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             if history[-1]['reason'] != 'Подробная причина в этой исторической записи не сохранена.':
                 item['reason'] = history[-1]['reason']
     funnel = [
-        ('received', 'Собрано материалов', 'Сборщик · программа',
+        ('received', 'Получено материалов', 'Сборщик · программа',
          'Получает публикации из подключённых источников и сохраняет ссылку, доступный текст и даты.',
          'Количество уникальных сохранённых материалов за выбранный период. Повторное получение той же версии не увеличивает число.'),
-        ('first_filter', 'Отобрано по теме', 'Фильтр · без ИИ',
+        ('first_filter', 'Прошли первый фильтр', 'Фильтр · без ИИ',
          'Проверяет словоформы, роли ключевиков и сочетания из таблицы. Принимает окончательное решение о тематике и сохраняет причину.',
          'Количество материалов с сохранённым допуском первого фильтра. Сам допуск по теме ещё не означает готовность к публикации.'),
-        ('primary_read', 'Текст отобранных материалов получен', 'Чтение · программа',
-         'После допуска по теме получает пригодный текст: использует уже сохранённый полный пост Telegram или открывает статью. Сохраняет URL и атрибуцию. Прочитанный пересказ тоже допустим.',
-         'Количество материалов, прошедших первый фильтр в текущей версии и имеющих сохранённый прочитанный текст. Текст отклонённых и ещё не отобранных публикаций сюда не входит.'),
-        ('analyzed', 'Разобрано ИИ', 'ИИ · один запрос',
+        ('primary_read', 'Прочитано', 'Чтение · программа',
+         'Открывает источник, извлекает пригодный текст и сохраняет его вместе с URL и атрибуцией. Прочитанный пересказ тоже допустим.',
+         'Количество материалов с сохранённым прочитанным текстом. Найденная ссылка сама по себе не считается чтением.'),
+        ('analyzed', 'Факты и черновик', 'ИИ · один запрос',
          'За один запрос выделяет подтверждённые факты, сравнивает их с опубликованным и сразу готовит черновик. Тематику повторно не оценивает; готовый текст проверяется отдельно.',
          'Количество материалов с сохранённым результатом разбора ИИ, включая отказы, дубликаты и случаи, требующие уточнения.'),
-        ('drafted', 'Пост сохранён', 'Программа · оформление',
+        ('drafted', 'Оформление поста', 'Программа · оформление',
          'Использует черновик из того же запроса ИИ, которым выполнен разбор. Программа оформляет ссылку на источник и сохраняет пост. Отдельный запрос написания нужен только для исправления текста или продолжения прежнего разбора.',
          'Количество материалов со связанным сохранённым постом, включая впоследствии отклонённые. Промежуточный текст до сохранения поста здесь не учитывается.'),
-        ('checked', 'Текст проверен', 'ИИ + программа',
+        ('checked', 'Проверка текста', 'ИИ + программа',
          'ИИ сверяет готовый текст с источником: утверждения, числа, авторов и стадию события. Замечания возвращают только к исправлению текста и его проверке, без повторного разбора материала. Программа проверяет связь с фактами и целостность проверенного текста. Повторного тематического отбора нет.',
-         'Количество материалов с подтверждённой проверкой текста: для черновиков — текущей версии, для опубликованных — сохранённой версии перед отправкой. Последующие изменения в Telegram не отменяют пройденный этап; проверка правок учитывается отдельно.'),
-        ('published', 'Опубликовано', 'Бот + Telegram',
+         'Количество материалов с сохранённой проверкой именно текущего текста поста. Изменённый после проверки текст не считается проверенным.'),
+        ('published', 'Отправка и квитанция', 'Бот + Telegram',
          'Бот отправляет допущенный пост штатным способом и сохраняет ответ Telegram с идентификатором сообщения. Неизвестный результат отправки требует сверки.',
          'Количество материалов со связанным постом, для которого сохранён статус публикации.'),
     ]

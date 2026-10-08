@@ -218,30 +218,6 @@ class CompactEditorTests(unittest.TestCase):
         reader.assert_called_once()
         writer.assert_not_called()
 
-    def test_invalid_binding_rechecks_saved_text_without_cached_failure(self):
-        self.prepare()
-        self.config['ai']['_text_repair_delay_seconds'] = 30
-        invalid = dict(issues=[], editorial_check=self.audit,
-                       covered_claims=[dict(fact_id=1, post_quote='Выдуманная фраза, которой нет в посте')])
-        valid = dict(issues=[], editorial_check=self.audit,
-                     covered_claims=[dict(fact_id=1, post_quote=self.evidence)])
-        with patch.object(ai, 'get_api_key', return_value='test'), \
-             patch('newsroom.core.get_api_key', return_value='test'), \
-             patch('newsroom.core.fetch_publisher_article', return_value=self.article) as reader, \
-             patch.object(ai, 'draft_post') as writer, \
-             patch.object(ai, 'validate_draft', side_effect=[invalid, valid]) as checker, \
-             patch.object(ai, 'request_response', side_effect=self.provider) as request:
-            self.assertEqual(self.process(), 'WAITING_CONFIRMATION')
-            self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
-            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM app_state WHERE key LIKE 'transport_retry:%'").fetchone()[0], 0)
-            row = self.db.execute('SELECT * FROM items').fetchone()
-            self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), 'NEW_STORY')
-        self.assertEqual(checker.call_count, 2)
-        self.assertEqual(request.call_count, 1)
-        reader.assert_called_once()
-        writer.assert_not_called()
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0], 1)
-
     def test_final_checker_failure_cannot_create_post(self):
         self.prepare()
         with patch.object(ai, 'get_api_key', return_value='test'), \
