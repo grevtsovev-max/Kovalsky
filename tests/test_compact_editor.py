@@ -193,6 +193,31 @@ class CompactEditorTests(unittest.TestCase):
         self.assertEqual(check.call_count, 4)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
 
+    def test_final_capacity_wait_does_not_consume_transport_or_editorial_retries(self):
+        from newsroom.runtime import BudgetDeferred
+        self.prepare()
+        checks = [BudgetDeferred('concurrency', 1) for _ in range(4)]
+        checks.append(dict(issues=[], editorial_check=self.audit,
+                           covered_claims=[dict(fact_id=1, post_quote=self.evidence)]))
+        with patch.object(ai, 'get_api_key', return_value='test'), \
+             patch('newsroom.core.get_api_key', return_value='test'), \
+             patch('newsroom.core.fetch_publisher_article', return_value=self.article) as reader, \
+             patch.object(ai, 'draft_post') as writer, \
+             patch.object(ai, 'validate_draft', side_effect=checks), \
+             patch.object(ai, 'request_response', side_effect=self.provider) as request:
+            self.assertEqual(self.process(), 'AI_RETRY')
+            for _ in range(3):
+                row = self.db.execute('SELECT * FROM items').fetchone()
+                self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), 'AI_RETRY')
+                state = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])
+                self.assertEqual(state['attempts'], 0)
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM app_state WHERE key LIKE 'transport_retry:%'").fetchone()[0], 0)
+            row = self.db.execute('SELECT * FROM items').fetchone()
+            self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), 'NEW_STORY')
+        self.assertEqual(request.call_count, 1)
+        reader.assert_called_once()
+        writer.assert_not_called()
+
     def test_final_checker_failure_cannot_create_post(self):
         self.prepare()
         with patch.object(ai, 'get_api_key', return_value='test'), \

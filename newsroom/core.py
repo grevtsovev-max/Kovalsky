@@ -3133,8 +3133,10 @@ def _finish_post_steps(db, item, ai_settings, context):
             account = account_unavailable(getattr(exc, 'code', None))
             item['_technical_error'] = technical_error(exc)
             item['_retry_without_count'] = isinstance(exc, BudgetDeferred) or account
-            item['_flow_block_kind'] = 'account' if account else 'technical' if item['_technical_error'] else 'transport'
-            item['_retry_reason'] = 'Проверка текста отложена: ' + getattr(exc, 'code', type(exc).__name__)
+            item['_flow_block_kind'] = ('account' if account else 'technical' if item['_technical_error']
+                                       else exc.block_kind if isinstance(exc, BudgetDeferred) else 'transport')
+            item['_retry_reason'] = 'Проверка текста отложена: ' + (exc.user_reason if isinstance(exc, BudgetDeferred)
+                                                                  else getattr(exc, 'code', type(exc).__name__))
             if isinstance(exc, BudgetDeferred): item['_retry_delay_seconds'] = exc.delay_seconds
             db.execute("UPDATE items SET disposition='AI_RETRY',processed_at=? WHERE item_id=?", (NOW(), item_id))
             db.commit()
