@@ -91,7 +91,7 @@ class PipelineTests(unittest.TestCase):
         self.posts[0]['facts']['final_text_check'] = {'assembled_sha256': hashlib.sha256('Проверенный текст'.encode()).hexdigest()}
         result = self.snapshot(stage='filtered')
         counts = {step['key']: step['count'] for step in result['funnel']}
-        self.assertEqual(counts, {'received': 3, 'first_filter': 0, 'primary_read': 1, 'analyzed': 2, 'drafted': 1, 'checked': 1, 'published': 0})
+        self.assertEqual(counts, {'received': 3, 'first_filter': 0, 'primary_read': 0, 'analyzed': 2, 'drafted': 1, 'checked': 1, 'published': 0})
         self.assertEqual(result['total'], 1)
         self.assertEqual(sum(step['count'] for step in result['stages']), 3)
         self.posts[0]['text'] = 'Изменённый непроверенный текст'
@@ -143,7 +143,7 @@ class PipelineTests(unittest.TestCase):
         report = self.snapshot(milestone='analyzed')
         self.assertEqual([i['item_id'] for i in report['items']], [1])
         self.assertEqual(report['total'], report['totals']['analyzed'])
-        self.assertEqual(self.snapshot(milestone='primary_read')['total'], 1)
+        self.assertEqual(self.snapshot(milestone='primary_read')['total'], 0)
         self.assertEqual(self.snapshot(bucket='work', milestone='analyzed')['total'], 0)
         self.assertEqual(self.snapshot(milestone='received')['total'], 2)
 
@@ -205,5 +205,28 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result['totals']['analyzed'],1)
         self.assertEqual(result['items'][0]['summary'],'Вывод')
         self.assertEqual(self.snapshot(q='нет совпадений')['total'],0)
+
+
+    def test_read_counter_requires_current_filter_admission(self):
+        self.add(1, primary={'_material_read': True})
+        self.add(2, primary={'_material_read': True})
+        self.db.execute("ALTER TABLE items ADD COLUMN ingest_revision TEXT DEFAULT 'r2'")
+        self.db.execute('CREATE TABLE material_stage_results(item_id INTEGER,revision TEXT,stage TEXT,result_json TEXT,created_at TEXT)')
+        for item_id, revision, passed in [(1, 'r2', True), (2, 'r1', True)]:
+            self.db.execute('INSERT INTO material_stage_results VALUES(?,?,?,?,?)',
+                (item_id, revision, 'screening', json.dumps({'kind':'keyword_prefilter','passed':passed}), '2026-09-28T11:00:00+00:00'))
+        report = self.snapshot(milestone='primary_read')
+        self.assertEqual([i['item_id'] for i in report['items']], [1])
+        self.assertEqual(report['totals']['primary_read'], 1)
+
+    def test_published_check_uses_saved_pre_send_text(self):
+        import hashlib
+        self.add(1)
+        self.post()
+        self.posts[0].update(origin_item_id=1, text='Изменённый текст Telegram', saved_text='Проверенный текст')
+        self.posts[0]['facts']['final_text_check'] = {'assembled_sha256': hashlib.sha256('Проверенный текст'.encode()).hexdigest()}
+        self.assertEqual(self.snapshot()['totals']['checked'], 1)
+        self.posts[0]['saved_text'] = 'Текст без подтверждения'
+        self.assertEqual(self.snapshot()['totals']['checked'], 0)
 
 if __name__=='__main__':unittest.main()

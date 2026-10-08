@@ -230,16 +230,42 @@ def verification_questions(result):
 
 def recover_technical(db, config, item_id, evidence):
     """Explicit, evidenced recovery; retain editorial counts and old failure totals."""
+    db.commit()
+    _check_recovery_integrity(db, evidence)
+    return _recover_technical_checked(db, config, item_id, evidence)
+
+
+def _check_recovery_integrity(db, evidence):
+    if not isinstance(evidence, str) or not 10 <= len(evidence.strip()) <= 2000:
+        raise ValueError('RECOVERY_EVIDENCE_REQUIRED')
+    if db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+        raise ValueError('DATABASE_INTEGRITY_FAILED')
+
+
+def recover_technical_batch(db, config, item_ids, evidence):
+    """Check integrity once, then retain every material's recovery guards."""
+    db.commit()
+    _check_recovery_integrity(db, evidence)
+    recovered, skipped = [], []
+    for item_id in dict.fromkeys(item_ids):
+        try:
+            recovered.append(_recover_technical_checked(db, config, item_id, evidence))
+        except ValueError as exc:
+            skipped.append({'item_id': item_id, 'reason': str(exc)})
+    return {'recovered': recovered, 'skipped': skipped}
+
+
+def _recover_technical_checked(db, config, item_id, evidence):
     from .core import _saved_material
     from .workflow import enqueue
     import uuid
     if not isinstance(evidence, str) or not 10 <= len(evidence.strip()) <= 2000:
         raise ValueError('RECOVERY_EVIDENCE_REQUIRED')
     db.commit()
+    # Integrity scanning may take minutes on a large database. In WAL mode a
+    # read scan must not reserve the writer while other materials are processed.
     db.execute('BEGIN IMMEDIATE')
     try:
-        if db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
-            raise ValueError('DATABASE_INTEGRITY_FAILED')
         item = db.execute('SELECT * FROM items WHERE item_id=?', (item_id,)).fetchone()
         if not item or item['disposition'] != 'TECHNICAL_ERROR':
             raise ValueError('RECOVERY_REQUIRES_TECHNICAL_ERROR')

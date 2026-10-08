@@ -56,6 +56,19 @@ class PrimarySourceExtractionTests(unittest.TestCase):
                 with self.assertRaises(IntakeError):
                     _submit_locked(config, article['url'])
 
+    def test_page_without_timezone_retains_confirmed_feed_date(self):
+        body = 'Банк получил разрешение на выпуск цифровых активов. ' * 4
+        page = ('<html><head><meta property="article:published_time" content="2026-10-07T17:55:00">'
+                '<script type="application/ld+json">' + json.dumps({'@type': 'NewsArticle', 'articleBody': body})
+                + '</script></head><body></body></html>')
+        feed_date = '2026-10-07T14:55:00+00:00'
+        with patch('newsroom.core._request_with_url', return_value=(page.encode(), 'https://example.org/news', 'text/html')):
+            article = fetch_publisher_article('https://example.org/news', 'Издание', feed_date, discover_primary=False)
+        self.assertEqual(article['published_at'], feed_date)
+        with patch('newsroom.core._request_with_url', return_value=(page.encode(), 'https://example.org/news', 'text/html')):
+            article = fetch_publisher_article('https://example.org/news', 'Издание', None, discover_primary=False)
+        self.assertIsNone(article['published_at'])
+
     def test_zoom_modified_metadata_is_not_invented_publication_time(self):
         parser = PublisherArticleParser()
         parser.feed('<meta name="zoom:last-modified" content="Tue, 06 Oct 2026 15:16:00 GMT">')
@@ -407,6 +420,7 @@ class PrimarySourceExtractionTests(unittest.TestCase):
             columns = {row[1] for row in db.execute("PRAGMA table_info(items)")}
             self.assertIn("primary_source_json", columns)
             self.assertEqual(db.execute("SELECT primary_source_json FROM items WHERE item_id=1").fetchone()[0], "{}")
+            self.assertEqual(db.execute("SELECT discovered_at FROM items WHERE item_id=1").fetchone()[0], 'now')
             db.close()
 
 
