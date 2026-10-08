@@ -1294,7 +1294,9 @@ def main() -> None:
     policy_command = sub.add_parser('policy', help='Версия правил и безопасная миграция')
     policy_command.add_argument('action', choices=['show', 'activate'])
     recovery = sub.add_parser('recover-material', help='Возобновить технически заблокированный материал после устранения причины')
-    recovery.add_argument('--item-id', type=int, required=True)
+    recovery_ids = recovery.add_mutually_exclusive_group(required=True)
+    recovery_ids.add_argument('--item-id', type=int)
+    recovery_ids.add_argument('--item-ids', type=int, nargs='+')
     recovery.add_argument('--evidence', required=True, help='Подтверждение устранённой причины; сохраняется в истории')
     sub.add_parser("init", help="Создать/обновить локальную базу")
     sub.add_parser("once", help="Проверить все активные RSS-источники один раз")
@@ -1343,9 +1345,11 @@ def main() -> None:
         policy.attach(config)
         print(json.dumps(policy.snapshot(config.get('ai', {})), ensure_ascii=False))
     elif args.command == 'recover-material':
-        from .material_flow import recover_technical
+        from .material_flow import recover_technical, recover_technical_batch
         with connect(db_path) as db:
-            print(json.dumps(recover_technical(db, config, args.item_id, args.evidence), ensure_ascii=False))
+            result = (recover_technical_batch(db, config, args.item_ids, args.evidence) if args.item_ids
+                      else recover_technical(db, config, args.item_id, args.evidence))
+            print(json.dumps(result, ensure_ascii=False))
     elif args.command == "init":
         connect(db_path).close()
         print(f"База готова: {db_path}")

@@ -38,10 +38,13 @@ def amendments(settings=None, stage=None):
 
 
 def snapshot(settings=None):
+    from .style_examples import signature
     text = document()
     changes = amendments(settings)
-    digest = hashlib.sha256(json.dumps([text, changes], ensure_ascii=False).encode()).hexdigest()
-    return {'version': VERSION, 'sha256': digest, 'file': FILE, 'amendments': changes}
+    examples_signature = signature(settings)
+    digest = hashlib.sha256(json.dumps([text, changes, examples_signature], ensure_ascii=False).encode()).hexdigest()
+    return {'version': VERSION, 'sha256': digest, 'file': FILE, 'amendments': changes,
+            'style_examples_sha256': examples_signature}
 
 
 def prompt(stage='analysis', settings=None):
@@ -52,6 +55,9 @@ def prompt(stage='analysis', settings=None):
     changes = amendments(settings, stage)
     if changes:
         result += '\nЯвно зарегистрированные уточнения владельца:\n' + json.dumps(changes, ensure_ascii=False)
+    if stage in {'drafting', 'correction'}:
+        from .style_examples import INSTRUCTIONS, signature
+        result += '\n' + INSTRUCTIONS + '\nВерсия образцов формы: ' + signature(settings)
     return result
 
 
@@ -310,7 +316,10 @@ def admission(db, item_id, item, source, hours, initial_minutes=None, *, after_r
         try:
             when = datetime.fromisoformat(raw.replace('Z', '+00:00'))
             if when.tzinfo is None:
-                when = when.replace(tzinfo=timezone.utc)
+                source_zone = item.get('source_timezone') or dict(source).get('timezone')
+                if len(raw) != 10 and not source_zone:
+                    raise ValueError('SOURCE_TIMEZONE_UNKNOWN')
+                when = when.replace(tzinfo=ZoneInfo(source_zone) if source_zone else timezone.utc)
             if len(raw) == 10:
                 source_zone = item.get('source_timezone') or dict(source).get('timezone') or 'Europe/Moscow'
                 days = (anchor.astimezone(ZoneInfo(source_zone)).date() - when.date()).days
@@ -324,7 +333,7 @@ def admission(db, item_id, item, source, hours, initial_minutes=None, *, after_r
                 result = ('STORE_ONLY', 'При поступлении материал был за пределами окна сбора; сохранён для контекста.')
             elif not owner and initial_minutes is not None and len(raw) != 10 and age > initial_minutes * 60:
                 result = ('STORE_ONLY', 'Материал за пределами первичного окна; сохранён для контекста.')
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, KeyError):
             raw = None
     evidence = item.get('freshness_evidence')
     if not raw and not owner and not evidence:

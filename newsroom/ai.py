@@ -11,7 +11,7 @@ import subprocess
 import urllib.error
 import urllib.request
 
-from . import policy
+from . import policy, style_examples
 
 
 class AIResponseError(RuntimeError):
@@ -348,6 +348,10 @@ def validate_draft(decision, source, draft, settings):
     post_text = draft.get('post_text')
     if not isinstance(post_text, str) or not post_text.strip():
         raise AIResponseError('ASSEMBLED_POST_MISSING')
+    from .quality import paragraph_issues
+    layout_issues = paragraph_issues(post_text.partition('\n')[2])
+    if layout_issues:
+        return {'issues': layout_issues, 'editorial_check': {}, 'covered_claims': []}
     decision = {key: value for key, value in decision.items() if key not in {
         'headline_ru', 'summary_ru', 'what_is_new', 'editorial_check',
         'editorial_issues', 'final_text_check', 'post_text'}}
@@ -381,6 +385,8 @@ def validate_draft(decision, source, draft, settings):
             'editorial_check относится только к post_text.\n'
             + _load_editorial_rules(settings, 'drafting')),
         'input': json.dumps({'decision': decision, 'read_source': source, 'post_text': post_text,
+                            'style_examples': style_examples.select(
+                                settings, title=draft.get('headline_ru') or '', text=post_text),
                             'draft_contract': settings.get('_draft_contract', {})}, ensure_ascii=False),
         'text': {'format': {'type': 'json_schema', 'name': 'newsroom_final_text_check',
                             'strict': True, 'schema': schema}}}
@@ -419,6 +425,9 @@ def draft_post(decision, source, settings):
             'не вычисляй день события по времени обнаружения. Будущий срок запуска сохраняй как план. '
         ) + '\n' + _load_editorial_rules(settings, 'drafting'),
         'input': json.dumps({'checked_decision': checked, 'previous_draft': previous_draft, 'read_source': source,
+                            'style_examples': style_examples.select(
+                                settings, title=decision.get('headline_ru') or source.get('title') or '',
+                                facts=(settings.get('_draft_contract') or {}).get('material_facts') or decision.get('facts')),
                             'draft_contract': settings.get('_draft_contract') or {},
                             'max_post_length': settings.get('max_post_length', 3500)}, ensure_ascii=False),
         'text': {'format': {'type': 'json_schema', 'name': 'newsroom_post_draft', 'strict': True, 'schema': schema}}}
@@ -527,6 +536,8 @@ def correct_published_post(current_text: str, feedback: str, item: dict,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": json.dumps({
             "feedback": feedback,
             "current_published_post": current_text,
+            "style_examples": style_examples.select(
+                settings, title=current_text.split('\n', 1)[0], text=current_text),
             "source_title": item.get("title", ""),
             "source_url": source.get("url", ""),
             "source_publisher": source.get("publisher", ""),

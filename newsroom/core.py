@@ -155,13 +155,13 @@ def parse_date(value: str | None) -> str | None:
     try:
         date = parsedate_to_datetime(value)
         if date.tzinfo is None:
-            date = date.replace(tzinfo=timezone.utc)
+            return None
         return date.astimezone(timezone.utc).isoformat(timespec="seconds")
     except (TypeError, ValueError, OverflowError):
         try:
             date = datetime.fromisoformat(value.replace("Z", "+00:00"))
             if date.tzinfo is None:
-                date = date.replace(tzinfo=timezone.utc)
+                return None
             return date.astimezone(timezone.utc).isoformat(timespec="seconds")
         except ValueError:
             return None
@@ -2106,7 +2106,11 @@ def _editor_history_revision(db, item):
     related = [dict(row) for row in db.execute("SELECT * FROM stories")
                if similarity(candidate, row['canonical_topic'] + ' ' + row['headline'] + ' ' + row['latest_information']) >= .12]
     ids = [row['story_id'] for row in related]
-    snapshots = {"stories": related}
+    # Collection counters and timestamps do not change the event evidence.
+    # Real story content, facts, publications and coverage still invalidate it.
+    semantic_fields = ('story_id', 'canonical_topic', 'headline', 'status',
+                       'latest_information', 'known_facts', 'entities', 'keywords')
+    snapshots = {"stories": [{key: row[key] for key in semantic_fields} for row in related]}
     for table in ("posts", "story_facts", "publication_coverage"):
         marks = ','.join('?' for _ in ids) or 'NULL'
         published_only = " AND status='PUBLISHED'" if table == 'posts' else ''
@@ -3062,7 +3066,7 @@ def _finish_post_steps(db, item, ai_settings, context):
                 from .runtime import cache_key
                 from .ai import _load_editorial_rules
                 draft_key = cache_key('drafting', {'decision': ai_result, 'source': primary_source or publisher_report,
-                    'rules': _load_editorial_rules(ai_options), 'model': ai_options.get('model'),
+                    'rules': _load_editorial_rules(ai_options, 'drafting'), 'model': ai_options.get('model'),
                     'max_post_length': max_length, 'contract': ai_options['_draft_contract'],
                     'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text())})
                 try:
@@ -3120,6 +3124,7 @@ def _finish_post_steps(db, item, ai_settings, context):
                            'editorial_check': {}, 'covered_claims': []}
             else:
                 check_key = cache_key('final-assembled-text', {'text': text_to_check, 'source': draft_source,
+                    'binding_retry': ai_result.get('_binding_check_attempt', 0),
                     'contract': ai_options['_draft_contract'],
                     'prompt': digest((Path(__file__).resolve().parent/'ai.py').read_text()),
                     'policy': __import__('newsroom.policy', fromlist=['snapshot']).snapshot(ai_options)})
@@ -3127,6 +3132,25 @@ def _finish_post_steps(db, item, ai_settings, context):
                                      key=check_key, ttl=21600, stage='verification')
             from .knowledge import validate_post_bindings
             bindings = validate_post_bindings(checked, material_ids, text_to_check)
+        except __import__('newsroom.knowledge', fromlist=['MemoryInvalid']).MemoryInvalid as exc:
+            # The checker produced an invalid binding, not a network failure.
+            # Retain the draft and bypass the cached malformed check on retry.
+            ai_result['_binding_check_attempt'] = int(ai_result.get('_binding_check_attempt', 0)) + 1
+            ai_result['_validation_pending'] = True
+            ai_result['editorial_issues'] = [str(exc)]
+            ai_result.pop('final_text_check', None)
+            context['ai_result'] = ai_result
+            from .material_flow import save_draft_context
+            save_draft_context(db, item_id, item, ai_settings, context)
+            item['_retry_reason'] = 'Исправление привязки фактов финальной проверки: ' + str(exc)
+            item['_flow_block_kind'] = 'verification'
+            item['_text_repair_ready'] = True
+            mark(db, item_id, 'gate', 'WAITING', item['_retry_reason'], block_kind='verification')
+            db.execute('UPDATE item_analysis SET result_json=? WHERE item_id=?',
+                       (json.dumps(ai_result, ensure_ascii=False), item_id))
+            db.execute("UPDATE items SET disposition='WAITING_CONFIRMATION',processed_at=? WHERE item_id=?", (NOW(), item_id))
+            db.commit()
+            return 'WAITING_CONFIRMATION'
         except Exception as exc:
             from .runtime import BudgetDeferred, account_unavailable
             from .material_flow import technical_error

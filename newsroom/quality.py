@@ -53,6 +53,23 @@ ATTRIBUTION_TO_OUTLET = re.compile(
 )
 OUTLET_REPORTING_VERB = r"(?:сообщил\w*|рассказал\w*|заявил\w*|подтвердил\w*|передал\w*|сообщает|пишет|передаёт|передает|по\s+данным|по\s+сообщению)"
 
+PARAGRAPH_LIMIT = 210
+
+
+def paragraph_issues(body):
+    """Count visible characters with spaces; links and source metadata are separate."""
+    issues = []
+    for index, paragraph in enumerate(re.split(r'\n[ \t]*\n', body.strip()), 1):
+        lines = [line for line in paragraph.splitlines()
+                 if not line.strip().startswith(('Источник:', 'Источники:', 'Ранее:'))]
+        visible = '\n'.join(lines).strip()
+        visible = re.sub(r'\[([^\]\n]+)\]\(https?://[^\s)]+\)', r'\1', visible)
+        visible = visible.replace('**', '')
+        visible = re.sub(r'(?<!\w)([*_])([^\n]+?)\1(?!\w)', r'\2', visible)
+        if len(visible) > PARAGRAPH_LIMIT:
+            issues.append(f'PARAGRAPH_TOO_LONG:{index}:{len(visible)}>{PARAGRAPH_LIMIT}')
+    return issues
+
 
 def _footer_source_name(body):
     match = re.search(r"(?m)^(?:Источник|Источники):\s*\[([^\]]+)\]\(https?://[^)]+\)\s*$", body)
@@ -86,7 +103,7 @@ def _source_attribution_is_redundant(body, facts, source_name=None, source_is_re
 
 
 def editorial_issues(headline, body, facts, *, final_post=False, source_name=None, source_is_report=False):
-    issues = []
+    issues = paragraph_issues(body)
     if facts.get('geographic_scope') == 'RUSSIA' and not headline.startswith('🇷🇺'):
         issues.append('RUSSIA_FLAG_MISSING')
     if not body.strip() or not re.search('[а-яА-ЯёЁ]', headline + body):

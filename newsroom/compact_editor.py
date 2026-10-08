@@ -60,6 +60,7 @@ def schema():
 
 def input_data(item, source, candidates, settings):
     from .policy import date_context
+    from .style_examples import select
     read = item.get('primary_source') or item.get('publisher_report') or {}
     return {
         'read_source': {key: read.get(key) for key in (
@@ -74,6 +75,8 @@ def input_data(item, source, candidates, settings):
         'independent_sources': [s for s in item.get('independent_sources', [])
                                 if s.get('url') != read.get('url')],
         'editorial_feedback': item.get('editorial_feedback', [])[:6],
+        'style_examples': select(settings, title=item.get('title') or '',
+                                 facts=(settings.get('_draft_contract') or {}).get('material_facts')),
         'max_post_length': int(settings.get('max_post_length', 3500)),
     }
 
