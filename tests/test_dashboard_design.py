@@ -11,10 +11,13 @@ class DashboardDesignTests(unittest.TestCase):
             'Путь материалов',
             'Путь материалов v2',
             'id="pipeline-funnel" class="path-strip"',
-            'Факты и черновик',
-            'Оформление поста',
-            'Проверка текста',
-            'Отправка и квитанция',
+            "received:'Собрано'",
+            "analyzed:'Разобрано ИИ'",
+            "drafted:'Пост сохранён'",
+            "first_filter:'Отобрано по теме'",
+            "primary_read:'Текст получен'",
+            "checked:'Текст проверен'",
+            "published:'Опубликовано'",
             '<option value="48" selected>48 часов</option>',
         ]
         for marker in required:
@@ -26,6 +29,9 @@ class DashboardDesignTests(unittest.TestCase):
             'id="pipeline-stages"',
             'Обработка материалов',
             'pipelineDescriptions',
+            "first_filter:'Первый фильтр'",
+            "primary_read:'Прочитано'",
+            "published:'Отправка и квитанция'",
         ]
         for marker in forbidden:
             with self.subTest(marker=marker):

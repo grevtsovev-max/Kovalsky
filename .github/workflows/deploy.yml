@@ -24,6 +24,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Check approved cabinet before release
+        run: python3 -m unittest tests.test_dashboard_shell tests.test_dashboard_design tests.test_cabinet_adapter
+
       - name: Configure SSH
         env:
           DEPLOY_KEY: ${{ secrets.KOVALSKY_DEPLOY_KEY }}

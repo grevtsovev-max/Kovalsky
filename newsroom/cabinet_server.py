@@ -31,6 +31,11 @@ async function load(){let d=await api('summary');document.getElementById('summar
 </script></body></html>
 '''
 
+from .dashboard_shell import green_shell
+
+from .cabinet_page import PAGE
+
+
 def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: str = "config.toml") -> None:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("Кабинет доступен только на этом компьютере.")
@@ -79,13 +84,14 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path == "/":
-                view_names = { "published", "sources", "pipeline", "resources"}
+                view_names = { "published", "sources", "pipeline", "resources", "edition"}
                 requested_view = parse_qs(parsed.query).get("view", ["pipeline"])[0]
                 view = requested_view if requested_view in view_names else "pipeline"
                 headings = {
                     "resources": ("Расход ресурсов", "Деньги и расходы по задачам"),
                     "published": ("Публикации", "Посты, отправленные в канал"),
                     "sources": ("Источники", "Подключённые новостные ленты"),
+                    "edition": ("Редакция", "Подготовки, исходники и проверки"),
                     "pipeline": ("Материалы", "Что получено, где находится и что будет дальше"),
                 }
                 body_text = PAGE.replace("__TOKEN__", token).replace("__INITIAL_VIEW__", view)
@@ -188,7 +194,10 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                     finally:
                         db.close()
                 elif parsed.path == "/api/pipeline":
-                    self._json({'editorial':'removed','items':self._news(parse_qs(parsed.query))})
+                    from .cabinet_pipeline import pipeline_snapshot, cabinet_posts
+                    db = self._read_db()
+                    try: self._json(pipeline_snapshot(db, config, parse_qs(parsed.query), cabinet_posts(db, config)))
+                    finally: db.close()
                 elif parsed.path == "/api/regulatory":
                     self._json({'error':'Редактор удалён'},410)
                 elif parsed.path == "/api/news":
@@ -526,7 +535,3 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally: server.server_close()
-
-
-# The approved cabinet is independent of editorial implementations.
-from .cabinet_server import PAGE, serve

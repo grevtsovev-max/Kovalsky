@@ -8,6 +8,13 @@ release="/opt/kovalsky/releases/$sha"
 app=/opt/kovalsky/app
 [ -f "$incoming/pyproject.toml" ] && [ -f "$incoming/newsroom/cli.py" ] || { echo "Incoming project is incomplete" >&2; exit 65; }
 [ ! -e "$release" ] || { echo "Release already exists" >&2; exit 73; }
+# Reject a release that would replace the approved cabinet before changing app.
+PYTHONPATH="$incoming" /opt/kovalsky/venv/bin/python -c '
+from newsroom.dashboard import PAGE, serve
+assert "materials-path-v2" in PAGE and "path-strip" in PAGE, "Approved cabinet missing"
+assert "pipeline-funnel" in PAGE and "Отобрано по теме" in PAGE, "Material journey missing"
+assert serve.__module__ == "newsroom.cabinet_server", "Cabinet API adapter missing"
+'
 old_target=
 if [ -L "$app" ]; then
   old_target=$(readlink -f "$app")

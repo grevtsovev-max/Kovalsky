@@ -71,6 +71,15 @@ class PipelineTests(unittest.TestCase):
             (i,1,'Материал '+str(i),'https://source/'+str(i),'https://source/'+str(i),
              '2026-09-26T18:22:14+00:00',discovered,discovered,disposition,1,json.dumps(primary or {})))
 
+    def screening(self, i, passed=True, revision='r1', dependency='rules', at='2026-09-28T11:00:00+00:00'):
+        from newsroom.material_flow import SCHEMA
+        if 'ingest_revision' not in {r[1] for r in self.db.execute('PRAGMA table_info(items)')}:
+            self.db.execute("ALTER TABLE items ADD COLUMN ingest_revision TEXT DEFAULT 'r1'")
+        self.db.executescript(SCHEMA)
+        self.db.execute('INSERT INTO material_stage_results VALUES(?,?,?,?,?,?)',
+                        (i, revision, 'screening', dependency, json.dumps(
+                            {'kind': 'keyword_prefilter', 'passed': passed}), at))
+
     def snapshot(self, **params):
         return pipeline_snapshot(self.db,{}, {k:[str(v)] for k,v in params.items()},self.posts,self.now)
 
@@ -84,6 +93,7 @@ class PipelineTests(unittest.TestCase):
         self.add(1, 'NEW_STORY', primary={'_material_read': True, '_material_url': 'https://source/1'})
         self.add(2, 'NOISE')
         self.add(3, 'PRIMARY_RETRY')
+        self.screening(1)
         for item_id, relevant in [(1, True), (2, False)]:
             self.db.execute('INSERT INTO item_analysis VALUES(?,?,?)', (item_id, '2026-09-28T11:00:00+00:00', json.dumps({'is_relevant': relevant})))
         self.post(status='PENDING')
@@ -91,12 +101,49 @@ class PipelineTests(unittest.TestCase):
         self.posts[0]['facts']['final_text_check'] = {'assembled_sha256': hashlib.sha256('Проверенный текст'.encode()).hexdigest()}
         result = self.snapshot(stage='filtered')
         counts = {step['key']: step['count'] for step in result['funnel']}
-        self.assertEqual(counts, {'received': 3, 'first_filter': 0, 'primary_read': 0, 'analyzed': 2, 'drafted': 1, 'checked': 1, 'published': 0})
+        self.assertEqual(counts, {'received': 3, 'first_filter': 1, 'primary_read': 1, 'analyzed': 2, 'drafted': 1, 'checked': 1, 'published': 0})
         self.assertEqual(result['total'], 1)
         self.assertEqual(sum(step['count'] for step in result['stages']), 3)
         self.posts[0]['text'] = 'Изменённый непроверенный текст'
         self.assertEqual(self.snapshot()['totals']['checked'], 0)
         self.assertEqual(self.snapshot(q='Материал 3')['totals']['received'], 1)
+
+    def test_reading_counts_only_admitted_current_versions(self):
+        # Telegram collection reads all posts before the topic filter runs.
+        for i in range(1, 6):
+            self.add(i, 'NOISE' if i == 2 else 'PENDING',
+                     primary={'_material_read': True})
+        self.screening(2, False)
+        self.screening(3, revision='old')
+        self.screening(4)
+        self.screening(5)
+        self.screening(5, False, dependency='new-rules', at='2026-09-28T11:01:00+00:00')
+        result = self.snapshot(milestone='primary_read')
+        self.assertEqual(result['totals']['first_filter'], 1)
+        self.assertEqual(result['totals']['primary_read'], 1)
+        self.assertEqual([i['item_id'] for i in result['items']], [4])
+        # Evidence remains visible even for rejected and historical materials.
+        self.assertTrue(all(i['material_status'] == 'Материал прочитан'
+                            for i in self.snapshot()['items']))
+
+    def test_telegram_display_edit_does_not_erase_completed_check(self):
+        import hashlib
+        self.add(1, 'NEW_STORY', primary={'status': 'READ', 'url': 'https://source/1'})
+        self.post()
+        original = 'По данным Crypto.news, опубликовано решение.'
+        self.posts[0].update(origin_item_id=1, saved_text=original,
+                            text='По данным [Crypto.news](http://Crypto.news/), опубликовано решение.')
+        self.posts[0]['facts']['final_text_check'] = {
+            'assembled_sha256': hashlib.sha256(original.encode()).hexdigest()}
+        self.assertEqual(self.snapshot()['totals']['checked'], 1)
+        self.assertEqual(self.snapshot(milestone='checked')['total'], 1)
+        self.assertEqual(self.snapshot()['totals']['published'], 1)
+        # A receipt alone never substitutes for proof of the stored text.
+        self.posts[0]['saved_text'] = 'Другой текст'
+        self.assertEqual(self.snapshot()['totals']['checked'], 0)
+        self.posts[0]['saved_text'] = original
+        self.posts[0]['status'] = 'PENDING'
+        self.assertEqual(self.snapshot()['totals']['checked'], 0)
 
     def test_materials_sort_by_instant_across_timezones(self):
         self.add(1, discovered='2026-09-28T11:00:00+03:00')
@@ -139,11 +186,12 @@ class PipelineTests(unittest.TestCase):
     def test_progress_link_returns_materials_that_passed_step_even_if_later_rejected(self):
         self.add(1, 'NOISE', primary={'_material_read': True})
         self.add(2, 'PENDING')
+        self.screening(1)
         self.db.execute('INSERT INTO item_analysis VALUES(?,?,?)', (1, '2026-09-28T11:00:00+00:00', '{}'))
         report = self.snapshot(milestone='analyzed')
         self.assertEqual([i['item_id'] for i in report['items']], [1])
         self.assertEqual(report['total'], report['totals']['analyzed'])
-        self.assertEqual(self.snapshot(milestone='primary_read')['total'], 0)
+        self.assertEqual(self.snapshot(milestone='primary_read')['total'], 1)
         self.assertEqual(self.snapshot(bucket='work', milestone='analyzed')['total'], 0)
         self.assertEqual(self.snapshot(milestone='received')['total'], 2)
 
@@ -205,28 +253,5 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result['totals']['analyzed'],1)
         self.assertEqual(result['items'][0]['summary'],'Вывод')
         self.assertEqual(self.snapshot(q='нет совпадений')['total'],0)
-
-
-    def test_read_counter_requires_current_filter_admission(self):
-        self.add(1, primary={'_material_read': True})
-        self.add(2, primary={'_material_read': True})
-        self.db.execute("ALTER TABLE items ADD COLUMN ingest_revision TEXT DEFAULT 'r2'")
-        self.db.execute('CREATE TABLE material_stage_results(item_id INTEGER,revision TEXT,stage TEXT,result_json TEXT,created_at TEXT)')
-        for item_id, revision, passed in [(1, 'r2', True), (2, 'r1', True)]:
-            self.db.execute('INSERT INTO material_stage_results VALUES(?,?,?,?,?)',
-                (item_id, revision, 'screening', json.dumps({'kind':'keyword_prefilter','passed':passed}), '2026-09-28T11:00:00+00:00'))
-        report = self.snapshot(milestone='primary_read')
-        self.assertEqual([i['item_id'] for i in report['items']], [1])
-        self.assertEqual(report['totals']['primary_read'], 1)
-
-    def test_published_check_uses_saved_pre_send_text(self):
-        import hashlib
-        self.add(1)
-        self.post()
-        self.posts[0].update(origin_item_id=1, text='Изменённый текст Telegram', saved_text='Проверенный текст')
-        self.posts[0]['facts']['final_text_check'] = {'assembled_sha256': hashlib.sha256('Проверенный текст'.encode()).hexdigest()}
-        self.assertEqual(self.snapshot()['totals']['checked'], 1)
-        self.posts[0]['saved_text'] = 'Текст без подтверждения'
-        self.assertEqual(self.snapshot()['totals']['checked'], 0)
 
 if __name__=='__main__':unittest.main()
