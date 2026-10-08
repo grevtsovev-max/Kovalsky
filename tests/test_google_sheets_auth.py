@@ -20,12 +20,21 @@ class GoogleSheetsAuthTests(unittest.TestCase):
         cls.key = subprocess.run(['/usr/bin/openssl','genpkey','-algorithm','RSA','-pkeyopt','rsa_keygen_bits:2048'],capture_output=True,check=True).stdout.decode()
 
     def setUp(self):
+        csv_read = patch('newsroom.core._request_with_url', return_value=('Тема,Слово или фраза,Мониторинг\n'.encode(), {}, ''))
+        csv_read.start(); self.addCleanup(csv_read.stop)
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.db=connect(str(Path(self.tmp.name)/'state.db'));self.addCleanup(self.db.close)
         self.creds={'type':'service_account','client_email':'kovalsky@sample-project.iam.gserviceaccount.com',
                     'private_key':self.key,'private_key_id':'a'*40,'token_uri':auth.TOKEN_URL}
         self.settings={'spreadsheet_id':'x'*25,'tabs':[{'name':'Ключевые слова','gid':'2001'}]}
         save(self.db,topics.SETTINGS,self.settings);self.db.commit()
+
+    def test_flat_header_permission_probe_preserves_first_column(self):
+        with patch('newsroom.core._request_with_url', return_value=('Ключевик,Мониторинг,Роль,Уточнение\n'.encode(), {}, '')):
+            probe=topics.keyword_header_probe(self.settings)
+        self.assertEqual(probe['find'],'Ключевик')
+        self.assertEqual(probe['replacement'],'Ключевик')
+        self.assertEqual(probe['range']['startColumnIndex'],0)
 
     def test_rejects_other_credential_types_and_arbitrary_token_server(self):
         for data in [dict(self.creds,type='authorized_user'),dict(self.creds,token_uri='https://evil.example/token'),dict(self.creds,client_email='personal@example.com')]:

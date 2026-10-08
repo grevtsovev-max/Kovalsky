@@ -13,11 +13,20 @@ from newsroom.source_registry import save, state
 
 class AppsScriptTests(unittest.TestCase):
     def setUp(self):
+        csv_read = patch('newsroom.core._request_with_url', return_value=('Тема,Слово или фраза,Мониторинг\n'.encode(), {}, ''))
+        csv_read.start(); self.addCleanup(csv_read.stop)
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.db = connect(str(Path(self.temp.name) / 'state.db')); self.addCleanup(self.db.close)
         self.settings = {'spreadsheet_id': 'table', 'tabs': [{'name': 'Ключевые слова', 'gid': '2'}]}
         save(self.db, topics.SETTINGS, self.settings); self.db.commit()
         self.credentials = {'url': 'https://script.google.com/macros/s/' + 'x'*30 + '/exec', 'secret': 'a'*64}
+
+    def test_flat_header_permission_probe_preserves_first_column(self):
+        with patch('newsroom.core._request_with_url', return_value=('Ключевик,Мониторинг,Роль,Уточнение\n'.encode(), {}, '')):
+            probe=topics.keyword_header_probe(self.settings)
+        self.assertEqual(probe['find'],'Ключевик')
+        self.assertEqual(probe['replacement'],'Ключевик')
+        self.assertEqual(probe['range']['startColumnIndex'],0)
 
     def test_reject_untrusted_urls_and_invalid_secrets(self):
         for url in ['http://script.google.com/macros/s/'+'x'*30+'/exec', 'https://example.org/exec',

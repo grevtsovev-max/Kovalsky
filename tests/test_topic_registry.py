@@ -39,6 +39,68 @@ class TopicsTests(unittest.TestCase):
     def enable(self):
         save(self.db,topics.SETTINGS,self.settings); save(self.db,topics.SNAPSHOT,snapshot()); self.db.commit()
 
+    def test_flat_keyword_only_defaults_to_enabled_profile(self):
+        body = 'Ключевик,Мониторинг,Роль,Уточнение\nмайнинг\nкошелёк,,Требует уточнения,криптовалюта | биткоин\nэкономика,FALSE,Контекстный,\n'
+        entries = topics.parse_tab(body.encode(), 'Ключевые слова')
+        self.assertTrue(entries[0]['enabled'])
+        self.assertEqual(entries[0]['role'], 'Профильный')
+        self.assertFalse(entries[2]['enabled'])
+        self.assertEqual(entries[1]['refinement'], 'криптовалюта | биткоин')
+        value = snapshot()
+        value['sections']['Темы'] = []
+        value['sections'][topics.FILTER_RULES] = [{'name':'Профильный', 'required':['Профильный'], 'enabled':True}]
+        value['sections']['Ключевые слова'] = entries
+        config = {'ai': {}}
+        topics.apply_snapshot(config, value)
+        self.assertEqual(config['ai']['_keyword_prefilter']['entries'], entries[:2])
+        from newsroom.keyword_filter import evaluate
+        self.assertTrue(evaluate('Запущен майнинг', config['ai']['_keyword_prefilter'])['passed'])
+
+    def test_flat_invalid_role_flag_and_missing_refinement_are_rejected(self):
+        for row in ['слово,MAYBE,,', 'слово,,Неизвестная,', 'слово,,Требует уточнения,']:
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                topics.parse_tab(('Ключевик,Мониторинг,Роль,Уточнение\n' + row).encode(), 'Ключевые слова')
+
+    def test_flat_writer_adds_without_topic_and_retry_preserves_disabled(self):
+        metadata={'sheets':[{'properties':{'title':name,'sheetId':i,'gridProperties':{'columnCount':4 if name=='Ключевые слова' else 3}}} for i,name in enumerate(topics.HEADERS)]}
+        def ranges(keyword_rows):
+            return {'valueRanges':[{'values':([topics.FLAT_KEYWORD_HEADERS] + keyword_rows) if name=='Ключевые слова' else [topics.HEADERS[name]]} for name in topics.HEADERS]}
+        change={'section':'Ключевые слова','title':'Несуществующая тема','description':'майнинг','operation':'ADD'}
+        with patch.object(topics,'api',side_effect=[metadata,ranges([]),{'replies':[{},{}]}]) as api:
+            topics.write_changes(self.settings,[change])
+            cells=api.call_args.args[3]['requests'][1]['updateCells']['rows'][0]['values']
+            self.assertEqual([c['userEnteredValue'] for c in cells], [{'stringValue':'майнинг'},{'boolValue':True},{'stringValue':'Профильный'},{'stringValue':''}])
+        with patch.object(topics,'api',side_effect=[metadata,ranges([['майнинг',False,'Контекстный','']])]) as api:
+            self.assertEqual(topics.write_changes(self.settings,[change]),0)
+            self.assertEqual(api.call_count,2)
+
+    def test_flat_learning_accepts_keyword_without_topic(self):
+        value=snapshot()
+        value['sections']['Ключевые слова']=topics.parse_tab('Ключевик,Мониторинг,Роль,Уточнение\nмайнинг\n'.encode(),'Ключевые слова')
+        change={'section':'Ключевые слова','title':'','description':'майнинг','operation':'DISABLE','evidence':'не отслеживать майнинг'}
+        with patch('newsroom.ai.request_response',return_value=response([change])):
+            changes=topics.plan_learning({'reason':'не отслеживать майнинг'},'editorial',value,{})
+        self.assertEqual(changes[0]['expected_description'],'майнинг')
+
+    def test_flat_writer_expands_initial_three_column_read(self):
+        metadata={'sheets':[{'properties':{'title':name,'sheetId':i,'gridProperties':{'columnCount':4 if name=='Ключевые слова' else 3}}} for i,name in enumerate(topics.HEADERS)]}
+        ranges={'valueRanges':[{'values':([topics.FLAT_KEYWORD_HEADERS[:3],['майнинг',True,'Требует уточнения']]) if name=='Ключевые слова' else [topics.HEADERS[name]]} for name in topics.HEADERS]}
+        expanded={'valueRanges':[{'values':[topics.FLAT_KEYWORD_HEADERS,['майнинг',True,'Требует уточнения','биткоин']]}]}
+        change={'section':'Ключевые слова','title':'','description':'майнинг','operation':'ADD'}
+        with patch.object(topics,'api',side_effect=[metadata,ranges,expanded]) as api:
+            self.assertEqual(topics.write_changes(self.settings,[change]),0)
+            self.assertIn('A1%3AD',api.call_args.args[2])
+
+    def test_flat_writer_disables_monitoring_column(self):
+        metadata={'sheets':[{'properties':{'title':name,'sheetId':i,'gridProperties':{'columnCount':4 if name=='Ключевые слова' else 3}}} for i,name in enumerate(topics.HEADERS)]}
+        ranges={'valueRanges':[{'values':([topics.FLAT_KEYWORD_HEADERS,['майнинг']]) if name=='Ключевые слова' else [topics.HEADERS[name]]} for name in topics.HEADERS]}
+        change={'section':'Ключевые слова','title':'','description':'майнинг','operation':'DISABLE','expected_description':'майнинг'}
+        with patch.object(topics,'api',side_effect=[metadata,ranges,{'replies':[{}]}]) as api:
+            topics.write_changes(self.settings,[change])
+            request=api.call_args.args[3]['requests'][0]['updateCells']
+            self.assertEqual(request['range']['startColumnIndex'],1)
+            self.assertEqual(request['rows'][0]['values'][0]['userEnteredValue'],{'boolValue':False})
+
     def test_morphology_and_word_boundaries(self):
         for text in ['договор с платёжного агента','услуги платежными агентами','агенты по платёжным операциям']:
             self.assertTrue(topics.lexical_match(text,['платёжный агент']))

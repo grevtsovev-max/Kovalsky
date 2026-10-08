@@ -105,11 +105,9 @@ def configure(db, data):
     if not settings:
         raise ValueError('Сначала подключите таблицу тем')
     credentials = validate(data)
-    tab = next(t for t in settings['tabs'] if t['name'] == 'Ключевые слова')
-    result = request(settings, 'POST', ':batchUpdate', {'requests': [{'findReplace': {
-        'range': {'sheetId': int(tab['gid']), 'startRowIndex': 0, 'endRowIndex': 1, 'startColumnIndex': 1, 'endColumnIndex': 2},
-        'find': 'Слово или фраза', 'replacement': 'Слово или фраза',
-        'matchCase': True, 'matchEntireCell': True, 'searchByRegex': False, 'includeFormulas': False}}]}, credentials)
+    from .topic_registry import keyword_header_probe
+    result = request(settings, 'POST', ':batchUpdate',
+                     {'requests': [{'findReplace': keyword_header_probe(settings)}]}, credentials)
     replies = result.get('replies', [])
     if len(replies) != 1 or not isinstance(replies[0].get('findReplace'), dict):
         raise ValueError('Не удалось подтвердить проверку записи в таблицу')

@@ -115,11 +115,8 @@ def configure(db, data):
     # Validate the real account and edit permission BEFORE activating credentials.
     token = access_token(data)
     temporary = {**settings, '_access_token': token}
-    tab = next(t for t in settings['tabs'] if t['name'] == 'Ключевые слова')
-    api(temporary, 'POST', ':batchUpdate', {'requests': [{'findReplace': {
-        'range': {'sheetId': int(tab['gid']), 'startRowIndex': 0, 'endRowIndex': 1, 'startColumnIndex': 1, 'endColumnIndex': 2},
-        'find': 'Слово или фраза', 'replacement': 'Слово или фраза',
-        'matchCase': True, 'matchEntireCell': True, 'searchByRegex': False, 'includeFormulas': False}}]})
+    from .topic_registry import keyword_header_probe
+    api(temporary, 'POST', ':batchUpdate', {'requests': [{'findReplace': keyword_header_probe(settings)}]})
     settings['credentials_file'] = store_credentials(db, data)
     settings.pop('apps_script_file', None)
     settings['service_account_email'] = data['client_email']

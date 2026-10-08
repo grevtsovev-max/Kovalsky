@@ -106,9 +106,9 @@ def evaluate_rules(text, title, spec):
         reason = ('Первый фильтр не пройден: найден ' + brand + ', профильного ключевика или разрешённого сочетания нет.'
                   if brand else 'Первый фильтр не пройден: профильного ключевика, разрешённого сочетания или лица в заголовке нет.')
     selected_keyword = profile or (ambiguous if rule else None) or person
-    topic = (next((r['title'] for r in profiles if r['description'] == profile), None)
+    topic = (next((r['title'] or None for r in profiles if r['description'] == profile), None)
              if profile else 'Публичные активности брендов и лиц' if person else
-             next((r['title'] for r in entries if r['description'] == ambiguous), None))
+             next((r['title'] or None for r in entries if r['description'] == ambiguous), None))
     return {'mode':'intake_rules', 'passed':bool(rule) and not configuration_error, 'rule':rule['name'] if rule else None,
             'matched_keyword':selected_keyword, 'matched_brand':brand, 'matched_person':person,
             'matched_topic_keyword':profile, 'matched_context_keyword':context,
