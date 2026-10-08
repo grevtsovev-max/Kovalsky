@@ -30,6 +30,7 @@ LEARNING = 'topic_registry_learning'
 PUBLIC_ACTIVITY = 'Публичные активности брендов и лиц'
 FILTER_RULES = 'Правила первого фильтра'
 FILTER_HEADERS = ['Правило', 'Обязательные условия', 'Необязательные условия', 'Мониторинг', 'Объяснение']
+FLAT_KEYWORD_HEADERS = ['Ключевик', 'Мониторинг', 'Роль', 'Уточнение']
 KEYWORD_ROLES = {'Профильный', 'Требует уточнения', 'Контекстный'}
 HEADERS = {
     'Темы': ['Тема', 'Что отслеживать', 'Мониторинг'],
@@ -93,6 +94,8 @@ def lexical_match(text, keywords):
 
 def parse_tab(body, name):
     rows = list(csv.reader(io.StringIO(body.decode('utf-8-sig'))))
+    if name == 'Ключевые слова' and rows and rows[0] == FLAT_KEYWORD_HEADERS:
+        return parse_flat_keywords(rows)
     if not rows or len(rows) > 10001 or rows[0][:3] != HEADERS[name]:
         raise ValueError('TOPIC_REGISTRY_HEADER_OR_SIZE')
     result = []
@@ -124,6 +127,36 @@ def parse_tab(body, name):
         if name != 'Ключевые слова':
             raise ValueError('TOPIC_REGISTRY_DUPLICATE')
     return result
+
+
+def parse_flat_keywords(rows):
+    if len(rows) > 10001:
+        raise ValueError('TOPIC_REGISTRY_HEADER_OR_SIZE')
+    result = []
+    for number, raw in enumerate(rows[1:], 2):
+        if raw == FLAT_KEYWORD_HEADERS:
+            continue
+        word, flag, role, refinement = [str(v).strip() for v in (raw + [''] * 4)[:4]]
+        if not word:
+            if role or refinement:
+                raise ValueError('TOPIC_REGISTRY_ROW')
+            continue
+        enabled = normalize(flag)
+        role = role or 'Профильный'
+        if len(word) > 8000:
+            raise ValueError('TOPIC_REGISTRY_ROW')
+        if enabled not in {'true', 'false', 'истина', 'ложь', 'да', 'нет', '1', '0', ''}:
+            raise ValueError('TOPIC_REGISTRY_FLAG')
+        active = enabled in {'true', 'истина', 'да', '1', ''}
+        if role not in KEYWORD_ROLES or len(refinement) > 2000 or (active and role == 'Требует уточнения' and not refinement):
+            raise ValueError('KEYWORD_ROLE_OR_REFINEMENT')
+        result.append({'title': '', 'description': word, 'enabled': active, 'row': number,
+                       'role': role, 'refinement': refinement, 'flat': True})
+    return result
+
+
+def keyword_enabled(entry, names):
+    return entry['enabled'] and (entry.get('flat') or entry['title'] in names)
 
 
 def parse_filter_rules(body):
@@ -168,7 +201,7 @@ def read_registry(settings):
         if any('role' not in r for r in sections['Ключевые слова']):
             raise ValueError('INTAKE_KEYWORD_ROLES_MISSING')
     titles = {r['title'] for r in sections['Темы']}
-    if any(r['title'] not in titles for r in sections['Ключевые слова']):
+    if any(not r.get('flat') and r['title'] not in titles for r in sections['Ключевые слова']):
         raise ValueError('TOPIC_REGISTRY_UNKNOWN_TOPIC')
     version = hashlib.sha256(json.dumps(sections, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     return {'sections': sections, 'checked_at': time.time(), 'version': version}
@@ -187,13 +220,13 @@ def policy(snapshot, entities=()):
         target.extend(alias.strip() for alias in re.split(r'\s+/\s+', name) if alias.strip())
     entity_names = {normalize(name) for name in people + organizations}
     activity_keywords = list(dict.fromkeys(r['description'] for r in sections.get('Ключевые слова', [])
-        if r['enabled'] and r['title'] in names and r['title'] != PUBLIC_ACTIVITY
+        if keyword_enabled(r, names) and r['title'] != PUBLIC_ACTIVITY
         and normalize(r['description']) not in entity_names))
     result = {'version': snapshot.get('version'),
             'people': list(dict.fromkeys(people)), 'organizations': list(dict.fromkeys(organizations)),
             'activity_keywords': activity_keywords,
             'topics': [{'name': r['title'], 'scope': r['description']} for r in topics],
-            'keywords': [{'topic': r['title'], 'concept': r['description']} for r in sections.get('Ключевые слова', []) if r['enabled'] and r['title'] in names],
+            'keywords': [{'topic': r['title'], 'concept': r['description']} for r in sections.get('Ключевые слова', []) if keyword_enabled(r, names)],
             'exclusions': [{'name': r['title'], 'scope': r['description']} for r in sections.get('Исключения', []) if r['enabled']],
             'geography': [{'name': r['title'], 'scope': r['description']} for r in sections.get('География', []) if r['enabled']],
             'entities': list(dict.fromkeys(r['name'] for r in entities if r.get('enabled', True)))}
@@ -219,7 +252,7 @@ def apply_snapshot(config, snapshot, entities=()):
             topic_keywords=thematic['activity_keywords'])
     if thematic.get('selection_mode') == 'intake_rules':
         names = {t['name'] for t in thematic['topics']}
-        entries = [r for r in snapshot['sections']['Ключевые слова'] if r['enabled'] and r['title'] in names]
+        entries = [r for r in snapshot['sections']['Ключевые слова'] if keyword_enabled(r, names)]
         config['ai']['_keyword_prefilter'] = {
             'mode':'intake_rules', 'version':snapshot.get('version'), 'entries':entries,
             'brands':thematic['organizations'], 'people':thematic['people'],
@@ -346,6 +379,24 @@ def api(settings, method, suffix, data=None):
         return json.load(response)
 
 
+def keyword_header_probe(settings):
+    from .core import _request_with_url
+    tab = next(t for t in settings['tabs'] if t['name'] == 'Ключевые слова')
+    url = f"https://docs.google.com/spreadsheets/d/{settings['spreadsheet_id']}/export?format=csv&gid={tab['gid']}"
+    body, _, _ = _request_with_url(url, timeout=8, public_only=True)
+    header = next(csv.reader(io.StringIO(body.decode('utf-8-sig'))), [])
+    if header == FLAT_KEYWORD_HEADERS:
+        column, value = 0, 'Ключевик'
+    elif header[:3] == HEADERS['Ключевые слова']:
+        column, value = 1, 'Слово или фраза'
+    else:
+        raise ValueError('TOPIC_REGISTRY_HEADER_OR_SIZE')
+    return {'range': {'sheetId': int(tab['gid']), 'startRowIndex': 0, 'endRowIndex': 1,
+                      'startColumnIndex': column, 'endColumnIndex': column + 1},
+            'find': value, 'replacement': value, 'matchCase': True, 'matchEntireCell': True,
+            'searchByRegex': False, 'includeFormulas': False}
+
+
 def learned_topics(db):
     return [{'topic':r['topic'], 'search_terms':json.loads(r['search_terms'] or '[]')}
             for r in db.execute('SELECT topic,search_terms FROM monitoring_topics ORDER BY topic LIMIT 1000')]
@@ -392,7 +443,8 @@ def plan_learning(signal, kind, snapshot, settings):
             'В комментарии можно ADD новую тему/ключ/исключение или REPLACE конкретное описание '
             'при явном пожелании уточнить охват. DISABLE допускается только для прямого требования '
             'отключить/не отслеживать/исключить названную тему или ключ целиком. '
-            'Не включай вручную выключенные строки. Для новой темы сначала ADD в Темы, затем ключи. '
+            'Не включай вручную выключенные строки. Для плоских ключевиков тема не требуется; '
+            'не добавляй тему только ради ключевика. В старом формате для новой темы сначала ADD в Темы. '
             'Сохраняй все прежние условия, которые владелец явно не отменил. '
             'Не выдумывай юридический статус или факты. Каждое evidence — точная непрерывная цитата '
             'из сигнала, объясняющая именно тематическое изменение.'),
@@ -412,7 +464,7 @@ def plan_learning(signal, kind, snapshot, settings):
         if (set(change) != {'section','title','description','operation','evidence'}
                 or change['section'] not in HEADERS or change['operation'] not in {'ADD','REPLACE','DISABLE'}
                 or not all(isinstance(v,str) for v in change.values())
-                or not change['title'].strip() or len(change['title'])>250 or len(change['description'])>8000
+                or (not change['title'].strip() and not (change['section'] == 'Ключевые слова' and any(r.get('flat') for r in snapshot.get('sections', {}).get('Ключевые слова', [])))) or len(change['title'])>250 or len(change['description'])>8000
                 or len(change['evidence'])<8 or change['evidence'] not in text):
             raise ValueError('TOPIC_LEARNING_INVALID_CHANGE')
         if any(change[k].lstrip().startswith(('=','+','@')) for k in ['title','description']):
@@ -425,7 +477,7 @@ def plan_learning(signal, kind, snapshot, settings):
         if kind=='rating' and not signal.get('is_interesting') and changes:
             raise ValueError('TOPIC_LEARNING_NEGATIVE_RATING_IS_NOT_A_BAN')
         if change['operation'] in {'REPLACE','DISABLE'}:
-            matches=[r for r in snapshot.get('sections',{}).get(change['section'],[]) if normalize(r['title'])==normalize(change['title']) and (change['section']!='Ключевые слова' or normalize(r['description'])==normalize(change['description']))]
+            matches=[r for r in snapshot.get('sections',{}).get(change['section'],[]) if (r.get('flat') or normalize(r['title'])==normalize(change['title'])) and (change['section']!='Ключевые слова' or normalize(r['description'])==normalize(change['description']))]
             if not matches:
                 raise ValueError('TOPIC_LEARNING_TARGET_MISSING')
             change['expected_description']=matches[0]['description']
@@ -443,26 +495,36 @@ A retry after an unknown write checks the current sheet before adding anything.
     if set(HEADERS)-set(properties):
         raise ValueError('TOPIC_LEARNING_TAB_MISSING')
     ids = {name:properties[name]['sheetId'] for name in HEADERS}
-    ranges = ["'"+name+"'!A1:C"+str(min(10000,properties[name].get('gridProperties',{}).get('rowCount',10000))) for name in HEADERS]
-    current = api(settings,'GET','/values:batchGet?'+urllib.parse.urlencode([('ranges',r) for r in ranges]))
-    rows = {name:vr.get('values',[]) for name,vr in zip(HEADERS,current['valueRanges'])}
+    ranges = ["'" + name + "'!A1:C" + str(min(10000, properties[name].get('gridProperties', {}).get('rowCount', 10000))) for name in HEADERS]
+    current = api(settings, 'GET', '/values:batchGet?' + urllib.parse.urlencode([('ranges', r) for r in ranges]))
+    rows = {name: vr.get('values', []) for name, vr in zip(HEADERS, current['valueRanges'])}
+    keyword_rows = rows.get('Ключевые слова', [])
+    if keyword_rows and keyword_rows[0][:3] == FLAT_KEYWORD_HEADERS[:3] and len(keyword_rows[0]) < 4:
+        keyword_range = "'Ключевые слова'!A1:D" + str(min(10000, properties['Ключевые слова'].get('gridProperties', {}).get('rowCount', 10000)))
+        expanded = api(settings, 'GET', '/values:batchGet?' + urllib.parse.urlencode({'ranges': keyword_range}))
+        rows['Ключевые слова'] = expanded['valueRanges'][0].get('values', [])
     for name in HEADERS:
-        if not rows.get(name) or rows[name][0][:3]!=HEADERS[name]:
+        if not rows.get(name) or rows[name][0][:3]!=HEADERS[name] and not (name == 'Ключевые слова' and rows[name][0] == FLAT_KEYWORD_HEADERS):
             raise ValueError('TOPIC_LEARNING_HEADER_CHANGED')
     requests=[]
     for change in changes:
         section,title,value,op = [change[k] for k in ['section','title','description','operation']]
         data=rows[section]
-        matches=[(i,r) for i,r in enumerate(data[1:],1) if r and normalize(r[0])==normalize(title)
-                 and (section!='Ключевые слова' or len(r)>1 and normalize(r[1])==normalize(value))]
+        flat = section == 'Ключевые слова' and data[0] == FLAT_KEYWORD_HEADERS
+        flag_col = 1 if flat else 2
+        value_col = 0 if flat else 1
+        matches=[(i,r) for i,r in enumerate(data[1:],1) if r and ((flat and normalize(r[0])==normalize(value)) or
+                 (not flat and normalize(r[0])==normalize(title)
+                  and (section!='Ключевые слова' or len(r)>1 and normalize(r[1])==normalize(value))))]
         if matches:
             index,row=matches[0]
             if op=='ADD' or op=='REPLACE' and len(row)>1 and row[1]==value:
                 continue
-            if len(row)<3 or normalize(row[2]) not in {'true','истина','1','да'}:
+            if (normalize(row[flag_col] if len(row)>flag_col else '') not in
+                    ({'true','истина','1','да',''} if flat else {'true','истина','1','да'})):
                 # Manual disabled flags are preserved, including descriptions.
                 continue
-            if op in {'REPLACE','DISABLE'} and row[1]!=change.get('expected_description',row[1]):
+            if op in {'REPLACE','DISABLE'} and row[value_col]!=change.get('expected_description',row[value_col]):
                 raise ValueError('TOPIC_LEARNING_CONCURRENT_EDIT')
             if op=='REPLACE':
                 if section=='Ключевые слова':
@@ -474,24 +536,26 @@ A retry after an unknown write checks the current sheet before adding anything.
                 # FindReplace can conditionally change the bool display value,
                 # but Sheets may convert it to a string. Use native bool cells,
                 # only for an explicitly requested owner disable.
-                requests.append({'updateCells':{'range':{'sheetId':ids[section],'startRowIndex':index,'endRowIndex':index+1,'startColumnIndex':2,'endColumnIndex':3},
+                requests.append({'updateCells':{'range':{'sheetId':ids[section],'startRowIndex':index,'endRowIndex':index+1,'startColumnIndex':flag_col,'endColumnIndex':flag_col+1},
                     'rows':[{'values':[{'userEnteredValue':{'boolValue':False}}]}],'fields':'userEnteredValue'}})
-                row[2]=False
+                row[flag_col:flag_col+1]=[False]
             continue
         if op!='ADD':
             raise ValueError('TOPIC_LEARNING_TARGET_MISSING')
         if not value.strip():
             raise ValueError('TOPIC_LEARNING_DESCRIPTION_MISSING')
-        if section=='Ключевые слова':
+        if section=='Ключевые слова' and not flat:
             topics = [r for r in rows['Темы'][1:] if r and normalize(r[0])==normalize(title)]
             if not topics or len(topics[0])<3 or normalize(topics[0][2]) not in {'true','истина','да','1'}:
                 raise ValueError('TOPIC_LEARNING_TOPIC_DISABLED_OR_MISSING')
             title=topics[0][0]
         index=max([i for i,r in enumerate(data) if any(str(v).strip() for v in r[:2])],default=0)+1
         requests.append({'insertDimension':{'range':{'sheetId':ids[section],'dimension':'ROWS','startIndex':index,'endIndex':index+1},'inheritFromBefore':True}})
-        requests.append({'updateCells':{'range':{'sheetId':ids[section],'startRowIndex':index,'endRowIndex':index+1,'startColumnIndex':0,'endColumnIndex':3},
-            'rows':[{'values':[{'userEnteredValue':{'stringValue':title}},{'userEnteredValue':{'stringValue':value}},{'userEnteredValue':{'boolValue':True}}]}],'fields':'userEnteredValue'}})
-        data.insert(index,[title,value,True])
+        values = [value, True, 'Профильный', ''] if flat else [title, value, True]
+        cells = [{'userEnteredValue': {'boolValue': v} if isinstance(v, bool) else {'stringValue': v}} for v in values]
+        requests.append({'updateCells':{'range':{'sheetId':ids[section],'startRowIndex':index,'endRowIndex':index+1,'startColumnIndex':0,'endColumnIndex':len(values)},
+            'rows':[{'values':cells}],'fields':'userEnteredValue'}})
+        data.insert(index,values)
     if requests:
         result=api(settings,'POST',':batchUpdate',{'requests':requests})
         if any('findReplace' in r and r['findReplace'].get('occurrencesChanged',0)!=1 for r in result.get('replies',[])):
