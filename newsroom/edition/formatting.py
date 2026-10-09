@@ -13,7 +13,8 @@ def normalized(text):return ' '.join(str(text).split())
 
 
 def contains(material,quote):
-    return bool(quote and any(normalized(quote) in normalized(material.get(k,'')) for k in ('title','description','content')))
+    from .source_text import canonical
+    return bool(quote and any(canonical(quote) in canonical(material.get(k,'')) for k in ('title','description','content')))
 
 
 def visible(block):
@@ -141,10 +142,10 @@ def validate(draft,materials,group=None):
             material=evidence.get(proof.get('material_id')) if isinstance(proof,dict) else None
             if not material or not isinstance(proof.get('quote'),str) or not contains(material,proof['quote']):
                 issues.append(problem('evidence',text,'Подтверждающий фрагмент отсутствует в сохранённом источнике'))
-        for quoted in re.findall(r'«([^»]+)»',text):
-            supported=[evidence.get(c.get('material_id')) for c in proofs if isinstance(c,dict)]
-            if not any(m and contains(m,quoted) for m in supported):
-                issues.append(problem('quotes',text,'Текст в кавычках не является точным фрагментом использованного источника'))
+            if group and material:
+                scopes=[f.get('scope') for f in group.get('focus',[]) if f.get('material_id')==material['material_id'] and f.get('scope')]
+                if scopes and not any(contains({'content':scope},proof.get('quote')) for scope in scopes):
+                    issues.append(problem('scope',text,'Факт взят из другой новости исходного дайджеста'))
         if re.search(r'\b(?:по данным|по сообщению|как сообщает|сообщает издание)\b',text,re.I):
             # Participant statements are permitted; the checker distinguishes actors from publishers.
             for material in materials:

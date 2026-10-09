@@ -1210,6 +1210,8 @@ class TelegramPreviewParser(HTMLParser):
         if self.msg_depth and self.current and tag == "a" and attrs.get("href"):
             self.current["links"].append({"href": attrs["href"], "text": ""})
             self.current["active_link"] = self.current["links"][-1]
+        if self.msg_depth and self.current and tag == 'br':
+            self.current['parts'].append('\n')
         if self.depth and tag == "time" and self.current:
             self.current["date"] = attrs.get("datetime")
 
@@ -1221,11 +1223,11 @@ class TelegramPreviewParser(HTMLParser):
                 self.msg_depth = 0
             self.depth -= 1
             if not self.depth and self.current:
-                text = re.sub(r"\s+", " ", " ".join(self.current["parts"])).strip()
+                text = '\n'.join(' '.join(line.split()) for line in ' '.join(self.current['parts']).splitlines() if line.strip())
                 post = self.current["post"]
                 if text and post:
                     url = "https://t.me/" + post
-                    self.items.append({"url": url, "title": text[:160], "description": text,
+                    self.items.append({"url": url, "title": text.splitlines()[0][:160], "description": text,
                                        "content": text, "published_at": parse_date(self.current["date"]),
                                        "updated_at": None, "discovery_links": self.current["links"],
                                        "telegram_forwarded": self.current["forwarded"],

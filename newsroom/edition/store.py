@@ -7,6 +7,11 @@ import uuid
 from datetime import datetime,timezone
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS edition_admissions (
+ material_id INTEGER PRIMARY KEY REFERENCES edition_materials(material_id),
+ decision TEXT NOT NULL, related_material_id INTEGER,
+ reason TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS edition_materials (
  material_id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL REFERENCES items(item_id),
  revision TEXT NOT NULL, received_at TEXT NOT NULL, snapshot_json TEXT NOT NULL,
@@ -105,7 +110,27 @@ def capture(db,item_id,*,eligible=False,queue=False):
         (item_id,revision,received,encoded(snapshot),item['title'],item['content'],item['description'],int(eligible),'QUEUED' if queue and eligible else 'ARCHIVE'))
     if queue and eligible:
         db.execute("UPDATE edition_materials SET eligible=1,queue_state='QUEUED' WHERE item_id=? AND revision=? AND queue_state='ARCHIVE'",(item_id,revision))
-    return db.execute('SELECT material_id FROM edition_materials WHERE item_id=? AND revision=?',(item_id,revision)).fetchone()[0]
+    material_id=db.execute('SELECT material_id FROM edition_materials WHERE item_id=? AND revision=?',(item_id,revision)).fetchone()[0]
+    if queue and eligible and db.execute('SELECT queue_state FROM edition_materials WHERE material_id=?',(material_id,)).fetchone()[0]=='QUEUED':
+        from .source_text import same_version,article_identity
+        from .formatting import material_source
+        previous=db.execute("SELECT material_id,snapshot_json FROM edition_materials WHERE item_id=? AND material_id<>? AND eligible=1 AND queue_state IN ('QUEUED','CLAIMED','DONE') ORDER BY material_id DESC LIMIT 1",(item_id,material_id)).fetchone()
+        duplicate=previous if previous and same_version(read(previous['snapshot_json'],{}),snapshot) else None
+        if not duplicate:
+            # Exact evidence equality is required across publishers, not just a similar title.
+            candidates=db.execute("SELECT material_id,snapshot_json FROM edition_materials WHERE material_id<>? AND eligible=1 AND queue_state IN ('QUEUED','CLAIMED','DONE') AND julianday(received_at)>=julianday(?)-10.0/1440 ORDER BY material_id DESC LIMIT 300",(material_id,received)).fetchall()
+            key=article_identity(snapshot)
+            duplicate=next((r for r in candidates if key[0] and material_source(read(r['snapshot_json'],{}))[0]!=material_source(snapshot)[0] and article_identity(read(r['snapshot_json'],{}))==key),None)
+        if duplicate:
+            db.execute("UPDATE edition_materials SET queue_state='DUPLICATE' WHERE material_id=? AND queue_state='QUEUED'",(material_id,))
+            db.execute('INSERT OR IGNORE INTO edition_admissions VALUES(?,?,?,?,?)',(material_id,'DUPLICATE',duplicate['material_id'],'Материал уже покрыт: тот же текст/косметическая правка, новых фактов нет.',stamp()))
+        else:
+            # A newer substantive version replaces an older unclaimed snapshot only.
+            older=db.execute("SELECT material_id FROM edition_materials WHERE item_id=? AND material_id<>? AND queue_state='QUEUED'",(item_id,material_id)).fetchall()
+            for row in older:
+                db.execute("UPDATE edition_materials SET queue_state='SUPERSEDED' WHERE material_id=?",(row[0],))
+                db.execute('INSERT OR IGNORE INTO edition_admissions VALUES(?,?,?,?,?)',(row[0],'SUPERSEDED',material_id,'До начала подготовки получена более новая содержательная версия.',stamp()))
+    return material_id
 
 
 def archive_step(db,limit=500):
@@ -171,7 +196,7 @@ def start(db,bundle_hash,*,retry_of=None):
     return job
 
 
-def lookup(db,job_id,query,*,late=False):
+def lookup(db,job_id,query,*,late=False,topic_spec=None):
     """An indexed local lookup. The durable shared budget includes the final arrival check."""
     from .model import bundle
     limits=bundle()[0]['limits']
@@ -185,9 +210,13 @@ def lookup(db,job_id,query,*,late=False):
     rows=[]
     if expression:
         time_clause='m.received_at>?' if late else 'm.received_at<=?'
-        rows=db.execute('SELECT m.material_id FROM edition_search JOIN edition_materials m ON m.material_id=edition_search.rowid '
+        rows=db.execute('SELECT m.material_id,m.snapshot_json FROM edition_search JOIN edition_materials m ON m.material_id=edition_search.rowid '
             'WHERE edition_search MATCH ? AND '+time_clause+' ORDER BY rank,m.material_id DESC LIMIT ?',
-            (expression,job['cutoff'],limits['search_results'])).fetchall()
+            (expression,job['cutoff'],50 if topic_spec else limits['search_results'])).fetchall()
+        if topic_spec:
+            from ..keyword_filter import evaluate
+            from .source_text import body,text
+            rows=[r for r in rows if evaluate(body(read(r['snapshot_json'],{})),topic_spec,text(read(r['snapshot_json'],{}).get('title')))['passed']][:limits['search_results']]
     ids=[r[0] for r in rows]
     db.execute('UPDATE edition_jobs SET searches=searches+1,late_checked=CASE WHEN ? THEN 1 ELSE late_checked END,updated_at=? WHERE job_id=?',(int(late),stamp(),job_id))
     db.execute('INSERT INTO edition_lookups(job_id,kind,query,material_ids_json,created_at) VALUES(?,?,?,?,?)',(job_id,'arrivals' if late else 'context',query,encoded(ids),stamp()))

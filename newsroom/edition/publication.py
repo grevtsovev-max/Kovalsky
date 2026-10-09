@@ -32,6 +32,9 @@ def gate(db,document_id,text,post_id=None):
         from .fallback import source_draft
         if draft!=source_draft(store.read(doc['group_json'],{}),materials):raise DeliveryRejected('EDITION_SOURCE_TEXT_CHANGED')
         if store.read(proof['response_json'],{}).get('kind')!='source_fallback':raise DeliveryRejected('EDITION_SOURCE_RECEIPT_MISSING')
+        physical={'headline_length','headline_emoji','paragraph','length','telegram_length','structure','sources'}
+        if any(i['code'] in physical for i in validate(draft,materials,store.read(doc['group_json'],{}))):
+            raise DeliveryRejected('EDITION_SOURCE_FORMAT_INVALID')
     else:
         if not store.read(proof['response_json'],{}).get('response_id'):raise DeliveryRejected('EDITION_REVIEW_RECEIPT_MISSING')
         try:model.validate_review(review)

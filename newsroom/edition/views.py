@@ -5,7 +5,8 @@ from . import model,store
 from .formatting import material_source
 
 LABELS={'QUEUED':'Ожидает подготовки','PLANNING':'Группировка','DRAFTING':'Написание','CHECKING':'Проверка','READY':'Ожидает доставки',
-        'SENDING':'Отправляется','PUBLISHED':'Опубликовано','INCOMPLETE':'Не завершено','REJECTED':'Не подготовлено','UNKNOWN':'Результат отправки неизвестен'}
+        'SENDING':'Отправляется','PUBLISHED':'Опубликовано','INCOMPLETE':'Не завершено','REJECTED':'Не подготовлено','UNKNOWN':'Результат отправки неизвестен',
+        'FILTERED':'Не соответствует теме','CANCELLED':'Отменено владельцем'}
 
 
 def overview(db,config):

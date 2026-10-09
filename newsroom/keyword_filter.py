@@ -19,6 +19,8 @@ def forms(word):
 
 
 def words(text):
+    # URLs and HTML attributes are not visible thematic evidence.
+    text=re.sub(r'<[^>]*>',' ',text)
     return re.findall(r'[а-яёa-z0-9]+', normalize(html.unescape(text)))
 
 

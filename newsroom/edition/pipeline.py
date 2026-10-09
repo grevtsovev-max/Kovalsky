@@ -38,6 +38,7 @@ def plan_all(db,job_id,inputs,settings):
     groups=[];excluded=[]
     for batch in batches:
         result,receipt=model.plan(batch,settings)
+        store.event(db,job_id,'plan_response',{'result':result,'receipt':receipt})
         known={m['material_id']:m for m in batch};covered=set()
         for group in result.get('groups',[]):
             ids=group.get('material_ids')
@@ -46,6 +47,14 @@ def plan_all(db,job_id,inputs,settings):
             for focus in group['focus']:
                 if focus.get('material_id') not in ids or not contains(known[focus['material_id']],focus.get('excerpt')):
                     raise ValueError('EDITION_UNGROUNDED_PLAN')
+                if focus.get('scope') and (not contains(known[focus['material_id']],focus['scope']) or not contains({'content':focus['scope']},focus['excerpt'])):
+                    raise ValueError('EDITION_UNGROUNDED_SCOPE')
+            for evidence in group.get('topic_evidence',[]):
+                if evidence.get('material_id') not in ids or not contains(known[evidence['material_id']],evidence.get('quote')):
+                    raise ValueError('EDITION_UNGROUNDED_TOPIC')
+                scopes=[f.get('scope') for f in group['focus'] if f['material_id']==evidence['material_id'] and f.get('scope')]
+                if scopes and not any(contains({'content':scope},evidence['quote']) for scope in scopes):
+                    raise ValueError('EDITION_TOPIC_FROM_DIFFERENT_EVENT')
             if set(ids)!={f['material_id'] for f in group['focus']}:raise ValueError('EDITION_PLAN_COVERAGE')
             covered.update(ids);groups.append(group)
         for entry in result.get('excluded',[]):
@@ -68,7 +77,7 @@ def save_draft(db,document,draft,receipt,stage):
 
 def review(db,document,draft,materials,settings):
     code=validate(draft,materials,store.read(document['group_json'],{}))
-    try:verdict,receipt=model.check(draft,materials,settings)
+    try:verdict,receipt=model.check(draft,materials,settings,group=store.read(document['group_json'],{}))
     except model.AIResponseError as exc:
         if hasattr(exc,'review'):
             store.event(db,document['job_id'],'review_response',{'verdict':exc.review,'receipt':exc.receipt,'draft_hash':store.sha(draft),'error':exc.code},document['document_id'])
@@ -80,7 +89,9 @@ def review(db,document,draft,materials,settings):
     allowed={r['id'] for r in model.bundle()[0]['rules']}|{'unsupported_fact','main_conflict','new_clarification'}
     for issue in verdict['issues']:
         if issue.get('code') not in allowed or not issue.get('reason') or not issue.get('post_fragment') or issue['post_fragment'] not in all_text:
-            raise ValueError('EDITION_UNSPECIFIC_REVIEW')
+            if issue.get('code') in ('headline_meaning','lead','paragraph','body','background','details','terms','duplicates','length'):
+                issue['post_fragment']=draft.get('lead') or draft.get('headline')
+            else:raise ValueError('EDITION_UNSPECIFIC_REVIEW')
         source=sources.get(issue.get('material_id'))
         if issue.get('source_fragment') and (not source or not contains(source,issue['source_fragment'])):
             raise ValueError('EDITION_UNGROUNDED_REVIEW')
@@ -112,9 +123,9 @@ def process(db,job_id,settings,*,send=None,publish=True):
             store.event(db,job_id,'retry_plan',{'groups':groups,'retry_of':job['retry_of']})
         else:
             groups,excluded=plan_all(db,job_id,inputs,settings)
-        db.execute("UPDATE edition_jobs SET groups_json=?,state='DRAFTING',updated_at=? WHERE job_id=?",(store.encoded(groups),store.stamp(),job_id));db.commit()
+        db.execute("UPDATE edition_jobs SET groups_json=?,reasons_json=?,state='DRAFTING',updated_at=? WHERE job_id=?",(store.encoded(groups),store.encoded(excluded),store.stamp(),job_id));db.commit()
         query=' '.join(g['lookup_query'] for g in groups if g['lookup_query'])
-        context=store.lookup(db,job_id,query) if query else []
+        context=store.lookup(db,job_id,query,topic_spec=settings.get('_keyword_prefilter')) if query else []
         for group in groups:
             selected=[m for m in inputs if m['material_id'] in group['material_ids']]
             combined={m['material_id']:m for m in [*selected,*context]}
@@ -131,7 +142,7 @@ def process(db,job_id,settings,*,send=None,publish=True):
                 draft,receipt=model.draft(group,materials,settings)
             save_draft(db,document,draft,receipt,'draft')
         query=' '.join(n for g in groups for n in [*g['entities'],g['event_key']])
-        late=store.lookup(db,job_id,query,late=True)
+        late=store.lookup(db,job_id,query,late=True,topic_spec=settings.get('_keyword_prefilter'))
         for material in late:material['role']='late_clarification_only'
         db.execute("UPDATE edition_jobs SET state='CHECKING',updated_at=? WHERE job_id=?",(store.stamp(),job_id));db.commit()
         documents=db.execute('SELECT * FROM edition_documents WHERE job_id=? ORDER BY created_at',(job_id,)).fetchall()
@@ -160,7 +171,7 @@ def process(db,job_id,settings,*,send=None,publish=True):
             from .publication import publish_document
             for pending in db.execute("SELECT document_id FROM edition_documents WHERE job_id=? AND state='READY'",(job_id,)).fetchall():publish_document(db,pending[0],settings['_edition_config'],send=send)
         states=[r[0] for r in db.execute('SELECT state FROM edition_documents WHERE job_id=?',(job_id,))]
-        final=('PUBLISHED' if states and all(s=='PUBLISHED' for s in states) else 'READY' if states and all(s in ('READY','PUBLISHED') for s in states) else 'INCOMPLETE')
+        final=('FILTERED' if not states and any(e.get('kind')=='out_of_scope' for e in excluded) else 'PUBLISHED' if states and all(s=='PUBLISHED' for s in states) else 'READY' if states and all(s in ('READY','PUBLISHED') for s in states) else 'INCOMPLETE')
         # Planner exclusions are advisory; ensure_job supplies their source releases.
         reasons=excluded+[{'code':'preparation_incomplete','reason':'Подготовка остановлена; подробности сохранены у постов.'}] if final=='INCOMPLETE' else excluded
         store.finish(db,job_id,final,reasons)

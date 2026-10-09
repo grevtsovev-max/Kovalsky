@@ -30,8 +30,10 @@ BLOCK = obj({'text':S,'kind':{'type':'string','enum':['paragraph','bullet','quot
              'evidence':arr(CITATION),'quote_text':S,'quote_author':S})
 DRAFT = obj({'headline':S,'headline_evidence':arr(CITATION),'lead':S,'lead_evidence':arr(CITATION),'blocks':arr(BLOCK)})
 GROUP = obj({'subject':S,'entities':arr(S),'event_key':S,'material_ids':arr(I),
-             'focus':arr(obj({'material_id':I,'excerpt':S,'summary':S})), 'lookup_query':S})
-PLAN = obj({'groups':arr(GROUP),'excluded':arr(obj({'material_id':I,'reason':S}))})
+             'focus':arr(obj({'material_id':I,'excerpt':S,'summary':S,'scope':S})),
+             'topic_evidence':arr(CITATION), 'lookup_query':S})
+PLAN = obj({'groups':arr(GROUP),'excluded':arr(obj({'material_id':I,'reason':S,
+             'kind':{'type':'string','enum':['out_of_scope','unusable']}}))})
 ISSUE = obj({'code':{'type':'string','enum':[r['id'] for r in bundle()[0]['rules']]+['unsupported_fact','main_conflict','new_clarification']},'post_fragment':S,'source_fragment':S,'material_id':I,'reason':S,'main_fact':B})
 REVIEW_RULES=tuple(r['id'] for r in bundle()[0]['rules'] if r['check']=='review' or r['id']=='duplicates')
 ASSESSMENT=obj({'passed':B,'explanation':S})
@@ -65,10 +67,19 @@ def plan(materials,settings):
         'Раздели исходники на самостоятельные новости, затем объедини все новости одного бренда/лица или '
         'общего события. Общая тема вроде криптовалюты не объединяет разные компании. '
         'Указывай нормализованные имена участников и точный короткий excerpt для каждой выделенной новости. '
+        'Рабочий темник передан в thematic_policy. Проверяй тему КАЖДОГО события, а не всего исходника: '
+        'прохождение первого фильтра не разрешает публиковать непрофильные пункты дайджеста. '
+        'Обычная наука, почта, акции чипмейкеров и деятельность AI-компаний без конкретной связи с '
+        'криптовалютой или цифровыми активами не являются отдельными криптоновостями. '
+        'Случайного слова crypto, названия криптоиздания или общего опасения за крипторынок недостаточно. '
+        'В topic_evidence укажи точный фрагмент, подтверждающий конкретную профильную связь события. '
+        'scope — полный непрерывный фрагмент ИМЕННО этой новости из исходника, со всеми её условиями, '
+        'но без соседних непрофильных пунктов дайджеста. excerpt должен входить в scope. '
         'Один материал может относиться к нескольким группам. Покрой каждый material_id группой или excluded '
-        'с конкретной причиной. Не исключай повторы опубликованного — истории публикаций у тебя нет. '
+        'с конкретной причиной и kind. out_of_scope — только если весь материал не содержит профильного события; '
+        'unusable — если сведений недостаточно. Не исключай профильный материал только из-за краткости. '
         'lookup_query заполняй только при конкретном пробеле, который можно найти в местном архиве; иначе пустая строка.',
-        {'materials':materials},settings)
+        {'materials':materials,'thematic_policy':settings.get('_topic_registry',{})},settings)
 
 
 def draft(group,materials,settings,*,previous=None,feedback=None):
@@ -79,6 +90,9 @@ def draft(group,materials,settings,*,previous=None,feedback=None):
         'В details помещай только дополнительные подробности для сворачиваемой цитаты. '
         'Источники и ссылки не добавляй в blocks: код автоматически добавляет их внизу. '
         'Каждый блок, лид и заголовок снабди точными evidence.quote из materials, с material_id. '
+        'Группа уже определяет новость: используй только её focus.scope и подтверждённые связанные уточнения. '
+        'Криптовалютная связь должна быть понятна в заголовке или лиде: например, ZEUS — биткоин-кошелёк. '
+        'Не выноси отдельным постом общий фон про науку, акции или AI без этой связи. '
         'Прямая цитата задаётся quote_text (точный непрерывный фрагмент) и quote_author; эти поля пусты, если цитаты нет. '
         'В kind=quote text содержит цитату и подпись автора. Цитата внутри обычного блока допускается в конце; '
         'если используешь цитату в заголовке/лиде, приложи соответствующий точный evidence.quote. '
@@ -95,12 +109,17 @@ def draft(group,materials,settings,*,previous=None,feedback=None):
         {'group':group,'materials':materials,'previous':previous,'feedback':feedback},settings,references=True)
 
 
-def check(draft_data,materials,settings):
+def check(draft_data,materials,settings,*,group=None):
     from .formatting import render
     rendered,plain=render(draft_data,materials)
     verdict,receipt=ask('checker',CHECK,
         'Ты независимый проверяющий окончательной версии. Оформление оценивай по rendered_html: '
         'код уже делает заголовок жирным и добавляет источники со ссылками. Отсутствие HTML в draft не ошибка. '
+        'Для scope проверь: основной сюжет соответствует thematic_policy и выбранной группе; '
+        'конкретная связь с криптовалютой/цифровыми активами понятна читателю, а не только исходному дайджесту. '
+        'Имена криптопроектов без указания их роли не раскрывают эту связь. '
+        'Кавычки у названий, терминов и условных обозначений не превращают их в прямую цитату: '
+        'дословность и автор обязательны для quote_text/прямой речи, не для грамматически склонённого термина. '
         'Общее событие в заголовке и лиде неизбежно совпадает; ошибкой является повтор без развития: '
         'лид должен добавлять существенную деталь или пояснять суть. '
         'Сопоставь каждый факт, число, участника, действие, '
@@ -126,7 +145,8 @@ def check(draft_data,materials,settings):
         'Каждый passed=false сопровождается issues с кодом соответствующего правила. '
         'approved=true только если issues пуст и все assessments.passed=true. '
         'Прямую цитату в лиде разрешай как сильное исключение.',
-        {'draft':draft_data,'rendered_html':rendered,'plain_text':plain,'materials':materials},settings)
+        {'draft':draft_data,'rendered_html':rendered,'plain_text':plain,'materials':materials,
+         'group':group,'thematic_policy':settings.get('_topic_registry',{})},settings)
 
     try:validate_review(verdict)
     except AIResponseError as exc:

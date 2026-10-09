@@ -27,7 +27,8 @@ class ReleaseTests(EditionCase):
     def test_writer_failure_releases_source_without_another_model_attempt(self):
         result=self.run_failure(writer=TimeoutError())
         self.assertEqual(result['state'],'PUBLISHED');self.send.assert_called_once()
-        self.assertIn(TEXT,self.send.call_args.args[1])
+        from newsroom.edition.source_text import text
+        self.assertIn(' '.join(TEXT.split()),' '.join(text(self.send.call_args.args[1]).split()))
 
     def test_checker_failure_releases_source_and_keeps_the_generated_draft(self):
         result=self.run_failure(checker=TimeoutError())

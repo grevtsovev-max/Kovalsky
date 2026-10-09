@@ -63,6 +63,7 @@ class PipelineTests(EditionCase):
     def test_explicit_retry_preserves_old_attempt_and_starts_a_new_one(self):
         bad=draft(self.mid);bad['headline']='🏦 '+('А'*109)
         result,_,_=self.run_job(writer=[(bad,receipt())]*2,checker=[(review_result(),receipt())]*2,publish=False)
+        previous_final=store.read(self.document()['draft_json'],{})
         # A historical unfinished attempt remains available for an explicit retry.
         self.db.execute("UPDATE edition_jobs SET state='INCOMPLETE' WHERE job_id=?",(result['job_id'],))
         self.db.execute("UPDATE edition_documents SET state='INCOMPLETE' WHERE job_id=?",(result['job_id'],));self.db.commit()
@@ -74,7 +75,7 @@ class PipelineTests(EditionCase):
         recover(self.db,self.config)
         self.assertEqual(self.db.execute('SELECT state FROM edition_jobs WHERE job_id=?',(new['job_id'],)).fetchone()[0],'QUEUED')
         finished,writing,_=self.run_job(job_id=new['job_id'])
-        self.assertEqual(writing.call_args.kwargs['previous'],bad)
+        self.assertEqual(writing.call_args.kwargs['previous'],previous_final)
         self.assertTrue(writing.call_args.kwargs['feedback'])
         self.assertEqual(finished['state'],'PUBLISHED')
         with self.assertRaises(ValueError):retry(self.db,self.config,result['job_id'])
@@ -87,7 +88,7 @@ class PipelineTests(EditionCase):
         self.assertEqual(result['state'],'PUBLISHED');self.send.assert_called_once();self.assertEqual(writer.call_count,1)
         saved=details(self.db,result['job_id'])
         self.assertTrue(any(e['stage']=='review_response' and e['payload']['verdict']==verdict for e in saved['events']))
-        self.assertIn(TEXT,self.document()['plain_text'])
+        self.assertIn(' '.join(TEXT.split()),' '.join(self.document()['plain_text'].split()))
 
     def test_status_mismatch_without_fragments_releases_source(self):
         verdict=review_result(False,[{'code':'status','post_fragment':LEAD,'source_fragment':'','material_id':self.mid,'reason':'Статус усилен','main_fact':True}])
@@ -138,7 +139,7 @@ class PipelineTests(EditionCase):
             model.draft(group(self.mid),store.materials(self.db,[self.mid]),self.settings)
         payload,settings=api.call_args.args
         self.assertNotIn('tools',payload);self.assertFalse(settings['web_search_enabled'])
-        data=json.loads(payload['input']);self.assertEqual(len(data['references']['references']),14)
+        data=json.loads(payload['input']);self.assertEqual(len(data['references']['references']),20)
         self.assertEqual(data['references']['references'][0]['text'],'Solana запустила обновление сети')
         self.assertNotIn('headline_min',data['rules']['limits'])
         self.assertNotIn('90–100',payload['instructions'])
