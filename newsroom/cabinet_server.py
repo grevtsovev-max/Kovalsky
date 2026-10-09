@@ -84,10 +84,11 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path == "/":
-                view_names = { "published", "sources", "pipeline", "resources", "edition"}
+                view_names = { "vacancies", "published", "sources", "pipeline", "resources", "edition"}
                 requested_view = parse_qs(parsed.query).get("view", ["pipeline"])[0]
                 view = requested_view if requested_view in view_names else "pipeline"
                 headings = {
+                    "vacancies": ("Вакансии", "Объявления о работе и условия"),
                     "resources": ("Расход ресурсов", "Деньги и расходы по задачам"),
                     "published": ("Публикации", "Посты, отправленные в канал"),
                     "sources": ("Источники", "Подключённые новостные ленты"),
@@ -119,7 +120,12 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
             try:
                 from .topic_registry import attach_cached
                 attach_cached(config)
-                if parsed.path == "/api/topic-registry":
+                if parsed.path == "/api/vacancies":
+                    from .vacancy_view import inbox
+                    db = self._read_db()
+                    try: self._json(inbox(db))
+                    finally: db.close()
+                elif parsed.path == "/api/topic-registry":
                     from .topic_registry import report
                     db = self._read_db()
                     try: self._json(report(db))
