@@ -173,12 +173,14 @@ def start(db,bundle_hash,*,retry_of=None):
     db.execute('BEGIN IMMEDIATE')
     if retry_of:
         original=db.execute('SELECT * FROM edition_jobs WHERE job_id=?',(retry_of,)).fetchone()
-        if not original or original['state'] not in ('INCOMPLETE','REJECTED'):
-            db.rollback();raise ValueError('Повтор доступен только для незавершённой подготовки')
+        if not original or original['state'] not in ('INCOMPLETE','REJECTED','FILTERED'):
+            db.rollback();raise ValueError('Повтор доступен только для незавершённой или исключённой подготовки')
         # No automatic or concurrent replay of a prior attempt.
-        if db.execute("SELECT 1 FROM edition_jobs WHERE retry_of=? AND state NOT IN ('INCOMPLETE','REJECTED')",(retry_of,)).fetchone():
+        if db.execute("SELECT 1 FROM edition_jobs WHERE retry_of=? AND state NOT IN ('INCOMPLETE','REJECTED','FILTERED')",(retry_of,)).fetchone():
             db.rollback();raise ValueError('Повторная подготовка уже запущена')
         docs=db.execute('SELECT * FROM edition_documents WHERE job_id=?',(retry_of,)).fetchall()
+        if original['state']=='FILTERED' and any(d['state']=='PUBLISHED' for d in docs):
+            db.rollback();raise ValueError('Исключённая подготовка содержит опубликованный пост; повтор запрещён')
         if any(d['state'] in ('UNKNOWN','SENDING','READY') for d in docs):
             db.rollback();raise ValueError('Сначала необходимо разрешить результат доставки предыдущей попытки')
         failed=[d for d in docs if d['state']=='INCOMPLETE']

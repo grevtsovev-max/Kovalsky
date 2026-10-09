@@ -14,6 +14,15 @@ from newsroom.locking import acquire_cycle_lock
 
 
 class RegressionTests(EditionCase):
+    def test_excluded_preparation_has_explicit_retry_and_original_decision_is_preserved(self):
+        mid=self.material();job=self.job()
+        self.db.execute("UPDATE edition_jobs SET state='FILTERED' WHERE job_id=?",(job,));self.db.commit()
+        retried=store.start(self.db,model.bundle()[2],retry_of=job)
+        self.assertEqual(self.db.execute('SELECT state FROM edition_jobs WHERE job_id=?',(job,)).fetchone()[0],'FILTERED')
+        row=self.db.execute('SELECT state,material_ids_json,retry_of FROM edition_jobs WHERE job_id=?',(retried,)).fetchone()
+        self.assertEqual((row[0],store.read(row[1]),row[2]),('QUEUED',[mid],job))
+        with self.assertRaises(ValueError):store.start(self.db,model.bundle()[2],retry_of=job)
+
     def test_checker_rejects_off_topic_source_without_forced_fallback(self):
         text='Зампред банка поделился опытом создания ИИ-агентов.'
         mid=self.material(text=text);job=self.job();output={'headline':'','headline_evidence':[],'lead':'','lead_evidence':[],'blocks':[]}

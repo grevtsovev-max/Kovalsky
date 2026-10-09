@@ -24,8 +24,9 @@ def overview(db,config):
                 'state_label':LABELS.get(d['state'],d['state']),'text':d['plain_text'],'draft':store.read(d['draft_json'],{}),
                 'repairs':d['repairs'],'reasons':store.read(d['reasons_json'],[]),'post_id':d['post_id'],
                 'sources':[{'material_id':m['material_id'],'url':material_source(m)[1],'name':material_source(m)[0]} for m in store.read(d['materials_json'],[])]})
-        retryable=job['state'] in ('INCOMPLETE','REJECTED') and not any(d['state'] in ('UNKNOWN','SENDING','READY') for d in docs)
-        if db.execute("SELECT 1 FROM edition_jobs WHERE retry_of=? AND state NOT IN ('INCOMPLETE','REJECTED')",(job['job_id'],)).fetchone():retryable=False
+        retryable=job['state'] in ('INCOMPLETE','REJECTED','FILTERED') and not any(d['state'] in ('UNKNOWN','SENDING','READY') for d in docs)
+        if job['state']=='FILTERED' and any(d['state']=='PUBLISHED' for d in docs):retryable=False
+        if db.execute("SELECT 1 FROM edition_jobs WHERE retry_of=? AND state NOT IN ('INCOMPLETE','REJECTED','FILTERED')",(job['job_id'],)).fetchone():retryable=False
         jobs.append({'job_id':job['job_id'],'retry_of':job['retry_of'],'state':job['state'],'state_label':LABELS.get(job['state'],job['state']),
             'received_at':job['received_at'],'created_at':job['created_at'],'updated_at':job['updated_at'],
             'age_seconds':age,'delayed':age>600 and job['state']!='PUBLISHED','searches':job['searches'],
