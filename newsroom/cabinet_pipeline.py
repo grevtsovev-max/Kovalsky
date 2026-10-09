@@ -371,6 +371,8 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                 if active_checkpoint['reason']:
                     reason = active_checkpoint['reason']
         latest = edition.get(item['item_id'])
+        if latest and latest.get('archived') and category in {'published', 'filtered'}:
+            latest = None
         if latest:
             category, reason = latest['category'], latest['reason']
         counts[category] += 1
@@ -432,10 +434,12 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             interest_vote=item.get('interest_vote'),
             post=({k:post.get(k) for k in ('post_id','status','created_at','published_at','telegram_url','external_id',
                                             'text','auto_reason','auto_attempts','auto_last_error',
-                                            'publication_trace','link_method')} if post else None))
+                                            'publication_trace','link_method','ai_metrics')} if post else None))
         if latest:
-            item['material_status'] = 'Материал прочитан' if latest['progress']['primary_read'] else 'Текст ещё не получен'
-            item['analysis_status'] = 'Разбор сохранён' if latest['progress']['analyzed'] else latest['reason']
+            item.pop('current_checkpoint', None)
+            item['archived'] = latest.get('archived', False)
+            item['material_status'] = 'Материал прочитан' if latest['progress'].get('primary_read', progress['primary_read']) else 'Текст ещё не получен'
+            item['analysis_status'] = 'Разбор сохранён' if latest['progress'].get('analyzed', progress['analyzed']) else latest['reason']
         in_bucket = (bucket == 'all' or bucket == 'work' and not terminal
                      or bucket == 'attention' and needs_attention
                      or bucket == 'published' and category == 'published'
@@ -464,7 +468,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
                                       if item['retry_queue_position'] and queue_batch else 0)
         history = decision_history(db, item['item_id'], has_decisions)
         item['decision_history'] = history
-        item['analysis_status'] = (
+        item['analysis_status'] = edition.get(item['item_id'], {}).get('reason') or (
             'Полный ИИ-разбор сохранён' if item.get('analyzed_at') else
             'Ожидает ИИ-разбора; повтор запланирован' if item['disposition'] == 'AI_RETRY' else
             'Ожидает прочитанного материала; полный разбор ещё не запускался' if item['disposition'] == 'PRIMARY_RETRY' else
@@ -517,6 +521,10 @@ def cabinet_posts(db, config):
         post['source_ids'] = obj(post.get('source_ids'))
         post['telegram_url'] = _telegram_message_url(config, post['external_id']) if post.get('external_id') else None
         output.append(post)
+    from .post_metrics import for_posts
+    metrics = for_posts(db, [p['post_id'] for p in output])
+    for post in output:
+        post['ai_metrics'] = metrics[post['post_id']]
     return output
 
 
@@ -525,6 +533,7 @@ def edition_progress(db, tables):
     if not {'edition_materials', 'edition_documents', 'edition_jobs', 'edition_checks'} <= tables:
         return {}
     from .edition.views import LABELS
+    from .edition.store import read
     result = {}
     documents = {}
     for d in db.execute('SELECT * FROM edition_documents ORDER BY updated_at'):
@@ -532,11 +541,13 @@ def edition_progress(db, tables):
             documents.setdefault(material_id, []).append(dict(d))
     job_map = {}
     for j in db.execute('SELECT * FROM edition_jobs ORDER BY updated_at'):
-        for material_id in obj(j['material_ids_json']):
+        for material_id in read(j['material_ids_json'], []):
             job_map.setdefault(material_id, []).append(dict(j))
+    admissions = {r['material_id']: dict(r) for r in db.execute('SELECT * FROM edition_admissions')} if 'edition_admissions' in tables else {}
     proofs = {(r[0],r[1]) for r in db.execute('SELECT document_id,rendered_hash FROM edition_checks')}
     sent = {r[0] for r in db.execute("SELECT post_id FROM posts WHERE status='PUBLISHED' AND external_id IS NOT NULL")}
-    for row in db.execute('SELECT m.material_id,m.item_id,m.revision,m.queue_state,m.eligible,(length(m.content)>0) AS content,i.ingest_revision FROM edition_materials m JOIN items i USING(item_id) ORDER BY m.material_id'):
+    activation = db.execute("SELECT value FROM app_state WHERE key='edition_v2_activation'").fetchone() if 'app_state' in tables else None
+    for row in db.execute('SELECT m.material_id,m.item_id,m.revision,m.queue_state,m.eligible,m.received_at,(length(m.content)>0) AS content,i.ingest_revision,i.disposition FROM edition_materials m JOIN items i USING(item_id) ORDER BY m.material_id'):
         m = dict(row)
         if m['revision'] != m['ingest_revision']:
             continue
@@ -544,6 +555,13 @@ def edition_progress(db, tables):
         jobs = job_map.get(m['material_id'], [])
         # Archived snapshots do not supersede legacy processing evidence.
         if not jobs and not docs and m['queue_state'] == 'ARCHIVE':
+            if m['disposition'] in {'PENDING', 'PRIMARY_RETRY', 'AI_RETRY', 'WAITING_CONFIRMATION', 'TECHNICAL_ERROR', 'NEW_STORY', 'UPDATE_CANDIDATE', 'AGENT_CORRECTION_QUEUED'} and activation and m['received_at'] < activation[0]:
+                result[m['item_id']] = {
+                    'category': 'processed',
+                    'archived': True,
+                    'reason': 'Архивный материал: получен до запуска новой редакции и не включён в её очередь. Результат прежней обработки не сохранён.',
+                    'progress': {},
+                }
             continue
         checks = False
         published = False
@@ -554,12 +572,51 @@ def edition_progress(db, tables):
             drafted |= bool(d['rendered_text'])
             checks |= (d['document_id'], hashlib.sha256(d['rendered_text'].encode()).hexdigest()) in proofs
             published |= d['post_id'] in sent
-        state = (jobs[-1]['state'] if jobs else m['queue_state'])
-        category = ('published' if published and all(d['state']=='PUBLISHED' for d in docs)
-                    else 'technical' if state in {'UNKNOWN','INCOMPLETE','REJECTED'}
-                    else 'review' if state in {'CHECKING','READY','SENDING'}
-                    else 'ai' if state in {'PLANNING','DRAFTING'} else 'received')
-        result[m['item_id']] = {'category':category, 'reason':LABELS.get(state,state),
+        state = jobs[-1]['state'] if jobs else m['queue_state']
+        reason = LABELS.get(state, state)
+        excluded = [entry for job in jobs[-1:] for entry in read(job.get('reasons_json'), [])
+                    if isinstance(entry, dict) and entry.get('material_id') == m['material_id']]
+        admission = admissions.get(m['material_id'])
+        states = {d['state'] for d in docs}
+        if docs:
+            if states <= {'PUBLISHED', 'COVERED', 'DUPLICATE', 'FILTERED', 'CANCELLED'}:
+                category = 'published' if published else 'filtered'
+                reason = ('Связанный пост опубликован в канале.' if published else
+                          'Материал завершён без публикации.')
+                saved_reasons = [entry.get('reason') for d in docs
+                                 for entry in read(d.get('reasons_json'), [])
+                                 if isinstance(entry, dict) and entry.get('reason')]
+                if not published and saved_reasons:
+                    reason = '; '.join(saved_reasons)
+            elif states & {'UNKNOWN', 'INCOMPLETE', 'REJECTED'}:
+                category = 'technical'
+                problem = 'UNKNOWN' if 'UNKNOWN' in states else sorted(states & {'INCOMPLETE', 'REJECTED'})[0]
+                reason = LABELS.get(problem, problem)
+            elif 'LANGUAGE_PENDING' in states:
+                category, reason = 'confirmation', LABELS.get('LANGUAGE_PENDING', 'Ожидает русского перевода')
+            elif states & {'CHECKING', 'READY', 'SENDING'}:
+                category = 'review'
+            else:
+                category = 'ai'
+        elif excluded:
+            category = 'filtered'
+            reason = '; '.join(entry['reason'] for entry in excluded if entry.get('reason')) or 'Исключён редакцией.'
+            analyzed = True
+        elif m['queue_state'] in {'DUPLICATE', 'SUPERSEDED'}:
+            category = 'filtered'
+            reason = admission['reason'] if admission else 'Повтор или заменённая версия; отдельная публикация не требуется.'
+        elif state in {'FILTERED', 'CANCELLED'}:
+            category, reason = 'filtered', LABELS.get(state, 'Завершён без публикации')
+        elif state in {'PUBLISHED', 'DONE'}:
+            category, reason = 'processed', 'Обработка редакцией завершена; отдельный пост не связан с материалом.'
+        elif state in {'UNKNOWN', 'INCOMPLETE', 'REJECTED'}:
+            category = 'technical'
+        elif state in {'CHECKING', 'READY', 'SENDING'}:
+            category = 'review'
+        else:
+            category = 'ai'
+            reason = LABELS.get(state, 'Ожидает подготовки редакцией.')
+        result[m['item_id']] = {'category':category, 'reason':reason,
             'progress': {'first_filter': bool(m['eligible']),
                          'primary_read':bool(m['eligible'] and m['content']),
                          'analyzed':analyzed, 'drafted':drafted,

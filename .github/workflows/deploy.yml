@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check approved cabinet before release
-        run: python3 -m unittest tests.test_dashboard_shell tests.test_dashboard_design tests.test_cabinet_adapter
+        run: python3 -m unittest tests.test_dashboard_shell tests.test_dashboard_design tests.test_cabinet_adapter tests.test_post_metrics
 
       - name: Configure SSH
         env:

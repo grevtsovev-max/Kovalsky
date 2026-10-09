@@ -258,7 +258,9 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
             try:
                 from .cli import _telegram_message_url
                 rows=db.execute("SELECT post_id,COALESCE((SELECT plain_text FROM edition_documents d WHERE d.post_id=posts.post_id),text) AS text,status,external_id,published_at FROM posts WHERE status='PUBLISHED' ORDER BY published_at DESC LIMIT 200").fetchall()
-                return [{**dict(r),'headline':r['text'].splitlines()[0] if r['text'] else '',
+                from .post_metrics import for_posts
+                metrics = for_posts(db, [r['post_id'] for r in rows])
+                return [{**dict(r),'ai_metrics':metrics[r['post_id']], 'headline':r['text'].splitlines()[0] if r['text'] else '',
                          'telegram_url':_telegram_message_url(config,r['external_id']) if r['external_id'] else None} for r in rows]
             finally: db.close()
 
