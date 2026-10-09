@@ -112,10 +112,11 @@ def capture(db,item_id,*,eligible=False,queue=False):
         db.execute("UPDATE edition_materials SET eligible=1,queue_state='QUEUED' WHERE item_id=? AND revision=? AND queue_state='ARCHIVE'",(item_id,revision))
     material_id=db.execute('SELECT material_id FROM edition_materials WHERE item_id=? AND revision=?',(item_id,revision)).fetchone()[0]
     if queue and eligible and db.execute('SELECT queue_state FROM edition_materials WHERE material_id=?',(material_id,)).fetchone()[0]=='QUEUED':
-        from .source_text import same_version,article_identity
+        from .source_text import same_version,article_identity,layout_version
         from .formatting import material_source
-        previous=db.execute("SELECT material_id,snapshot_json FROM edition_materials WHERE item_id=? AND material_id<>? AND eligible=1 AND queue_state IN ('QUEUED','CLAIMED','DONE') ORDER BY material_id DESC LIMIT 1",(item_id,material_id)).fetchone()
-        duplicate=previous if previous and same_version(read(previous['snapshot_json'],{}),snapshot) else None
+        previous=db.execute("SELECT material_id,snapshot_json,eligible,queue_state FROM edition_materials WHERE item_id=? AND material_id<? ORDER BY material_id DESC LIMIT 1",(item_id,material_id)).fetchone()
+        prior=read(previous['snapshot_json'],{}) if previous else {}
+        duplicate=previous if previous and (layout_version(prior,snapshot) or previous['eligible'] and previous['queue_state'] in ('QUEUED','CLAIMED','DONE','DUPLICATE') and same_version(prior,snapshot)) else None
         if not duplicate:
             # Exact evidence equality is required across publishers, not just a similar title.
             candidates=db.execute("SELECT material_id,snapshot_json FROM edition_materials WHERE material_id<>? AND eligible=1 AND queue_state IN ('QUEUED','CLAIMED','DONE') AND julianday(received_at)>=julianday(?)-10.0/1440 ORDER BY material_id DESC LIMIT 300",(material_id,received)).fetchall()

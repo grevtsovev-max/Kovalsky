@@ -79,8 +79,18 @@ def formatted(draft):
     return result
 
 
+def layout_version(a,b):
+    """A collector layout change cannot turn an indexed archive into fresh news."""
+    compact=lambda value:re.sub(r'\s+','',canonical(value))
+    left=compact(body(a));right=compact(body(b))
+    if not left or left!=right:return False
+    first=compact(a.get('title',''));second=compact(b.get('title',''))
+    return first==second or bool(first and second and left.startswith(first) and right.startswith(second))
+
+
 def same_version(a,b):
     """Ignore punctuation, markup and grammatical copy edits, never changed facts."""
+    if layout_version(a,b):return True
     left=re.findall(r'\w+',canonical(body(a)));right=re.findall(r'\w+',canonical(body(b)))
     left_title=re.findall(r'\w+',canonical(a.get('title','')))
     right_title=re.findall(r'\w+',canonical(b.get('title','')))

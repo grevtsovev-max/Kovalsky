@@ -14,6 +14,14 @@ from newsroom.locking import acquire_cycle_lock
 
 
 class RegressionTests(EditionCase):
+    def test_collector_layout_change_does_not_enqueue_indexed_archive(self):
+        old='Биржа открыла переводы криптовалют. Переводы доступны в пяти сетях.'
+        mid=self.material(text=old,title=old[:55],queue=False,url='https://example.org/archived')
+        revised=self.material(text=old.replace('. ','.\n'),title='Биржа открыла переводы криптовалют.',url='https://example.org/archived')
+        self.assertEqual(self.db.execute('SELECT queue_state FROM edition_materials WHERE material_id=?',(revised,)).fetchone()[0],'DUPLICATE')
+        self.assertIsNone(self.job())
+        self.assertEqual(self.db.execute('SELECT related_material_id FROM edition_admissions WHERE material_id=?',(revised,)).fetchone()[0],mid)
+
     def test_telegram_intake_preserves_heading_and_paragraph_boundaries(self):
         from newsroom.core import TelegramPreviewParser
         parser=TelegramPreviewParser('example')
