@@ -253,6 +253,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     by_story = {}
     for post in posts:
         by_story.setdefault(post['story_id'], []).append(post)
+    posts_by_id = {p['post_id']: p for p in posts}
     counts = dict.fromkeys(dict(STAGES), 0)
     totals = dict(received=0, first_filter=0, analyzed=0, primary_read=0, selected=0, drafted=0, checked=0, published=0)
     revisions = {row['item_id']: row['ingest_revision'] for row in rows}
@@ -375,6 +376,10 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             latest = None
         if latest:
             category, reason = latest['category'], latest['reason']
+            if latest.get('post_id') in posts_by_id:
+                post = posts_by_id[latest['post_id']]
+                post['link_method'] = 'EXPLICIT'
+                post['publication_trace'] = publication_trace(db, post['post_id'], tables)
         counts[category] += 1
         proof = ((post.get('facts') or {}).get('final_text_check') or {}) if post else {}
         # A Telegram edit changes the display, not the completed pre-send check.
@@ -616,7 +621,7 @@ def edition_progress(db, tables):
         else:
             category = 'ai'
             reason = LABELS.get(state, 'Ожидает подготовки редакцией.')
-        result[m['item_id']] = {'category':category, 'reason':reason,
+        result[m['item_id']] = {'category':category, 'reason':reason, 'post_id':next((d['post_id'] for d in reversed(docs) if d.get('post_id')),None),
             'progress': {'first_filter': bool(m['eligible']),
                          'primary_read':bool(m['eligible'] and m['content']),
                          'analyzed':analyzed, 'drafted':drafted,
