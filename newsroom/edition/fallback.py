@@ -139,6 +139,6 @@ def ensure_job(db,job_id,reason):
                 else:db.execute('INSERT INTO edition_documents(document_id,job_id,group_json,materials_json,created_at,updated_at) VALUES(?,?,?,?,?,?)',(docid,job_id,store.encoded(sub),store.encoded([m]),now,now))
                 db.commit();release(db,db.execute('SELECT * FROM edition_documents WHERE document_id=?',(docid,)).fetchone(),source=True,reason=reason)
     states=[r[0] for r in db.execute('SELECT state FROM edition_documents WHERE job_id=?',(job_id,))]
-    state='FILTERED' if not states and filtered else 'PUBLISHED' if states and all(s=='PUBLISHED' for s in states) else 'READY' if all(s in ('READY','PUBLISHED') for s in states) else 'INCOMPLETE'
+    state='FILTERED' if (not states and filtered) or states and all(s=='FILTERED' for s in states) else 'PUBLISHED' if states and all(s in ('PUBLISHED','FILTERED') for s in states) else 'READY' if all(s in ('READY','PUBLISHED','FILTERED') for s in states) else 'INCOMPLETE'
     store.finish(db,job_id,state,[*excluded,reason])
     db.executemany("UPDATE edition_materials SET queue_state='DONE' WHERE material_id=?",[(m['material_id'],) for m in inputs]);db.commit()

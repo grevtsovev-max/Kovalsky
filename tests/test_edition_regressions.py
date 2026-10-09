@@ -14,6 +14,26 @@ from newsroom.locking import acquire_cycle_lock
 
 
 class RegressionTests(EditionCase):
+    def test_checker_rejects_off_topic_source_without_forced_fallback(self):
+        text='Зампред банка поделился опытом создания ИИ-агентов.'
+        mid=self.material(text=text);job=self.job();output={'headline':'','headline_evidence':[],'lead':'','lead_evidence':[],'blocks':[]}
+        issue={'code':'scope','material_id':mid,'post_fragment':'','source_fragment':text,'reason':'Исходник о личном опыте с ИИ, без цифровых активов.','main_fact':True}
+        verdict=review_result(False,[issue]);verdict['source_scope']='out_of_scope';send=Mock();g=group(mid);g['focus']=[{'material_id':mid,'excerpt':text,'summary':text,'scope':text}]
+        with patch.object(model,'plan',return_value=({'groups':[g],'excluded':[]},receipt())),patch.object(model,'draft',return_value=(output,receipt())) as writer,patch.object(model,'check',return_value=(verdict,receipt())):
+            result=process(self.db,job,self.settings,send=send)
+        self.assertEqual(result['state'],'FILTERED');send.assert_not_called();self.assertEqual(writer.call_count,1)
+        self.assertEqual(self.db.execute('SELECT state FROM edition_documents').fetchone()[0],'FILTERED')
+        self.assertEqual(self.db.execute("SELECT count(*) FROM edition_events WHERE stage='source_out_of_scope'").fetchone()[0],1)
+
+    def test_missing_crypto_explanation_in_draft_does_not_discard_profiled_source(self):
+        mid=self.material();job=self.job();output=draft(mid)
+        issue={'code':'scope','material_id':mid,'post_fragment':output['lead'],'source_fragment':LEAD,'reason':'В тексте необходимо пояснить профильную роль участника.','main_fact':False}
+        verdict=review_result(False,[issue]);verdict['source_scope']='in_scope';send=Mock(return_value=TelegramReceipt({'message_id':99,'chat':{'id':'@test'},'text':'saved'}))
+        with patch.object(model,'plan',return_value=({'groups':[group(mid)],'excluded':[]},receipt())),patch.object(model,'draft',return_value=(output,receipt())) as writer,patch.object(model,'check',side_effect=[(verdict,receipt()),(review_result(),receipt())]):
+            result=process(self.db,job,self.settings,send=send,publish=False)
+        self.assertEqual(result['state'],'READY');self.assertEqual(writer.call_count,2)
+        self.assertNotEqual(self.db.execute('SELECT state FROM edition_documents').fetchone()[0],'FILTERED')
+
     def test_collector_layout_change_does_not_enqueue_indexed_archive(self):
         old='Биржа открыла переводы криптовалют. Переводы доступны в пяти сетях.'
         mid=self.material(text=old,title=old[:55],queue=False,url='https://example.org/archived')

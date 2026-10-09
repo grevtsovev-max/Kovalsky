@@ -28,7 +28,7 @@ def review_result(approved=True,issues=None):
     codes={i['code'] for i in issues}
     if 'unsupported_fact' in codes:codes.add('facts')
     if 'main_conflict' in codes:codes.add('conflicts')
-    return {'approved':approved,'issues':issues,'assessments':{key:{'passed':key not in codes,'explanation':'Проверено на условном материале'} for key in model.REVIEW_RULES}}
+    return {'source_scope':'in_scope','approved':approved,'issues':issues,'assessments':{key:{'passed':key not in codes,'explanation':'Проверено на условном материале'} for key in model.REVIEW_RULES}}
 
 
 def receipt():return {'response_id':'fake-test-response','model':'test','bundle_hash':model.bundle()[2]}

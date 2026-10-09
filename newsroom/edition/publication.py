@@ -67,7 +67,7 @@ def published(db,doc,config,message_id):
     seconds=(datetime.fromisoformat(now)-datetime.fromisoformat(min(received) if received else job[0])).total_seconds()
     store.event(db,doc['job_id'],'published',{'message_id':str(message_id),'received_to_channel_seconds':seconds},doc['document_id'])
     state=db.execute('SELECT state FROM edition_jobs WHERE job_id=?',(doc['job_id'],)).fetchone()[0]
-    if state in ('READY','INCOMPLETE') and not db.execute("SELECT 1 FROM edition_documents WHERE job_id=? AND state!='PUBLISHED'",(doc['job_id'],)).fetchone():
+    if state in ('READY','INCOMPLETE') and not db.execute("SELECT 1 FROM edition_documents WHERE job_id=? AND state NOT IN ('PUBLISHED','FILTERED')",(doc['job_id'],)).fetchone():
         store.finish(db,doc['job_id'],'PUBLISHED',[])
     return str(message_id)
 

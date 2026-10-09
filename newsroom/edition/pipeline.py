@@ -84,6 +84,15 @@ def review(db,document,draft,materials,settings):
         raise
     store.event(db,document['job_id'],'review_response',{'verdict':verdict,'receipt':receipt,'draft_hash':store.sha(draft)},document['document_id'])
     model.validate_review(verdict)
+    if verdict.get('source_scope')=='out_of_scope':
+        sources={m['material_id']:m for m in materials}
+        initial=set(store.read(document['group_json'],{}).get('material_ids',[]))
+        grounded=[i for i in verdict['issues'] if i.get('material_id') in initial and i.get('code')=='scope' and i.get('reason') and contains(sources.get(i.get('material_id'),{}),i.get('source_fragment'))]
+        if not grounded:raise ValueError('EDITION_UNGROUNDED_SOURCE_SCOPE')
+        db.execute("UPDATE edition_documents SET state='FILTERED',reasons_json=?,updated_at=? WHERE document_id=?",
+            (store.encoded(grounded),store.stamp(),document['document_id']))
+        db.commit();store.event(db,document['job_id'],'source_out_of_scope',{'verdict':verdict,'receipt':receipt},document['document_id'])
+        return False,grounded
     all_text='\n'.join([draft.get('headline',''),draft.get('lead',''),*(b.get('text','') for b in draft.get('blocks',[]))])
     sources={m['material_id']:m for m in materials}
     allowed={r['id'] for r in model.bundle()[0]['rules']}|{'unsupported_fact','main_conflict','new_clarification'}
@@ -152,12 +161,14 @@ def process(db,job_id,settings,*,send=None,publish=True):
             for m in late:combined.setdefault(m['material_id'],m)
             materials=list(combined.values());draft=store.read(document['draft_json'],{})
             passed,issues=review(db,document,draft,materials,settings)
+            if db.execute('SELECT state FROM edition_documents WHERE document_id=?',(document['document_id'],)).fetchone()[0]=='FILTERED':continue
             if not passed:
                 # A single explicit correction, with no search or re-planning loop.
                 db.execute('UPDATE edition_documents SET repairs=repairs+1 WHERE document_id=? AND repairs=0',(document['document_id'],));db.commit()
                 corrected,receipt=model.draft(store.read(document['group_json'],{}),materials,settings,previous=draft,feedback=issues)
                 draft=save_draft(db,document,corrected,receipt,'repair')
                 passed,issues=review(db,document,draft,materials,settings)
+            if db.execute('SELECT state FROM edition_documents WHERE document_id=?',(document['document_id'],)).fetchone()[0]=='FILTERED':continue
             if not passed:
                 from .fallback import release,can_release
                 current=db.execute('SELECT * FROM edition_documents WHERE document_id=?',(document['document_id'],)).fetchone()
@@ -171,7 +182,7 @@ def process(db,job_id,settings,*,send=None,publish=True):
             from .publication import publish_document
             for pending in db.execute("SELECT document_id FROM edition_documents WHERE job_id=? AND state='READY'",(job_id,)).fetchall():publish_document(db,pending[0],settings['_edition_config'],send=send)
         states=[r[0] for r in db.execute('SELECT state FROM edition_documents WHERE job_id=?',(job_id,))]
-        final=('FILTERED' if not states and any(e.get('kind')=='out_of_scope' for e in excluded) else 'PUBLISHED' if states and all(s=='PUBLISHED' for s in states) else 'READY' if states and all(s in ('READY','PUBLISHED') for s in states) else 'INCOMPLETE')
+        final=('FILTERED' if (not states and any(e.get('kind')=='out_of_scope' for e in excluded)) or states and all(s=='FILTERED' for s in states) else 'PUBLISHED' if states and all(s in ('PUBLISHED','FILTERED') for s in states) else 'READY' if states and all(s in ('READY','PUBLISHED','FILTERED') for s in states) else 'INCOMPLETE')
         # Planner exclusions are advisory; ensure_job supplies their source releases.
         reasons=excluded+[{'code':'preparation_incomplete','reason':'Подготовка остановлена; подробности сохранены у постов.'}] if final=='INCOMPLETE' else excluded
         store.finish(db,job_id,final,reasons)

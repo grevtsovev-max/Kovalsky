@@ -37,7 +37,7 @@ PLAN = obj({'groups':arr(GROUP),'excluded':arr(obj({'material_id':I,'reason':S,
 ISSUE = obj({'code':{'type':'string','enum':[r['id'] for r in bundle()[0]['rules']]+['unsupported_fact','main_conflict','new_clarification']},'post_fragment':S,'source_fragment':S,'material_id':I,'reason':S,'main_fact':B})
 REVIEW_RULES=tuple(r['id'] for r in bundle()[0]['rules'] if r['check']=='review' or r['id']=='duplicates')
 ASSESSMENT=obj({'passed':B,'explanation':S})
-CHECK = obj({'assessments':obj({key:ASSESSMENT for key in REVIEW_RULES}),'approved':B,'issues':arr(ISSUE)})
+CHECK = obj({'source_scope':{'type':'string','enum':['in_scope','out_of_scope','uncertain']},'assessments':obj({key:ASSESSMENT for key in REVIEW_RULES}),'approved':B,'issues':arr(ISSUE)})
 
 
 def ask(role, schema, instruction, data, settings, *, references=False):
@@ -67,6 +67,7 @@ def plan(materials,settings):
         'Раздели исходники на самостоятельные новости, затем объедини все новости одного бренда/лица или '
         'общего события. Общая тема вроде криптовалюты не объединяет разные компании. '
         'Указывай нормализованные имена участников и точный короткий excerpt для каждой выделенной новости. '
+        'Издания-источники не входят в entities, если сами не являются участниками события. '
         'Рабочий темник передан в thematic_policy. Проверяй тему КАЖДОГО события, а не всего исходника: '
         'прохождение первого фильтра не разрешает публиковать непрофильные пункты дайджеста. '
         'Обычная наука, почта, акции чипмейкеров и деятельность AI-компаний без конкретной связи с '
@@ -75,6 +76,8 @@ def plan(materials,settings):
         'В topic_evidence укажи точный фрагмент, подтверждающий конкретную профильную связь события. '
         'scope — полный непрерывный фрагмент ИМЕННО этой новости из исходника, со всеми её условиями, '
         'но без соседних непрофильных пунктов дайджеста. excerpt должен входить в scope. '
+        'scope копируется из ОДНОГО поля title, description или content. Не склеивай заголовок '
+        'и описание добавленной точкой. Если нужны оба поля — добавь два элемента focus с тем же material_id. '
         'Один материал может относиться к нескольким группам. Покрой каждый material_id группой или excluded '
         'с конкретной причиной и kind. out_of_scope — только если весь материал не содержит профильного события; '
         'unusable — если сведений недостаточно. Не исключай профильный материал только из-за краткости. '
@@ -115,6 +118,13 @@ def check(draft_data,materials,settings,*,group=None):
     verdict,receipt=ask('checker',CHECK,
         'Ты независимый проверяющий окончательной версии. Оформление оценивай по rendered_html: '
         'код уже делает заголовок жирным и добавляет источники со ссылками. Отсутствие HTML в draft не ошибка. '
+        'Сначала оцени source_scope независимо от качества черновика: in_scope — исходное событие '
+        'по теме, out_of_scope — исходное событие само по себе непрофильное, uncertain — данных недостаточно. '
+        'Банк, известное лицо или криптоиздание как источник не делают рассказ о создании ИИ-агентов '
+        'криптоновостью без конкретной связи с цифровыми активами. Для out_of_scope обязательны '
+        'issue code=scope и точный source_fragment с material_id; post_fragment может быть пустым '
+        'при пустом черновике. Не путай непрофильный исходник с отсутствием объяснения профильной связи в тексте: '
+        'во втором случае source_scope=in_scope и замечание scope адресуется тексту. '
         'Для scope проверь: основной сюжет соответствует thematic_policy и выбранной группе; '
         'конкретная связь с криптовалютой/цифровыми активами понятна читателю, а не только исходному дайджесту. '
         'Имена криптопроектов без указания их роли не раскрывают эту связь. '
@@ -158,6 +168,10 @@ def check(draft_data,materials,settings,*,group=None):
 def validate_review(verdict):
     if not isinstance(verdict,dict) or not isinstance(verdict.get('approved'),bool) or not isinstance(verdict.get('issues'),list):
         raise AIResponseError('EDITION_INVALID_REVIEW')
+    if verdict.get('source_scope','in_scope') not in ('in_scope','out_of_scope','uncertain'):
+        raise AIResponseError('EDITION_INVALID_SOURCE_SCOPE')
+    if verdict.get('source_scope')=='out_of_scope' and not any(i.get('code')=='scope' and i.get('source_fragment') and i.get('reason') for i in verdict['issues']):
+        raise AIResponseError('EDITION_SOURCE_SCOPE_EVIDENCE_MISSING')
     assessments=verdict.get('assessments',{})
     if not isinstance(assessments,dict):raise AIResponseError('EDITION_REVIEW_COVERAGE_MISSING')
     if set(assessments)!=set(REVIEW_RULES):raise AIResponseError('EDITION_REVIEW_COVERAGE_MISSING')
