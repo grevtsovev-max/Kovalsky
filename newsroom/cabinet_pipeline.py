@@ -4,6 +4,18 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 MAX_AUTOMATIC_RETRIES = 3  # Historical records only; this view never schedules work.
 
+
+
+PATH_KEYS = ('received', 'first_filter', 'primary_read', 'analyzed', 'drafted', 'checked', 'published')
+
+def sequential_progress(evidence):
+    result = dict(evidence)
+    reached = True
+    for key in PATH_KEYS:
+        reached = reached and bool(evidence.get(key))
+        result[key] = reached
+    return result
+
 STAGES = [
     ('received', 'Ожидают обработки'), ('screening', 'Фильтр ключевиков'), ('primary', 'Чтение источника'),
     ('ai', 'Факты и черновик'), ('confirmation', 'Требуют уточнения'),
@@ -256,6 +268,7 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     posts_by_id = {p['post_id']: p for p in posts}
     counts = dict.fromkeys(dict(STAGES), 0)
     totals = dict(received=0, first_filter=0, analyzed=0, primary_read=0, selected=0, drafted=0, checked=0, published=0)
+    evidence_totals = dict(totals)
     revisions = {row['item_id']: row['ingest_revision'] for row in rows}
     item_marks = 'SELECT value FROM json_each(?)'
     item_ids = (json.dumps(list(revisions)),)
@@ -391,10 +404,8 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             'received': True,
             'first_filter': item['item_id'] in keyword_passed,
             'analyzed': bool(item['analyzed_at']),
-            # Telegram intake already contains a read post, even before screening.
-            # Count only admitted current revisions as reaching the reading step.
-            'primary_read': item['item_id'] in keyword_passed and (
-                primary.get('status') == 'READ' or primary.get('_material_read') is True),
+            # Reading is a saved fact, independent of a later topic decision.
+            'primary_read': primary.get('status') == 'READ' or primary.get('_material_read') is True,
             'selected': analysis.get('is_relevant') is True or post is not None,
             'drafted': post is not None,
             'checked': bool(post and proof.get('assembled_sha256') and proof['assembled_sha256'] == hashlib.sha256(checked_text.encode()).hexdigest()),
@@ -402,7 +413,11 @@ def pipeline_snapshot(db, config, params, posts, now=None):
         }
         if latest:
             progress.update(latest['progress'])
+        original_progress = dict(progress)
+        progress = sequential_progress(progress)
         in_counter_cohort = not counter_epoch or item['item_id'] > counter_epoch['after_item_id']
+        for key, passed in original_progress.items():
+            evidence_totals[key] += bool(passed and in_counter_cohort)
         for key, passed in progress.items():
             totals[key] += bool(passed and in_counter_cohort)
         terminal = category in {'published', 'filtered', 'processed'}
@@ -485,30 +500,30 @@ def pipeline_snapshot(db, config, params, posts, now=None):
             if history[-1]['reason'] != 'Подробная причина в этой исторической записи не сохранена.':
                 item['reason'] = history[-1]['reason']
     funnel = [
-        ('received', 'Собрано материалов', 'Сборщик · программа',
-         'Получает публикации из подключённых источников и сохраняет ссылку, доступный текст и даты.',
-         'Количество уникальных сохранённых материалов за выбранный период. Повторное получение той же версии не увеличивает число.'),
-        ('first_filter', 'Отобрано по теме', 'Фильтр · без ИИ',
-         'Проверяет словоформы, роли ключевиков и сочетания из таблицы. Принимает окончательное решение о тематике и сохраняет причину.',
-         'Количество материалов с сохранённым допуском первого фильтра. Сам допуск по теме ещё не означает готовность к публикации.'),
-        ('primary_read', 'Текст отобранных материалов получен', 'Чтение · программа',
-         'После допуска по теме получает пригодный текст: использует уже сохранённый полный пост Telegram или открывает статью. Сохраняет URL и атрибуцию. Прочитанный пересказ тоже допустим.',
-         'Количество материалов, прошедших первый фильтр в текущей версии и имеющих сохранённый прочитанный текст. Текст отклонённых и ещё не отобранных публикаций сюда не входит.'),
-        ('analyzed', 'Разобрано ИИ', 'ИИ · один запрос',
-         'За один запрос выделяет подтверждённые факты, сравнивает их с опубликованным и сразу готовит черновик. Тематику повторно не оценивает; готовый текст проверяется отдельно.',
-         'Количество материалов с сохранённым результатом разбора ИИ, включая отказы, дубликаты и случаи, требующие уточнения.'),
-        ('drafted', 'Пост сохранён', 'Программа · оформление',
-         'Использует черновик из того же запроса ИИ, которым выполнен разбор. Программа оформляет ссылку на источник и сохраняет пост. Отдельный запрос написания нужен только для исправления текста или продолжения прежнего разбора.',
-         'Количество материалов со связанным сохранённым постом, включая впоследствии отклонённые. Промежуточный текст до сохранения поста здесь не учитывается.'),
-        ('checked', 'Текст проверен', 'ИИ + программа',
-         'ИИ сверяет готовый текст с источником: утверждения, числа, авторов и стадию события. Замечания возвращают только к исправлению текста и его проверке, без повторного разбора материала. Программа проверяет связь с фактами и целостность проверенного текста. Повторного тематического отбора нет.',
-         'Количество материалов с подтверждённой проверкой текста: для черновиков — текущей версии, для опубликованных — сохранённой версии перед отправкой. Последующие изменения в Telegram не отменяют пройденный этап; проверка правок учитывается отдельно.'),
-        ('published', 'Опубликовано', 'Бот + Telegram',
-         'Бот отправляет допущенный пост штатным способом и сохраняет ответ Telegram с идентификатором сообщения. Неизвестный результат отправки требует сверки.',
-         'Количество материалов со связанным постом, для которого сохранён статус публикации.'),
+        ('received', 'Собрано', 'Сборщик',
+         'Сохраняет публикации из подключённых источников.',
+         'Уникальные материалы, полученные за выбранный период. Повторные обращения к тому же материалу не увеличивают число.'),
+        ('first_filter', 'Отобрано по теме', 'Фильтр ключевиков',
+         'Проверяет материал по действующим ключевым словам и сохраняет решение.',
+         'Материалы с допуском фильтра для текущей версии. Повторная проверка может изменить этот результат; прежний разбор или публикация при этом сохраняются.'),
+        ('primary_read', 'Текст получен', 'Сборщик и чтение',
+         'Сохраняет доступный текст Telegram или прочитанной статьи, в том числе до тематического отбора.',
+         'Материалы с сохранённым текстом независимо от допуска по теме. Отклонённые материалы тоже учитываются. Отсутствующий текст не восстанавливается по факту публикации.'),
+        ('analyzed', 'Разобрано ИИ', 'Редакция',
+         'Разбирает сохранённые материалы и готовит новости по правилам редакции.',
+         'Материалы с сохранённым результатом разбора, включая исключённые сюжеты и дубликаты. Прежние результаты учитываются независимо от текущего допуска фильтра.'),
+        ('drafted', 'Пост сохранён', 'Редакция',
+         'Сохраняет подготовленные тексты; несколько материалов могут объединяться в пост, а один материал — давать несколько постов.',
+         'Материалы, связанные хотя бы с одним сохранённым текстом поста. Это число материалов, а не постов. Резервный текст также учитывается, даже если разбор ИИ не завершился.'),
+        ('checked', 'Текст проверен', 'Проверяющий',
+         'Сверяет подготовленный текст с сохранёнными источниками и фиксирует результат.',
+         'Материалы с сохранённой проверкой связанного текста: текущего черновика или версии перед публикацией. Наличие проверки не означает отсутствие замечаний. При отсутствии сохранённого подтверждения этап не засчитывается.'),
+        ('published', 'Опубликовано', 'Telegram',
+         'Отправляет подготовленный пост и сохраняет результат доставки.',
+         'Материалы, связанные хотя бы с одним опубликованным постом. Это число материалов, а не сообщений в канале. Прежние публикации сохраняются независимо от текущего допуска фильтра.'),
     ]
-    return {'counter_started_at': (counter_epoch or {}).get('started_at'), 'funnel': [
-                {'key': key, 'label': label, 'count': totals[key], 'owner': owner, 'action': action, 'description': description}
+    return {'evidence_totals':evidence_totals, 'counter_started_at': (counter_epoch or {}).get('started_at'), 'funnel': [
+                {'key': key, 'label': label, 'count': totals[key], 'owner': owner, 'action': action, 'description': 'Уникальные материалы с подтверждёнными результатами этого и всех предыдущих этапов для текущего допуска по теме. Независимые исторические результаты показаны в отдельной сводке.'}
                 for key, label, owner, action, description in funnel],
             'stages':[{'key':k,'label':v,'count':counts[k]} for k,v in STAGES],
             'totals':totals,'total':len(output),'items':visible,
@@ -623,7 +638,7 @@ def edition_progress(db, tables):
             reason = LABELS.get(state, 'Ожидает подготовки редакцией.')
         result[m['item_id']] = {'category':category, 'reason':reason, 'post_id':next((d['post_id'] for d in reversed(docs) if d.get('post_id')),None),
             'progress': {'first_filter': bool(m['eligible']),
-                         'primary_read':bool(m['eligible'] and m['content']),
+                         'primary_read':bool(m['content']),
                          'analyzed':analyzed, 'drafted':drafted,
                          'checked':checks, 'published':published}}
     return result
