@@ -1,5 +1,7 @@
 """Read-only vacancy cards; independent of editorial routing."""
 import json
+import re
+from .vacancy_fields import extract
 
 def read(value, default):
     try: return json.loads(value)
@@ -11,8 +13,12 @@ def inbox(db,limit=500):
     for row in db.execute('SELECT * FROM edition_vacancies ORDER BY created_at DESC LIMIT ?',(min(1000,max(1,limit)),)):
         card=read(row['card_json'],{})
         origins=[dict(r) for r in db.execute('SELECT * FROM edition_vacancy_origins WHERE vacancy_id=? ORDER BY received_at',(row['vacancy_id'],))]
+        card = {**card, **extract(card.get('excerpt',''),card)}
         items.append({**card,'vacancy_id':row['vacancy_id'],'state':row['state'],'created_at':row['created_at'],'origins':origins})
     pending=[dict(r) for r in db.execute("SELECT r.material_id,m.title,m.content,m.description,m.received_at,m.snapshot_json FROM edition_vacancy_routes r JOIN edition_materials m USING(material_id) WHERE r.kind='pending' ORDER BY r.created_at DESC LIMIT 100")]
-    for p in pending:p['url']=read(p.pop('snapshot_json'),{}).get('url','')
+    pending=[p for p in pending if not re.search(r'(?:^|\s)#(?:резюме|resume|cv)\b',str(p.get('title') or p.get('content') or '').split('\n',1)[0],re.I)]
+    for p in pending:
+        p['url']=read(p.pop('snapshot_json'),{}).get('url','')
+        p.update(extract(p.get('content') or p.get('description') or ''))
     return {'items':items,'pending':pending}
 
