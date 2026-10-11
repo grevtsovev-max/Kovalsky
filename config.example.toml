@@ -100,3 +100,13 @@ jina_cloud_hosts = []
 # Автоматическая подготовка и публикация после двух проверок.
 # Не снимает постоянную остановку агента владельцем.
 enabled = true
+
+[telegram_reader]
+# Установить пакет с дополнением telegram-reader; авторизация: newsroom telegram-login.
+# API ID/hash — в окружении службы, сессия — абсолютный путь вне репозитория.
+api_id_env = "TELEGRAM_API_ID"
+api_hash_env = "TELEGRAM_API_HASH"
+# session_file = "<абсолютный путь к закрытому файлу сессии .session>"
+timeout_seconds = 45
+# В нужном [[sources]] с type="telegram" указать telegram_transport="api".
+# Остальные Telegram-источники продолжают читать публичную веб-ленту.

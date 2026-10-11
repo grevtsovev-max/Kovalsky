@@ -69,4 +69,3 @@ class DateGateTests(unittest.TestCase):
         context, item, citation, source = self.context()
         citation.update(url='https://primary.example/news', updated_at='2026-03-03')
         self.assertIsNone(saved_date_context(context, item, citation, source)['source_calendar_day'])
-

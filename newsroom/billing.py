@@ -16,6 +16,7 @@ from .resources import snapshot, counter_start
 _LOCK = threading.Lock()
 COSTS_URL = 'https://api.openai.com/v1/organization/costs'
 TASKS = {
+    'edition_retrospective':'Ретроспективный аудит',
     'edition_planner':'Группировка новостей', 'edition_writer':'Подготовка постов', 'edition_checker':'Проверка постов',
     'discovery_search': 'Поиск новостей и источников', 'recovery_search': 'Поиск новостей и источников',
     'research_agent': 'Поиск новостей и источников', 'triage': 'Прежний ИИ-отбор',
@@ -209,6 +210,8 @@ def spending(db, config, period='month', start=None, end=None, now=None):
             'last_sync_error': _state(db, 'billing_last_error'),
             'accounting_started_at': local['accounting_started_at'],
             'local': total, 'publications': local['publications'],
+            'hourly': local['hourly'],
+            'cost_per_publication_usd': local['cost_per_publication_usd'],
             'tasks': sorted(tasks.values(), key=lambda r:r['amount_usd'], reverse=True),
             'unexplained_usd': difference if difference is not None and difference >= 0 else None,
             'reconciliation_conflict': difference is not None and difference < 0,

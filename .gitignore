@@ -9,3 +9,14 @@ data/
 *.log
 *.zip
 .DS_Store
+
+*.session
+*.session-*
+
+# Локальные выгрузки и результаты экспериментальных прогонов
+exports/
+
+# Артефакты сборки Python
+build/
+dist/
+*.egg-info/

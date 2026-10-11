@@ -2,6 +2,7 @@ import copy
 import tempfile
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 from newsroom.db import connect
 from newsroom.core import NOW,_save_item
 from newsroom.edition import store,model
@@ -36,6 +37,14 @@ def receipt():return {'response_id':'fake-test-response','model':'test','bundle_
 
 class EditionCase(TestCase):
     def setUp(self):
+        # Preserve the legacy contracts as rollback tests. New release tests
+        # explicitly enable the terminal path instead of changing these fixtures.
+        self.real_bundle=model.bundle
+        def legacy_bundle():
+            policy,refs,digest=self.real_bundle()
+            return {**policy,'short_release':False},refs,digest
+        self.legacy_policy=patch.object(model,'bundle',side_effect=legacy_bundle)
+        self.legacy_policy.start();self.addCleanup(self.legacy_policy.stop)
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.database=str(Path(self.tmp.name)/'news.sqlite3');self.db=connect(self.database);self.addCleanup(self.db.close)
         self.config={'newsroom':{'database':self.database},'editorial':{'enabled':True},'telegram':{'chat_id':'@test'},'ai':{}}
@@ -43,6 +52,9 @@ class EditionCase(TestCase):
         self.source=self.db.execute("INSERT INTO sources(name,type,url) VALUES('Проверенный источник','rss','https://example.org/rss')").lastrowid
         self.db.commit()
         self.settings={'_edition_config':self.config,'_agent_control_config':self.config}
+        self.semantic=patch.object(model,'semantic_screen',side_effect=lambda materials,settings: (
+            {'decisions':[{'material_id':m['material_id'],'decision':'allow','reason':'Допустимая тестовая новость.','evidence':[]} for m in materials]},receipt()))
+        self.semantic_mock=self.semantic.start();self.addCleanup(self.semantic.stop)
 
     def material(self,*,text=TEXT,title='Компания Альфа запустила сервис',queue=True,url=None):
         source=dict(self.db.execute('SELECT * FROM sources WHERE source_id=?',(self.source,)).fetchone())
@@ -52,4 +64,9 @@ class EditionCase(TestCase):
         material_id=store.capture(self.db,item_id,eligible=queue,queue=queue);self.db.commit()
         return material_id
 
-    def job(self):return store.start(self.db,model.bundle()[2])
+    def job(self):
+        # Most unit fixtures start at editorial admission. Dedicated recovery
+        # tests use store.start directly to exercise interrupted screening.
+        job=store.start(self.db,model.bundle()[2])
+        if job:self.db.execute("UPDATE edition_jobs SET state='PLANNING' WHERE job_id=?",(job,));self.db.commit()
+        return job

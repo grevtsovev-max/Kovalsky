@@ -612,6 +612,12 @@ def edition_progress(db, tables):
                 category = 'technical'
                 problem = 'UNKNOWN' if 'UNKNOWN' in states else sorted(states & {'INCOMPLETE', 'REJECTED'})[0]
                 reason = LABELS.get(problem, problem)
+            elif 'SHORT_PENDING' in states:
+                category = 'technical'
+                saved_reasons = [entry.get('reason') for d in docs if d['state']=='SHORT_PENDING'
+                                 for entry in read(d.get('reasons_json'), [])
+                                 if isinstance(entry, dict) and entry.get('reason')]
+                reason = saved_reasons[-1] if saved_reasons else 'Короткий выпуск ожидает завершения.'
             elif 'LANGUAGE_PENDING' in states:
                 category, reason = 'confirmation', LABELS.get('LANGUAGE_PENDING', 'Ожидает русского перевода')
             elif states & {'CHECKING', 'READY', 'SENDING'}:

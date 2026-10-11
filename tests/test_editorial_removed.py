@@ -47,11 +47,18 @@ class EditorialRemovedTests(unittest.TestCase):
         import inspect
         self.assertNotIn('editorial_feedback',inspect.getsource(collect_feedback))
 
-    def test_dashboard_has_no_editor_controls(self):
+    def test_dashboard_has_only_current_edition_controls(self):
         from newsroom.dashboard import PAGE
-        for endpoint in ('/api/policy','/api/editorial-registry','/api/corrections'):
+        for endpoint in ('/api/policy','/api/editorial-registry','/api/corrections',
+                         '/api/post-corrections','/api/editorial-feedback',
+                         '/api/regulatory','/api/analysis-drafts'):
             self.assertNotIn(endpoint,PAGE)
-        self.assertIn('Редактор удалён',PAGE)
+        for view in ('policy','corrections','regulatory','analysis'):
+            self.assertNotIn('id="view-'+view+'"',PAGE)
+        self.assertIn('id="view-edition"',PAGE)
+        self.assertIn("api('/api/edition')",PAGE)
+        self.assertIn("api('/api/edition/job?job_id='",PAGE)
+        self.assertIn("api('/api/edition/retry'",PAGE)
 
     def test_config_load_and_empty_database_diagnostics(self):
         from newsroom.diagnostics import snapshot

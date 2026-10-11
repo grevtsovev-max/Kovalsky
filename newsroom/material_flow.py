@@ -36,7 +36,6 @@ def revision(db, item_id):
     return row[0] if row else None
 
 
-
 def mark(db, item_id, stage, status, reason='', *, block_kind=None, next_at=None):
     if stage not in STAGES:
         raise ValueError('UNKNOWN_MATERIAL_STAGE')
@@ -63,7 +62,6 @@ def mark(db, item_id, stage, status, reason='', *, block_kind=None, next_at=None
                 now if status == 'RUNNING' else None, now, work, wait))
 
 
-
 def put(db, item_id, stage, dependency, result):
     rev = revision(db, item_id)
     if rev is None:
@@ -72,12 +70,10 @@ def put(db, item_id, stage, dependency, result):
                (item_id, rev, stage, dependency, json.dumps(result, ensure_ascii=False), stamp()))
 
 
-
 def get(db, item_id, stage, dependency):
     row = db.execute('SELECT result_json FROM material_stage_results WHERE item_id=? AND revision=? AND stage=? AND dependency=?',
                      (item_id, revision(db, item_id), stage, dependency)).fetchone()
     return json.loads(row[0]) if row else None
-
 
 
 def snapshot(db, item_id):
@@ -92,5 +88,3 @@ def snapshot(db, item_id):
         elif row['status'] in {'READY','WAITING','ERROR'}:
             row['wait_seconds'] += elapsed
     return rows
-
-

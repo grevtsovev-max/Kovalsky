@@ -25,4 +25,3 @@ BEGIN SELECT RAISE(ABORT,'watch history is append only'); END;
 CREATE TRIGGER IF NOT EXISTS story_watch_no_delete BEFORE DELETE ON story_watch_log
 BEGIN SELECT RAISE(ABORT,'watch history is append only'); END;
 """
-

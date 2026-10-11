@@ -12,6 +12,15 @@ class FormattingTests(EditionCase):
 
     def codes(self):return {i['code'] for i in validate(self.draft,self.materials)}
 
+    def test_adapter_suffix_removed_without_changing_article_url(self):
+        material=copy.deepcopy(self.materials[0])
+        for name in ('РОСКРИПТО.РФ','РИА Новости (Telegram)','Бизнес FM (RSS)'):
+            material['source_name']=name
+            expected=name.split(' (')[0]
+            self.assertEqual(material_source(material),(expected,material['url']))
+        material['primary_source_json']=json.dumps({'_material_publisher':'Настоящее СМИ','_material_url':'https://publisher.example/article'})
+        self.assertEqual(material_source(material),('Настоящее СМИ','https://publisher.example/article'))
+
     def test_valid_draft_and_safe_html(self):
         self.assertEqual(validate(self.draft,self.materials),[])
         markup,plain=render(self.draft,self.materials)

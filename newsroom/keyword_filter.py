@@ -162,6 +162,8 @@ def screen(db, item_id, item, settings):
     if spec.get('mode') == 'intake_rules':
         result.update(input_sha256=cache_key('intake-text', text), item_id=item_id, revision=revision(db, item_id))
         item['_intake_filter'] = result
+    from .filter_audit import record
+    record(db, item_id, item, spec, result)
     keyword = result['matched_keyword']
     put(db, item_id, 'screening', dependency, result)
     if result['passed']:

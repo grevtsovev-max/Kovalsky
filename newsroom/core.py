@@ -87,7 +87,6 @@ def configure_runtime_log(path: str | Path) -> None:
     _RUNTIME_LOG_PATH = Path(path)
 
 
-
 def _log_timing(event: str, **fields) -> None:
     line = json.dumps({"timestamp": NOW(), "event": event, **fields}, ensure_ascii=False)
     print(line, flush=True)
@@ -101,7 +100,6 @@ def _log_timing(event: str, **fields) -> None:
             pass
 
 
-
 def _trusted_tls_context():
     try:
         import certifi
@@ -113,7 +111,6 @@ def _trusted_tls_context():
     return ssl.create_default_context(cafile=certifi.where())
 
 
-
 TLS_CONTEXT = _trusted_tls_context()
 
 
@@ -121,13 +118,11 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-
 def canonicalize(url: str) -> str:
     parsed = urllib.parse.urlsplit(url.strip())
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query = [(k, v) for k, v in query if not k.lower().startswith("utm_") and k.lower() not in {"ref", "fbclid", "gclid"}]
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), urllib.parse.urlencode(query), ""))
-
 
 
 def parse_date(value: str | None) -> str | None:
@@ -153,7 +148,6 @@ def parse_date(value: str | None) -> str | None:
             return None
 
 
-
 def _public_host_addresses(host: str, port: int = 443) -> list[str]:
     host = host.rstrip(".").encode("idna").decode("ascii")
     try:
@@ -170,14 +164,12 @@ def _public_host_addresses(host: str, port: int = 443) -> list[str]:
     return sorted(addresses)
 
 
-
 def _validate_public_http_url(url: str) -> None:
     parsed = urllib.parse.urlsplit(url)
     if (parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password
             or parsed.port not in (None, 443)):
         raise ValueError("URL_NOT_ALLOWED")
     _public_host_addresses(parsed.hostname)
-
 
 
 class _PublicHttpsConnection(http.client.HTTPSConnection):
@@ -210,7 +202,6 @@ class _PublicHttpsConnection(http.client.HTTPSConnection):
             return
 
 
-
 class _PublicHttpsHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
         kwargs = {'context': self._context}
@@ -220,7 +211,6 @@ class _PublicHttpsHandler(urllib.request.HTTPSHandler):
         return self.do_open(_PublicHttpsConnection, req, **kwargs)
 
 
-
 class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urllib.parse.urljoin(req.full_url, newurl)
@@ -228,7 +218,6 @@ class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
         if urllib.parse.urlsplit(req.full_url).scheme.lower() == "https" and urllib.parse.urlsplit(target).scheme.lower() != "https":
             raise ValueError("HTTPS_REDIRECT_DOWNGRADE")
         return super().redirect_request(req, fp, code, msg, headers, target)
-
 
 
 def _request_with_url(url: str, timeout: int = 20, public_only: bool = False) -> tuple[bytes, str, str]:
@@ -283,10 +272,8 @@ def _request_with_url(url: str, timeout: int = 20, public_only: bool = False) ->
     raise RuntimeError("NETWORK_RETRY_EXHAUSTED")
 
 
-
 def _request(url: str) -> bytes:
     return _request_with_url(url)[0]
-
 
 
 def _safe_source_error(exc: Exception) -> str:
@@ -294,6 +281,8 @@ def _safe_source_error(exc: Exception) -> str:
     if isinstance(exc, AIResponseError):
         return exc.code
     message = str(exc).lower()
+    if re.fullmatch(r"telegram_(api|session)_[a-z_]+", message):
+        return message.upper()
     if message in {"publisher_browser_challenge", "response_too_large", "invalid_gzip_response", "telegram_preview_unavailable", "telegram_pagination_stalled"}:
         return message.upper()
     if "certificate_verify_failed" in message or "certificate verify failed" in message:
@@ -318,13 +307,11 @@ def _safe_source_error(exc: Exception) -> str:
     return type(exc).__name__.upper()
 
 
-
 class PDFText(str):
     def __new__(cls, value: str, ocr_used: bool = False):
         instance = super().__new__(cls, value)
         instance.ocr_used = ocr_used
         return instance
-
 
 
 def _extract_pdf_text(payload: bytes, timeout: int = 15) -> str:
@@ -367,7 +354,6 @@ def _extract_pdf_text(payload: bytes, timeout: int = 15) -> str:
     return PDFText(text, ocr_used=ocr_used)
 
 
-
 class GoogleArticleParamsParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -377,7 +363,6 @@ class GoogleArticleParamsParser(HTMLParser):
         values = dict(attrs)
         if tag == "div" and all(key in values for key in ("data-n-a-id", "data-n-a-sg", "data-n-a-ts")):
             self.params = values
-
 
 
 def decode_google_news_url(url: str) -> str:
@@ -426,7 +411,6 @@ def decode_google_news_url(url: str) -> str:
     if target.scheme not in {"http", "https"} or not target.hostname or target.hostname.endswith("google.com"):
         raise ValueError("Google News returned no publisher article URL")
     return decoded
-
 
 
 class PublisherArticleParser(HTMLParser):
@@ -581,7 +565,6 @@ class PublisherArticleParser(HTMLParser):
             self.anchor["text"].append(data)
 
 
-
 OFFICIAL_SOURCE_DOMAINS = {
     "cbr.ru", "kremlin.ru", "government.ru", "publication.pravo.gov.ru", "pravo.gov.ru",
     "duma.gov.ru", "minfin.gov.ru", "nalog.gov.ru", "fas.gov.ru", "rosfinmonitoring.gov.ru",
@@ -606,7 +589,6 @@ PRIMARY_LINK_LABEL = re.compile(
 def _is_official_source_host(host: str) -> bool:
     host = host.lower().rstrip(".")
     return any(host == domain or host.endswith("." + domain) for domain in OFFICIAL_SOURCE_DOMAINS) or host.endswith(OFFICIAL_SOURCE_SUFFIXES)
-
 
 
 ORIGINAL_REPORTING_PUBLISHERS = {
@@ -636,14 +618,12 @@ def _original_reporting_kind(url: str, content: str) -> str | None:
     return None
 
 
-
 def _looks_like_pdf_url(url: str) -> bool:
     parsed = urllib.parse.urlsplit(url)
     path = urllib.parse.unquote(parsed.path).lower()
     query = urllib.parse.parse_qs(parsed.query)
     return (path.endswith(".pdf") or any(".pdf" in value.lower() for values in query.values() for value in values)
             or query.get("type", [""])[0].lower() == "application/pdf")
-
 
 
 def _embedded_document_candidates(parser: PublisherArticleParser, article_url: str) -> list[dict]:
@@ -682,7 +662,6 @@ def _embedded_document_candidates(parser: PublisherArticleParser, article_url: s
     return results
 
 
-
 def _primary_link_candidates(links: list[dict], article_url: str) -> list[dict]:
     article_host = (urllib.parse.urlsplit(article_url).hostname or "").lower()
     ranked = []
@@ -704,7 +683,6 @@ def _primary_link_candidates(links: list[dict], article_url: str) -> list[dict]:
         if official or document_label or explicit_document_url:
             ranked.append((0 if document_label or direct_pdf or explicit_document_url else 1, index, target, "OFFICIAL" if official else "LINKED_DOCUMENT"))
     return [{"url": entry[2], "kind": entry[3]} for entry in sorted(ranked)[:4]]
-
 
 
 def _fetch_bybit_restricted_counterparty_pdf(url: str, publisher_name: str,
@@ -756,7 +734,6 @@ def _fetch_bybit_restricted_counterparty_pdf(url: str, publisher_name: str,
     }
 
 
-
 def fetch_publisher_article(url: str, publisher_name: str, published_at: str | None,
                             discover_primary: bool = True, timeout: int = 20,
                             public_only: bool = False) -> dict:
@@ -781,13 +758,11 @@ def fetch_publisher_article(url: str, publisher_name: str, published_at: str | N
     return save(article)
 
 
-
 def _jina_retryable(exc):
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in {403, 406, 429, 503}
     return isinstance(exc, ValueError) and str(exc) in {
         'PUBLISHER_BROWSER_CHALLENGE', 'Publisher page has no readable article text'}
-
 
 
 def _fetch_publisher_article_native(url: str, publisher_name: str, published_at: str | None,
@@ -843,6 +818,8 @@ def _fetch_publisher_article_native(url: str, publisher_name: str, published_at:
     generic_meta_title = meta_title.casefold() in {"fincen.gov", "home", "news"}
     title = (heading if heading and (not meta_title or generic_meta_title)
              else meta_title or " ".join(parser.title_parts) or heading or (blocks[0] if blocks else "")).strip()
+    if title.casefold().strip() in {'forbidden', 'access denied', '403 forbidden', 'just a moment...', 'attention required!'} or re.search(r'if you are not a bot, please copy the report', content, re.I):
+        raise ValueError("PUBLISHER_ACCESS_DENIED")
     canonical_url = urllib.parse.urljoin(final_url, parser.canonical_url) if parser.canonical_url else final_url
     canonical_host = urllib.parse.urlsplit(canonical_url).hostname or ""
     if canonical_host.endswith("google.com") or "news.google" in canonical_host:
@@ -906,12 +883,10 @@ def _fetch_publisher_article_native(url: str, publisher_name: str, published_at:
     return article
 
 
-
 class FetchedItems(list):
     def __init__(self, values=(), diagnostics=None):
         super().__init__(values)
         self.diagnostics = diagnostics or []
-
 
 
 MULTI_LEVEL_SUFFIXES = {"ac.uk", "co.uk", "gov.uk", "org.uk", "com.au", "net.au", "org.au", "co.nz",
@@ -926,7 +901,6 @@ def _registrable_domain(host: str) -> str:
     if suffix in MULTI_LEVEL_SUFFIXES and len(labels) >= 3:
         return ".".join(labels[-3:])
     return suffix
-
 
 
 def fetch_google_news(url: str, *, read_articles=True) -> list[dict]:
@@ -983,7 +957,6 @@ def fetch_google_news(url: str, *, read_articles=True) -> list[dict]:
     return FetchedItems(result, diagnostics)
 
 
-
 def _read_discovery_links(links: list[dict], max_results: int = 8, page_timeout: int = 20) -> list[dict]:
     """Read a bounded set of search results concurrently, preserving result order."""
     candidates = [link for link in links[:max(1, min(8, int(max_results)))]
@@ -1007,7 +980,6 @@ def _read_discovery_links(links: list[dict], max_results: int = 8, page_timeout:
     result = [article for article, _ in fetched if article is not None]
     diagnostics = [diagnostic for _, diagnostic in fetched if diagnostic]
     return FetchedItems(result, diagnostics)
-
 
 
 def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
@@ -1097,7 +1069,6 @@ def fetch_web_search(query: str | list[str | dict], ai_settings: dict,
     return _read_discovery_links(links, max_results=max_results, page_timeout=page_timeout)
 
 
-
 def fetch_x_recent(query: str, x_settings: dict) -> list[dict]:
     """Fetch public recent X posts and retain the API text as the direct source."""
     token = get_api_key({"api_key_env": x_settings.get("token_env", "X_BEARER_TOKEN"),
@@ -1134,7 +1105,6 @@ def fetch_x_recent(query: str, x_settings: dict) -> list[dict]:
     return result
 
 
-
 def fetch_rss(url: str) -> list[dict]:
     payload = _request(url)
     root = ET.fromstring(payload)
@@ -1164,7 +1134,6 @@ def fetch_rss(url: str) -> list[dict]:
     return result
 
 
-
 class FeedLinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -1176,7 +1145,6 @@ class FeedLinkParser(HTMLParser):
         if tag.lower() == "link" and "alternate" in a.get("rel", "").lower() and ("rss" in feed_hint or "atom" in feed_hint):
             if a.get("href"):
                 self.links.append(a["href"])
-
 
 
 class TelegramPreviewParser(HTMLParser):
@@ -1241,11 +1209,9 @@ class TelegramPreviewParser(HTMLParser):
                 self.current["active_link"]["text"] += data
 
 
-
 class TelegramBatch(list):
     recovery_before = None
     recovery_error = None
-
 
 
 def fetch_telegram(channel_url: str, since: str | None = None,
@@ -1302,7 +1268,6 @@ def fetch_telegram(channel_url: str, since: str | None = None,
     return batch
 
 
-
 def fetch_web(url: str) -> list[dict]:
     """Use a publisher's advertised RSS/Atom endpoint; never scrape page lists as if they were feeds."""
     parser = FeedLinkParser()
@@ -1313,13 +1278,11 @@ def fetch_web(url: str) -> list[dict]:
     return fetch_rss(feed_url)
 
 
-
 STOP = set("это как который которая которые чтобы если что где когда после перед было быть для при они она оно его ее их мы вы они тот эта эти этот а и в во на по из к от за с со под над до не ни или же но также заявил сообщает сообщила сообщают".split())
 
 
 def terms(value: str) -> set[str]:
     return {word.lower() for word in re.findall(r"[а-яёa-z0-9]{3,}", value) if word.lower() not in STOP}
-
 
 
 def is_relevant(text: str, configured_terms: list[str]) -> bool:
@@ -1345,7 +1308,6 @@ def is_relevant(text: str, configured_terms: list[str]) -> bool:
     return False
 
 
-
 def _primary_source_from_item(item: dict, status: str) -> dict | None:
     if not item.get("primary_source_url") or not item.get("primary_source_content"):
         return None
@@ -1361,7 +1323,6 @@ def _primary_source_from_item(item: dict, status: str) -> dict | None:
         **({"document_url": item["primary_source_document_url"]}
            if item.get("primary_source_document_url") else {}),
     }
-
 
 
 def _read_feed_article(item: dict, publisher_name: str) -> str:
@@ -1392,7 +1353,6 @@ def _read_feed_article(item: dict, publisher_name: str) -> str:
         "primary_source_status": article.get("primary_source_status", "NO_LINK"),
     })
     return item["content"]
-
 
 
 def _read_telegram_primary(item: dict, source) -> str:
@@ -1485,7 +1445,6 @@ def _read_telegram_primary(item: dict, source) -> str:
     return item.get("content") or item["title"]
 
 
-
 def _stored_primary(item: dict, primary: dict | None, status: str) -> str:
     record = dict(primary or {"status": status, "error": item.get("primary_source_error")})
     record["_material_read"] = item.get("material_read") is True
@@ -1495,7 +1454,6 @@ def _stored_primary(item: dict, primary: dict | None, status: str) -> str:
         record["_discovery_links"] = item["discovery_links"]
         record["_telegram_forwarded"] = item.get("telegram_forwarded", False)
     return json.dumps(record, ensure_ascii=False)
-
 
 
 class _WebSearchQuota:
@@ -1552,7 +1510,6 @@ class _WebSearchQuota:
 
     def __call__(self, query: str, ai_settings: dict) -> list[dict]:
         return fetch_web_search(query, {**ai_settings, '_work_stage': 'recovery_search'})
-
 
 
 def _archive_item_revision(db, item_id: int, prior_row) -> None:
@@ -1669,7 +1626,6 @@ def run_cycle(config: dict) -> dict[str, int]:
             finally:
                 evidence_db.close()
         raise
-
 
 
 def _run_cycle(config, db, cleanup):
@@ -1791,6 +1747,11 @@ def _run_cycle(config, db, cleanup):
         since = source["recovery_since"] or source["last_seen_published_at"] or (
             datetime.now(timezone.utc) - timedelta(hours=config["newsroom"].get("freshness_window_hours", 24))
         ).isoformat(timespec="seconds")
+        if source_cfg.get("telegram_transport", "preview") == "api":
+            from .telegram_reader import fetch
+            return fetch(source["url"], config.get("telegram_reader", {}), since=since,
+                         before=source["recovery_before"],
+                         max_pages=config["newsroom"].get("telegram_recovery_pages", 5))
         return fetch_telegram(source["url"], since=since, before=source["recovery_before"],
                               max_pages=config["newsroom"].get("telegram_recovery_pages", 5))
 

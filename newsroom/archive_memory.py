@@ -26,4 +26,3 @@ BEGIN SELECT RAISE(ABORT,'coverage history is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS coverage_no_delete BEFORE DELETE ON publication_coverage
 BEGIN SELECT RAISE(ABORT,'coverage history is immutable'); END;
 """
-

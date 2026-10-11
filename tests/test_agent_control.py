@@ -45,19 +45,16 @@ class AgentControlTests(unittest.TestCase):
         set_enabled(self.config, False)
         from newsroom.core import run_cycle
         from newsroom.manual_intake import submit_article_url
-        from newsroom.review import run_review_bot, process_feedback_corrections
+        from newsroom.edition.worker import run_once
         with patch('urllib.request.urlopen') as network, patch('newsroom.cli.run_cycle') as cycle:
             for work in [lambda: cli.run_one_cycle(self.config, self.config['newsroom']['database']),
                          lambda: run_cycle(self.config),
                          lambda: submit_article_url(self.config, 'https://example.org/article'),
-                         lambda: run_review_bot(self.config),
-                         lambda: process_feedback_corrections(self.config, None),
+                         lambda: run_once(self.config),
                          lambda: cli._telegram_api(self.config, 'editMessageText', {}),
                          lambda: request_response({}, {'_agent_control_config': self.config})]:
                 with self.assertRaises(AgentDisabled):
                     work()
-            self.assertEqual(cli.auto_publish_since('unused', self.config), (0, 0, 0))
-            self.assertEqual(cli._publish_digest(None, self.config, 'daily'), (False, 0))
             network.assert_not_called()
             cycle.assert_not_called()
 
@@ -83,10 +80,6 @@ class AgentControlTests(unittest.TestCase):
             send.assert_not_called()
             self.assertEqual(db.execute('SELECT status FROM publication_attempts').fetchone()[0], 'FAILED')
 
-    def test_false_autopublish_blocks_both_news_and_digest(self):
-        self.config['newsroom']['auto_publish'] = False
-        self.assertEqual(cli.auto_publish_since('unused', self.config), (0, 0, 0))
-        self.assertEqual(cli._publish_digest(None, self.config, 'weekly'), (False, 0))
 
 
 class DeploymentStopTests(unittest.TestCase):

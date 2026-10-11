@@ -1,0 +1,139 @@
+{
+  "commit": "d58a5b34d229b7b2e8bd50723977fbf561c98a2b",
+  "matching_files": 37,
+  "changed": [
+    {
+      "file": "newsroom/billing.py",
+      "git_sha256": "4fadb08c49fae2e7567d6cddf673422847185e067a27a667111afc678c65d2c9",
+      "release_sha256": "6b8e651d3070c1126d923587dbace72aad426067f1ef16b2368f73b7c443028e"
+    },
+    {
+      "file": "newsroom/cabinet_page.py",
+      "git_sha256": "1d322245ec234888e72824572aef03d6147f33cb82cfd6763058693656d311f7",
+      "release_sha256": "f7ffa6e370506a7f6e975cb5a22df0e1a0b02a01c8f6ad1d60953dea125ae739"
+    },
+    {
+      "file": "newsroom/cabinet_pipeline.py",
+      "git_sha256": "d80966305535728c1d38739313442c1b99c0c64e52e75e0516e43fb21b56c3e7",
+      "release_sha256": "b7ec071023398102e5e00f69f940f30c05307681b5ca309cfddeda6b0d18e76c"
+    },
+    {
+      "file": "newsroom/cabinet_server.py",
+      "git_sha256": "633bd78374523247a2f98cf0a872c7cde7ed36e569b76234b454b31f23894053",
+      "release_sha256": "e7a2a2eb9917ada07c590640da5bb17d1b02aef832b8ef0dbac2954f139b14a3"
+    },
+    {
+      "file": "newsroom/cli.py",
+      "git_sha256": "f794c864c79e6737e1d47025a605522ad663149f91d9c50d392f6628576899a3",
+      "release_sha256": "aebfaaf2e69cc52602ddbdd6ef27b1803d1b150c1d4bb17dce34bcd8a63975ad"
+    },
+    {
+      "file": "newsroom/core.py",
+      "git_sha256": "a36d936d61ebff68dbf3dc0245e3cd57ab2bbfb386be3ef51bdcc134bf2cf62a",
+      "release_sha256": "c217411ed4207979c4417ef725ef40d772969e2fccdff2ee06bcf42db1eb312c"
+    },
+    {
+      "file": "newsroom/edition/fallback.py",
+      "git_sha256": "6ff74a9af6bc10a72a043de5165f1c57647310fdc927772dbfd36383447fd247",
+      "release_sha256": "e519f0fe0aec00231f2ebb21bce9dad5b52ec4deb9cd64906b3c606fef97dcd6"
+    },
+    {
+      "file": "newsroom/edition/formatting.py",
+      "git_sha256": "d9ca628876e43d6a079c2ccd051432e63bf1b708f9fe81cfa0e60c06e2b9b8c7",
+      "release_sha256": "44949556f357a9934075b82190c2952dc3f0da1eb8e1dd40617dee8185eb08b0"
+    },
+    {
+      "file": "newsroom/edition/model.py",
+      "git_sha256": "c8571feeaabf533d6880ea80db9943270b4aab1f9f5fbd833136cac36c0589d8",
+      "release_sha256": "bded083aebc95a9f96eea512b95918a783ac9e08600ea89efe4e39f6290f736a"
+    },
+    {
+      "file": "newsroom/edition/pipeline.py",
+      "git_sha256": "1e16e56139ee1a2a1efc0b32acfb462668573ce61a7bdb479aff8d4d3efb7235",
+      "release_sha256": "8be2e174429dea16fa08fcd7e17ec458f9f90bac8164ffcab3ff3975468e7423"
+    },
+    {
+      "file": "newsroom/edition/policy.json",
+      "git_sha256": "10e60621aa3c8a612d504dc91f2b3c8324a7e4876187595269e77c37a92128a4",
+      "release_sha256": "b4a441def3fa04210f9a789ac2785f48e58f325fe885ff2f26efe16418575b3b"
+    },
+    {
+      "file": "newsroom/edition/publication.py",
+      "git_sha256": "92c02bf6f4082b23324748b6e16cd3133cd8f7b8f57906213bebe11b45ff5a31",
+      "release_sha256": "7b5c5d99bd5e20d9a7af835e644c0a6bf22e7052055e7ea8f5ad8f7717569409"
+    },
+    {
+      "file": "newsroom/edition/references.json",
+      "git_sha256": "8aece1c8d0c33592211d8a5651af72c84517c0d7ed90cd77559c05c17489c0a2",
+      "release_sha256": "99befd18c3c5f1611ea71f73ddde6418667f886392abf2a97d57632e20f0d084"
+    },
+    {
+      "file": "newsroom/edition/source_text.py",
+      "git_sha256": "486c93714710eae94f1b3284e73b1b0b1802bc0d239d9f4e21fad0632035bb91",
+      "release_sha256": "7ad7f96e8590c4b844702c518c250f1a4e0d9921149b57439a02ba401a4460fa"
+    },
+    {
+      "file": "newsroom/edition/store.py",
+      "git_sha256": "6690b9b8c8e0254e8c38dfd8ec8d6ca8599f1ee82ccb18a918ef4c940dd51da2",
+      "release_sha256": "0036ba937e60f46f25ed74f33e66ce6c89d2d65542cf2ab87a9a29147086e3e5"
+    },
+    {
+      "file": "newsroom/edition/views.py",
+      "git_sha256": "dafb9e75712a7fae2f041bca2fc90c747dd3100ae3acfe1fcce69692292eb5ac",
+      "release_sha256": "21751c66ded7d10271bf4818a40c27efe05b92c3f2111e804578a147779562a6"
+    },
+    {
+      "file": "newsroom/edition/worker.py",
+      "git_sha256": "9e4b4918f9210dcec9e8f20a51d705287dbd38af9564ab7e79e889f238211fb2",
+      "release_sha256": "9c27325fdb6a9db76e755a759dd920c116dfe7453e4bc288a78664e9fbcba985"
+    },
+    {
+      "file": "newsroom/locking.py",
+      "git_sha256": "45e8ff18f0268206ffd691ab41acd8954e98f64dfdcfc9b13f849debd13da7fc",
+      "release_sha256": "d5278c1ec7ddf567012445b2647ad9d433db6890a1f41f3e655bd05a4c63cc5f"
+    },
+    {
+      "file": "newsroom/resources.py",
+      "git_sha256": "0dd2bc39025b21d2678ef8dee81139d6655d4a483802fc5dda211e0527d13784",
+      "release_sha256": "9db1b8e8f9f438ee580a104dd69aa5e3776110f0c3da7cb582def340964d6c09"
+    },
+    {
+      "file": "newsroom/source_registry.py",
+      "git_sha256": "f74cee829dee9ff8e1bcb786b6bdad91fb37803a2097d340dd09f3592e841c17",
+      "release_sha256": "3b8c8fceb7b573f4e7e6ecc2c83114b66163b954fc1164cf5f1106e004cd03fc"
+    },
+    {
+      "file": "newsroom/vacancy_view.py",
+      "git_sha256": "471fe421bd58252e99897d2ae7c2614aabd0fa8a1971da1813202d7cb7eef375",
+      "release_sha256": "07bfaed1d9996240088e09a9bb92f18e37242619ddd627a5d7af2b78bd595652"
+    },
+    {
+      "file": "newsroom/workflow.py",
+      "git_sha256": "7f1bb1bc45d481d331898093ced562bf67396d0285b9d7bd9094e0d5bbd738b9",
+      "release_sha256": "edc52ffbd3fda576952a7fa59052fd3fe0c805b08074fd052fb111bcd1dcd872"
+    }
+  ],
+  "missing": [],
+  "unreadable": [],
+  "extra": [
+    "newsroom/edition/corrections.py",
+    "newsroom/edition/fragments.py",
+    "newsroom/edition/freshness.py",
+    "newsroom/edition/language.py",
+    "newsroom/edition/layout_metrics.py",
+    "newsroom/edition/layout_review.py",
+    "newsroom/edition/publication_history.py",
+    "newsroom/edition/semantic_filter.py",
+    "newsroom/edition/short_release.py",
+    "newsroom/edition/source_translation.py",
+    "newsroom/edition/vacancies.py",
+    "newsroom/jobs/__init__.py",
+    "newsroom/jobs/model.py",
+    "newsroom/jobs/store.py",
+    "newsroom/jobs/view.py",
+    "newsroom/jobs/worker.py",
+    "newsroom/retrospective.py",
+    "newsroom/source_reading.py",
+    "newsroom/telegram_reader.py"
+  ]
+}

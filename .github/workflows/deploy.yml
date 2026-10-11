@@ -7,6 +7,8 @@ on:
     paths:
       - 'newsroom/**'
       - 'KANBAN.json'
+      - 'pyproject.toml'
+      - 'ops/deploy.sh'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
@@ -24,8 +26,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Check approved cabinet before release
-        run: python3 -m unittest tests.test_dashboard_shell tests.test_vacancy_fields tests.test_dashboard_design tests.test_cabinet_adapter tests.test_sequential_counters tests.test_post_metrics
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install project dependencies
+        run: python -m pip install -e .
+
+      - name: Verify reconciled release
+        run: python -m unittest discover -s tests
 
       - name: Configure SSH
         env:

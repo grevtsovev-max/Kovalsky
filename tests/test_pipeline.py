@@ -2,7 +2,7 @@ import json
 import sqlite3
 import unittest
 from datetime import datetime, timezone
-from newsroom.pipeline import pipeline_snapshot
+from newsroom.cabinet_pipeline import pipeline_snapshot
 
 
 class PipelineTests(unittest.TestCase):
@@ -101,7 +101,7 @@ class PipelineTests(unittest.TestCase):
         self.posts[0]['facts']['final_text_check'] = {'assembled_sha256': hashlib.sha256('Проверенный текст'.encode()).hexdigest()}
         result = self.snapshot(stage='filtered')
         counts = {step['key']: step['count'] for step in result['funnel']}
-        self.assertEqual(counts, {'received': 3, 'first_filter': 1, 'primary_read': 1, 'analyzed': 2, 'drafted': 1, 'checked': 1, 'published': 0})
+        self.assertEqual(counts, {'received': 3, 'first_filter': 1, 'primary_read': 1, 'analyzed': 1, 'drafted': 1, 'checked': 1, 'published': 0})
         self.assertEqual(result['total'], 1)
         self.assertEqual(sum(step['count'] for step in result['stages']), 3)
         self.posts[0]['text'] = 'Изменённый непроверенный текст'
@@ -129,6 +129,8 @@ class PipelineTests(unittest.TestCase):
     def test_telegram_display_edit_does_not_erase_completed_check(self):
         import hashlib
         self.add(1, 'NEW_STORY', primary={'status': 'READ', 'url': 'https://source/1'})
+        self.screening(1)
+        self.db.execute('INSERT INTO item_analysis VALUES(1,?,?)',('2026-09-28T11:00:00+00:00','{}'))
         self.post()
         original = 'По данным Crypto.news, опубликовано решение.'
         self.posts[0].update(origin_item_id=1, saved_text=original,
@@ -172,7 +174,7 @@ class PipelineTests(unittest.TestCase):
         self.db.executescript(SCHEMA)
         mark(self.db, 1, 'reading', 'ERROR', 'Не ответил обработчик', block_kind='technical')
         mark(self.db, 2, 'reading', 'ERROR', 'Старая ошибка', block_kind='technical')
-        mark(self.db, 3, 'drafting', 'READY', 'Ожидает написания')
+        mark(self.db, 3, 'reading', 'READY', 'Ожидает чтения')
         report = self.snapshot()
         items = {i['item_id']: i for i in report['items']}
         self.assertEqual(items[1]['stage'], 'technical')
@@ -180,7 +182,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(items[1]['reason'], 'Не ответил обработчик')
         self.assertEqual(items[2]['stage'], 'filtered')
         self.assertFalse(items[2]['needs_attention'])
-        self.assertEqual(items[3]['stage'], 'drafting')
+        self.assertEqual(items[3]['stage'], 'primary')
         self.assertEqual({i['item_id'] for i in self.snapshot(bucket='work')['items']}, {1, 3})
 
     def test_progress_link_returns_materials_that_passed_step_even_if_later_rejected(self):
@@ -241,7 +243,8 @@ class PipelineTests(unittest.TestCase):
         self.posts[0]['facts']['primary_source']=None
         self.posts[0]['source_ids']=[1]
         result=self.snapshot()
-        self.assertEqual(result['totals']['published'],1)
+        self.assertEqual(result['evidence_totals']['published'],1)
+        self.assertEqual(result['totals']['published'],0)
         self.assertEqual(next(x for x in result['items'] if x['item_id']==1)['stage'],'published')
         self.assertIsNone(next(x for x in result['items'] if x['item_id']==2)['post'])
 
@@ -250,7 +253,8 @@ class PipelineTests(unittest.TestCase):
         self.db.execute("UPDATE items SET primary_source_json='broken'")
         self.db.execute('INSERT INTO item_analysis VALUES(1,?,?)',('2026-09-28T10:01:00+00:00',json.dumps({'summary_ru':'Вывод'})))
         result=self.snapshot(q='асрос')
-        self.assertEqual(result['totals']['analyzed'],1)
+        self.assertEqual(result['evidence_totals']['analyzed'],1)
+        self.assertEqual(result['totals']['analyzed'],0)
         self.assertEqual(result['items'][0]['summary'],'Вывод')
         self.assertEqual(self.snapshot(q='нет совпадений')['total'],0)
 

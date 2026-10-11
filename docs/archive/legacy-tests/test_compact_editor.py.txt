@@ -82,47 +82,6 @@ class CompactEditorTests(unittest.TestCase):
         self.assertTrue(text.endswith('Источник: [Банк России](https://www.cbr.ru/crypto)'))
         self.assertNotIn('wrong.example', text)
 
-    def test_source_named_today_does_not_block_a_checked_post(self):
-        self.prepare()
-        self.article.update(primary_source_url='https://example.org/primary',
-                            primary_source_publisher='Россия сегодня')
-        with patch.object(ai, 'get_api_key', return_value='test'), \
-             patch('newsroom.core.get_api_key', return_value='test'), \
-             patch('newsroom.core.fetch_publisher_article', return_value=self.article), \
-             patch.object(ai, 'validate_draft', wraps=real_validate_draft), \
-             patch.object(ai, 'request_response', side_effect=self.provider) as request:
-            self.assertEqual(self.process(), 'NEW_STORY')
-        self.assertEqual(request.call_count, 2)
-        checked_text = json.loads(request.call_args.args[0]['input'])['post_text']
-        post = self.db.execute('SELECT * FROM posts').fetchone()
-        self.assertIn('Россия сегодня', checked_text)
-        self.assertEqual(post['text'], checked_text)
-        self.assertEqual(json.loads(post['fact_check_result'])['final_text_check']['text_sha256'], digest(checked_text))
-
-    def test_unknown_relative_date_repairs_only_text_before_paid_check(self):
-        self.prepare()
-        self.article.update(primary_source_url='https://example.org/primary')
-        self.value['summary_ru'] = 'Вчера ' + self.evidence
-        draft = dict(headline_ru=self.value['headline_ru'], summary_ru=self.evidence,
-                     what_is_new=self.evidence, editorial_check=self.audit)
-        with patch.object(ai, 'get_api_key', return_value='test'), \
-             patch('newsroom.core.get_api_key', return_value='test'), \
-             patch('newsroom.core.fetch_publisher_article', return_value=self.article) as reader, \
-             patch.object(ai, 'draft_post', return_value=draft) as writer, \
-             patch.object(ai, 'validate_draft', wraps=real_validate_draft) as check, \
-             patch.object(ai, 'request_response', side_effect=self.provider) as request:
-            self.assertEqual(self.process(), 'WAITING_CONFIRMATION')
-            check.assert_not_called()
-            self.assertEqual(request.call_count, 1)
-            self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
-            row = self.db.execute('SELECT * FROM items').fetchone()
-            self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), 'NEW_STORY')
-        self.assertEqual(reader.call_count, 1)
-        self.assertEqual(writer.call_count, 1)
-        self.assertEqual(check.call_count, 1)
-        self.assertEqual(request.call_count, 2)
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0], 1)
-
     def test_broken_evidence_never_reaches_writing_or_final_check(self):
         self.prepare()
         self.value['memory']['claims'][0]['source_quote'] = 'Выдуманная цитата о другом выпуске.'
@@ -140,7 +99,6 @@ class CompactEditorTests(unittest.TestCase):
 
     def test_text_repair_resumes_saved_facts_without_combined_rerun(self):
         self.prepare()
-        self.config['ai']['_text_repair_delay_seconds'] = 30
         checks = [dict(issues=['Исправить формулировку'], editorial_check=self.audit, covered_claims=[]),
                   dict(issues=[], editorial_check=self.audit,
                        covered_claims=[dict(fact_id=1, post_quote=self.evidence)])]
@@ -153,12 +111,6 @@ class CompactEditorTests(unittest.TestCase):
              patch.object(ai, 'validate_draft', side_effect=checks) as check, \
              patch.object(ai, 'request_response', side_effect=self.provider) as request:
             self.assertEqual(self.process(), 'WAITING_CONFIRMATION')
-            from datetime import datetime, timezone
-            state = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])
-            delay = (datetime.fromisoformat(state['next_at']) - datetime.now(timezone.utc)).total_seconds()
-            self.assertGreater(delay, 20)
-            self.assertLessEqual(delay, 30)
-            self.assertEqual(state['attempts'], 0)
             row = self.db.execute('SELECT * FROM items').fetchone()
             resumed = _saved_material(row, self.source)
             self.assertEqual(self.process(resumed, row['item_id']), 'NEW_STORY')
@@ -168,79 +120,6 @@ class CompactEditorTests(unittest.TestCase):
         self.assertEqual(check.call_count, 2)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0], 1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 1)
-
-    def test_fast_text_repair_keeps_three_retry_limit(self):
-        self.prepare()
-        self.config['ai']['_text_repair_delay_seconds'] = 30
-        draft = dict(headline_ru=self.value['headline_ru'], summary_ru=self.evidence,
-                     what_is_new=self.evidence, editorial_check=self.audit)
-        checked = dict(issues=['Не устранено искажение факта'], editorial_check=self.audit, covered_claims=[])
-        with patch.object(ai, 'get_api_key', return_value='test'), \
-             patch('newsroom.core.get_api_key', return_value='test'), \
-             patch('newsroom.core.fetch_publisher_article', return_value=self.article) as reader, \
-             patch.object(ai, 'draft_post', return_value=draft) as writer, \
-             patch.object(ai, 'validate_draft', return_value=checked) as check, \
-             patch.object(ai, 'request_response', side_effect=self.provider) as request:
-            self.assertEqual(self.process(), 'WAITING_CONFIRMATION')
-            for attempts, outcome in ((1, 'WAITING_CONFIRMATION'), (2, 'WAITING_CONFIRMATION'), (3, 'REJECTED')):
-                row = self.db.execute('SELECT * FROM items').fetchone()
-                self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), outcome)
-                state = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])
-                self.assertEqual(state['attempts'], attempts)
-        self.assertEqual(request.call_count, 1)
-        self.assertEqual(reader.call_count, 1)
-        self.assertEqual(writer.call_count, 3)
-        self.assertEqual(check.call_count, 4)
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
-
-    def test_final_capacity_wait_does_not_consume_transport_or_editorial_retries(self):
-        from newsroom.runtime import BudgetDeferred
-        self.prepare()
-        checks = [BudgetDeferred('concurrency', 1) for _ in range(4)]
-        checks.append(dict(issues=[], editorial_check=self.audit,
-                           covered_claims=[dict(fact_id=1, post_quote=self.evidence)]))
-        with patch.object(ai, 'get_api_key', return_value='test'), \
-             patch('newsroom.core.get_api_key', return_value='test'), \
-             patch('newsroom.core.fetch_publisher_article', return_value=self.article) as reader, \
-             patch.object(ai, 'draft_post') as writer, \
-             patch.object(ai, 'validate_draft', side_effect=checks), \
-             patch.object(ai, 'request_response', side_effect=self.provider) as request:
-            self.assertEqual(self.process(), 'AI_RETRY')
-            for _ in range(3):
-                row = self.db.execute('SELECT * FROM items').fetchone()
-                self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), 'AI_RETRY')
-                state = json.loads(self.db.execute("SELECT value FROM app_state WHERE key='selection_retry:1'").fetchone()[0])
-                self.assertEqual(state['attempts'], 0)
-            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM app_state WHERE key LIKE 'transport_retry:%'").fetchone()[0], 0)
-            row = self.db.execute('SELECT * FROM items').fetchone()
-            self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), 'NEW_STORY')
-        self.assertEqual(request.call_count, 1)
-        reader.assert_called_once()
-        writer.assert_not_called()
-
-    def test_invalid_binding_rechecks_saved_text_without_cached_failure(self):
-        self.prepare()
-        self.config['ai']['_text_repair_delay_seconds'] = 30
-        invalid = dict(issues=[], editorial_check=self.audit,
-                       covered_claims=[dict(fact_id=1, post_quote='Выдуманная фраза, которой нет в посте')])
-        valid = dict(issues=[], editorial_check=self.audit,
-                     covered_claims=[dict(fact_id=1, post_quote=self.evidence)])
-        with patch.object(ai, 'get_api_key', return_value='test'), \
-             patch('newsroom.core.get_api_key', return_value='test'), \
-             patch('newsroom.core.fetch_publisher_article', return_value=self.article) as reader, \
-             patch.object(ai, 'draft_post') as writer, \
-             patch.object(ai, 'validate_draft', side_effect=[invalid, valid]) as checker, \
-             patch.object(ai, 'request_response', side_effect=self.provider) as request:
-            self.assertEqual(self.process(), 'WAITING_CONFIRMATION')
-            self.assertEqual(self.db.execute('SELECT COUNT(*) FROM posts').fetchone()[0], 0)
-            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM app_state WHERE key LIKE 'transport_retry:%'").fetchone()[0], 0)
-            row = self.db.execute('SELECT * FROM items').fetchone()
-            self.assertEqual(self.process(_saved_material(row, self.source), row['item_id']), 'NEW_STORY')
-        self.assertEqual(checker.call_count, 2)
-        self.assertEqual(request.call_count, 1)
-        reader.assert_called_once()
-        writer.assert_not_called()
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM story_facts').fetchone()[0], 1)
 
     def test_final_checker_failure_cannot_create_post(self):
         self.prepare()

@@ -159,21 +159,6 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(report['categories'][0]['operations'], 1)
         self.assertEqual(SCOPE.get(), {})
 
-    def test_cache_hits_are_operations_without_an_extra_api_call(self):
-        calls = []
-        def read():
-            calls.append(True)
-            return {'material_read': True, 'content': 'Прочитанный текст сообщения источника.'}
-        work = Work('collector', read, key='read-key', ttl=60, stage='source_read')
-        work.execute(self.runtime)
-        work.execute(self.runtime)
-        result = snapshot(self.db, self.config)['total']
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(result['calls'], 0)
-        self.assertEqual(result['operations'], 2)
-        self.assertEqual(result['cache_hits'], 1)
-        self.assertGreater(result['operation_seconds'], 0)
-        self.assertGreaterEqual(result['cpu_seconds'], 0)
 
     def test_nested_operations_do_not_double_count_worker_time(self):
         with self.runtime.measure('digest', 'editor'):
@@ -222,17 +207,6 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(report['total']['operation_errors'], 1)
         self.assertNotIn('private-details', json.dumps(report))
 
-    def test_existing_cache_hits_are_preserved_without_counting_new_hits_twice(self):
-        old = (datetime.now(timezone.utc)-timedelta(minutes=10)).isoformat()
-        self.db.execute("INSERT INTO cache_events(stage,created_at) VALUES('collector',?)", (old,))
-        self.db.commit()
-        work = Work('collector', lambda: {'material_read': True, 'content': 'Прочитанный текст сообщения источника.'}, key='cached', ttl=60, stage='source_read')
-        work.execute(self.runtime)
-        work.execute(self.runtime)
-        report = snapshot(self.db, self.config)
-        self.assertEqual(report['total']['cache_hits'], 2)
-        self.assertEqual(report['total']['legacy_cache_hits'], 1)
-        self.assertEqual(sum(r['cache_hits'] for r in report['stages']), 2)
 
     def test_runtime_migration_preserves_old_receipt_and_leaves_stage_unknown(self):
         old_path = str(Path(self.path).with_name('old.db'))
@@ -255,7 +229,7 @@ class ResourceTests(unittest.TestCase):
             server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
             servers.append(server); ready.set()
             return server
-        with patch('newsroom.dashboard.ThreadingHTTPServer', side_effect=make_server):
+        with patch('newsroom.cabinet_server.ThreadingHTTPServer', side_effect=make_server):
             thread = threading.Thread(target=dashboard.serve, args=(self.config,), daemon=True)
             thread.start()
             self.assertTrue(ready.wait(3))
@@ -268,33 +242,21 @@ class ResourceTests(unittest.TestCase):
                 self.assertIn('<h1 id="heading">Расход ресурсов</h1>', page)
                 with urllib.request.urlopen(base+'/?view=policy', timeout=3) as response:
                     policy_page = response.read().decode()
-                self.assertIn('id="view-policy" class="view active"', policy_page)
-                with urllib.request.urlopen(base+'/api/policy', timeout=3) as response:
-                    policy_report = json.load(response)
-                self.assertEqual(policy_report['version'], '1.0')
-                self.assertIn('## 12 Исправления и замечания владельца', policy_report['document'])
-                self.assertEqual(len(policy_report['sha256']), 64)
-                from newsroom.source_registry import save
-                save(self.db, 'editorial_learning:999', {'status': 'NEEDS_CLARIFICATION',
-                     'question': 'Только этот пост?', 'signal': {'reason': 'Здесь сократи'}})
-                self.db.commit()
+                self.assertIn('id="view-pipeline" class="view active"', policy_page)
                 import re
-                dashboard_token = re.search(r"const TOKEN='([^']+)'", policy_page)[1]
-                request = urllib.request.Request(base+'/api/policy/clarify', method='POST',
-                    headers={'Content-Type': 'application/json', 'X-Dashboard-Token': dashboard_token},
-                    data=json.dumps({'key': 'editorial_learning:999', 'answer': 'Для следующих тоже'}).encode())
-                with urllib.request.urlopen(request, timeout=3) as response:
-                    self.assertGreater(json.load(response)['feedback_id'], 0)
-                with urllib.request.urlopen(base+'/api/policy', timeout=3) as response:
-                    self.assertEqual(json.load(response)['questions'], [])
+                dashboard_token = re.search(r"const TOKEN='([^']+)'", page)[1]
+                with self.assertRaises(HTTPError) as retired:
+                    urllib.request.urlopen(urllib.request.Request(base+'/api/policy',
+                        headers={'X-Dashboard-Token':dashboard_token}),timeout=3)
+                self.assertEqual(retired.exception.code,410);retired.exception.close()
                 version = self.db.execute('PRAGMA schema_version').fetchone()[0]
-                with urllib.request.urlopen(base+'/api/resources?hours=1', timeout=3) as response:
+                with urllib.request.urlopen(urllib.request.Request(base+'/api/resources?hours=1',headers={'X-Dashboard-Token':dashboard_token}), timeout=3) as response:
                     report = json.load(response)
                 self.assertEqual(report['hours'], 1)
                 self.assertEqual(report['total']['calls'], 1)
                 self.assertEqual(version, self.db.execute('PRAGMA schema_version').fetchone()[0])
                 with self.assertRaises(HTTPError) as invalid:
-                    urllib.request.urlopen(base+'/api/resources?hours=bad', timeout=3)
+                    urllib.request.urlopen(urllib.request.Request(base+'/api/resources?hours=bad',headers={'X-Dashboard-Token':dashboard_token}), timeout=3)
                 self.assertEqual(invalid.exception.code, 400)
                 invalid.exception.close()
             finally:

@@ -21,7 +21,6 @@ def existing_topic_names(db):
     return [r[0] for r in db.execute("SELECT topic FROM monitoring_topics ORDER BY weight DESC LIMIT 100")]
 
 
-
 def expand_search_queries(config: dict) -> None:
     """Add learned topic alternatives to existing broad web-search queries."""
     if config.get("_topic_registry_authoritative"):
@@ -57,7 +56,6 @@ def expand_search_queries(config: dict) -> None:
             query = f"{base} {learned}" if base else learned
             source["query"] = query
             source["interest_exclusions"] = avoid
-
 
 
 def extract_topics(text, settings, existing_topics=None):

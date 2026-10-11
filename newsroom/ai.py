@@ -39,7 +39,6 @@ class AIResponseError(RuntimeError):
         super().__init__(code)
 
 
-
 def get_api_key(settings: dict) -> str | None:
     key_name = settings.get("api_key_env", "OPENAI_API_KEY")
     api_key = os.getenv(key_name)
@@ -67,7 +66,6 @@ def get_api_key(settings: dict) -> str | None:
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 
-
 def safe_api_error(exc):
     """Expose a bounded API error code, never the response message or request."""
     code = ""
@@ -83,10 +81,8 @@ def safe_api_error(exc):
     return f"HTTP_{exc.code}{code}"
 
 
-
 def web_search_enabled(settings):
     return settings.get('web_search_enabled', False) is True
-
 
 
 def request_response(payload, settings):
@@ -106,7 +102,6 @@ def request_response(payload, settings):
                              {'category': settings.get('_work_category', scope.get('category', 'fresh'))}):
             return _request_response(payload, settings)
     return _request_response(payload, settings)
-
 
 
 def _request_response(payload, settings):
@@ -159,5 +154,3 @@ def _request_response(payload, settings):
             if runtime:
                 runtime.finish(call_id, None, time.perf_counter() - call_started, exc)
             raise
-
-

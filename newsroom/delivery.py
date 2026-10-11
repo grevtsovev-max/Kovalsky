@@ -74,10 +74,8 @@ class DeliveryUncertain(RuntimeError):
     pass
 
 
-
 class DeliveryRejected(RuntimeError):
     """Only a definitive rejection, or a failure before any request, is retryable."""
-
 
 
 from .runtime import BudgetDeferred
@@ -87,7 +85,6 @@ class DeliveryRateLimited(BudgetDeferred):
     """Telegram definitively refused this request and specified a wait."""
     def __init__(self, seconds):
         super().__init__('delivery', seconds)
-
 
 
 def telegram_rate_limit(response):
@@ -100,7 +97,6 @@ def telegram_rate_limit(response):
     return None
 
 
-
 class TelegramReceipt(str):
     def __new__(cls, response):
         obj = super().__new__(cls, str(response['message_id']))
@@ -108,10 +104,8 @@ class TelegramReceipt(str):
         return obj
 
 
-
 def now():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
-
 
 
 def channel(config):
@@ -120,7 +114,6 @@ def channel(config):
     if not target:
         raise DeliveryRejected('Telegram destination is missing')
     return str(target)
-
 
 
 def replace_unsent_digest_batch(db, batch_key, messages, news_count, period_end):
@@ -154,11 +147,9 @@ def replace_unsent_digest_batch(db, batch_key, messages, news_count, period_end)
         raise
 
 
-
 def event(db, attempt_id, status, detail=None):
     db.execute('INSERT INTO delivery_events(attempt_id,status,detail_json,created_at) VALUES(?,?,?,?)',
                (attempt_id, status, json.dumps(detail or {}, ensure_ascii=False), now()))
-
 
 
 def deliver(db, config, operation, text, send, post_id=None, verified_text=None):
@@ -287,7 +278,6 @@ def confirm(db, config, operation):
         event(db, row['attempt_id'], 'CONFIRMED')
 
 
-
 def reconcile_posts(db, config):
     """Replay durable receipts; a series is published only when every part arrived."""
     db.commit()
@@ -322,7 +312,6 @@ def reconcile_posts(db, config):
         completed += 1
     db.commit()
     return completed
-
 
 
 def observe_channel_post(db, message, comparable_text):
@@ -361,4 +350,3 @@ def observe_channel_post(db, message, comparable_text):
                    "WHERE request_key=? AND status IN ('SENDING','UNKNOWN')",
                    (str(message_id), now(), request_key))
     return True
-

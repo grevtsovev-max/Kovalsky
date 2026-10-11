@@ -15,10 +15,8 @@ class IntakeError(ValueError):
     """A user-facing, safe failure while submitting a single article URL."""
 
 
-
 class IntakeBusyError(IntakeError):
     """The scheduled collection or another intake currently owns the cycle lock."""
-
 
 
 def submit_article_url(config: dict, url: str, *, retry_after_credits_restored: bool = False,
@@ -38,7 +36,6 @@ def submit_article_url(config: dict, url: str, *, retry_after_credits_restored: 
                               retry_after_validation_fix)
     finally:
         lock.close()
-
 
 
 def _submit_locked(config: dict, url: str, retry_after_credits_restored: bool = False,

@@ -68,7 +68,6 @@ def normalize(value):
     return ' '.join(str(value).casefold().replace('ё', 'е').split())
 
 
-
 @lru_cache(maxsize=32768)
 def lemmas(word):
     from .morphology import _morphology
@@ -93,7 +92,6 @@ def lexical_match(text, keywords):
             if all(any(form & token for token in window) for form in forms):
                 return True
     return False
-
 
 
 def parse_tab(body, name):
@@ -133,7 +131,6 @@ def parse_tab(body, name):
     return result
 
 
-
 def parse_flat_keywords(rows):
     if len(rows) > 10001:
         raise ValueError('TOPIC_REGISTRY_HEADER_OR_SIZE')
@@ -160,10 +157,8 @@ def parse_flat_keywords(rows):
     return result
 
 
-
 def keyword_enabled(entry, names):
     return entry['enabled'] and (entry.get('flat') or entry['title'] in names)
-
 
 
 def parse_negative_keywords(body):
@@ -194,7 +189,6 @@ def parse_negative_keywords(body):
     return result
 
 
-
 def parse_filter_rules(body):
     rows = list(csv.reader(io.StringIO(body.decode('utf-8-sig'))))
     if not rows or rows[0] != FILTER_HEADERS or len(rows) > 101:
@@ -218,7 +212,6 @@ def parse_filter_rules(body):
     if len({r['name'] for r in rules}) != len(rules):
         raise ValueError('INTAKE_RULE_DUPLICATE')
     return rules
-
 
 
 def read_registry(settings):
@@ -251,7 +244,6 @@ def read_registry(settings):
     return {'sections': sections, 'checked_at': time.time(), 'version': version}
 
 
-
 def policy(snapshot, entities=()):
     sections = snapshot.get('sections', {})
     topics = [r for r in sections.get('Темы', []) if r['enabled']]
@@ -278,7 +270,6 @@ def policy(snapshot, entities=()):
     if FILTER_RULES in sections:
         result.update(selection_mode='intake_rules', intake_rules=[r for r in sections[FILTER_RULES] if r['enabled']])
     return result
-
 
 
 def apply_snapshot(config, snapshot, entities=()):
@@ -313,7 +304,6 @@ def apply_snapshot(config, snapshot, entities=()):
         if source.get('type') == 'web_search':
             source['query'] = json.dumps({'topics': thematic['topics'], 'geography': thematic['geography']}, ensure_ascii=False)
     return thematic
-
 
 
 def attach_cached(config):
@@ -357,7 +347,6 @@ def sync(db, config, force=False):
     return report(db)
 
 
-
 def configure(db, payload):
     settings = validate_settings(payload)
     if {t['name'] for t in settings['tabs']} != set(HEADERS) or len(settings['tabs']) != 4:
@@ -399,12 +388,10 @@ def report(db):
             'applied':state(db,'topic_registry_applied',{})}
 
 
-
 def credentials_available(settings=None):
     settings = settings or {}
     return bool(settings.get('apps_script_file') and Path(settings['apps_script_file']).is_file()) or bool(settings.get('credentials_file') and Path(settings['credentials_file']).is_file()) or bool(os.getenv('GOOGLE_SHEETS_ACCESS_TOKEN') or
                 all(os.getenv(n) for n in ['GOOGLE_SHEETS_CLIENT_ID','GOOGLE_SHEETS_CLIENT_SECRET','GOOGLE_SHEETS_REFRESH_TOKEN']))
-
 
 
 def api(settings, method, suffix, data=None):
@@ -432,7 +419,6 @@ def api(settings, method, suffix, data=None):
         return json.load(response)
 
 
-
 def keyword_header_probe(settings):
     from .core import _request_with_url
     tab = next(t for t in settings['tabs'] if t['name'] == 'Ключевые слова')
@@ -451,11 +437,9 @@ def keyword_header_probe(settings):
             'searchByRegex': False, 'includeFormulas': False}
 
 
-
 def learned_topics(db):
     return [{'topic':r['topic'], 'search_terms':json.loads(r['search_terms'] or '[]')}
             for r in db.execute('SELECT topic,search_terms FROM monitoring_topics ORDER BY topic LIMIT 1000')]
-
 
 
 def collect_feedback(db):
@@ -539,7 +523,6 @@ def plan_learning(signal, kind, snapshot, settings):
     return changes
 
 
-
 def write_changes(settings, changes):
     """Re-read current rows; insertions never overwrite somebody's new rows.
 
@@ -619,7 +602,6 @@ A retry after an unknown write checks the current sheet before adding anything.
     return len(requests)
 
 
-
 def learn_cycle(db, config):
     if not state(db,SETTINGS):
         return
@@ -666,10 +648,3 @@ def learn_cycle(db, config):
                 job['error']=type(exc).__name__
                 job['retry_at']=time.time()+180
             save(db,key,job); db.commit()
-
-
-
-
-
-
-

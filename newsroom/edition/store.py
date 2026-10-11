@@ -7,6 +7,25 @@ import uuid
 from datetime import datetime,timezone
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS edition_source_translations (
+ source_hash TEXT NOT NULL, bundle_hash TEXT NOT NULL,
+ draft_json TEXT NOT NULL, receipt_json TEXT NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(source_hash,bundle_hash)
+);
+CREATE TABLE IF NOT EXISTS edition_translation_waits (
+ document_id TEXT PRIMARY KEY REFERENCES edition_documents(document_id),
+ retry_after TEXT NOT NULL, automatic INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS edition_semantic_decisions (
+ material_id INTEGER NOT NULL REFERENCES edition_materials(material_id),
+ bundle_hash TEXT NOT NULL, result_json TEXT NOT NULL, receipt_json TEXT NOT NULL,
+ created_at TEXT NOT NULL, PRIMARY KEY(material_id,bundle_hash)
+);
+CREATE TABLE IF NOT EXISTS edition_source_coverage (
+ document_id TEXT PRIMARY KEY REFERENCES edition_documents(document_id),
+ covered_by TEXT NOT NULL REFERENCES edition_documents(document_id),
+ created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS edition_admissions (
  material_id INTEGER PRIMARY KEY REFERENCES edition_materials(material_id),
  decision TEXT NOT NULL, related_material_id INTEGER,
@@ -82,6 +101,10 @@ def read(raw,fallback=None):
     except (TypeError,ValueError):return fallback
 
 
+def document_states(db,job_id):
+    return [r[0] for r in db.execute("SELECT CASE WHEN d.state='DUPLICATE' THEN 'PUBLISHED' WHEN d.state='COVERED' THEN representative.state ELSE d.state END FROM edition_documents d LEFT JOIN edition_source_coverage c ON c.document_id=d.document_id LEFT JOIN edition_documents representative ON representative.document_id=c.covered_by WHERE d.job_id=?",(job_id,))]
+
+
 def event(db,job_id,stage,payload,document_id=None):
     db.execute('INSERT INTO edition_events(job_id,document_id,stage,payload_json,created_at) VALUES(?,?,?,?,?)',
                (job_id,document_id,stage,encoded(payload),stamp()))
@@ -90,6 +113,10 @@ def event(db,job_id,stage,payload,document_id=None):
 
 def initialize(db):
     db.executescript(SCHEMA)
+    from .freshness import SCHEMA as DATE_ADMISSIONS
+    db.executescript(DATE_ADMISSIONS)
+    from .vacancies import SCHEMA as VACANCIES
+    db.executescript(VACANCIES)
     now=stamp()
     db.execute("INSERT OR IGNORE INTO app_state(key,value) VALUES('edition_v2_activation',?)",(now,))
     db.commit()
@@ -111,6 +138,12 @@ def capture(db,item_id,*,eligible=False,queue=False):
     if queue and eligible:
         db.execute("UPDATE edition_materials SET eligible=1,queue_state='QUEUED' WHERE item_id=? AND revision=? AND queue_state='ARCHIVE'",(item_id,revision))
     material_id=db.execute('SELECT material_id FROM edition_materials WHERE item_id=? AND revision=?',(item_id,revision)).fetchone()[0]
+    if queue and eligible:
+        from .freshness import record
+        decision=record(db,{**snapshot,'material_id':material_id,'received_at':received})
+        if decision['decision']=='STALE':
+            db.execute("UPDATE edition_materials SET queue_state='ARCHIVE',eligible=0 WHERE material_id=? AND queue_state IN ('ARCHIVE','QUEUED')",(material_id,))
+            return material_id
     if queue and eligible and db.execute('SELECT queue_state FROM edition_materials WHERE material_id=?',(material_id,)).fetchone()[0]=='QUEUED':
         from .source_text import same_version,article_identity,layout_version
         from .formatting import material_source
@@ -183,16 +216,21 @@ def start(db,bundle_hash,*,retry_of=None):
             db.rollback();raise ValueError('Исключённая подготовка содержит опубликованный пост; повтор запрещён')
         if any(d['state'] in ('UNKNOWN','SENDING','READY') for d in docs):
             db.rollback();raise ValueError('Сначала необходимо разрешить результат доставки предыдущей попытки')
-        failed=[d for d in docs if d['state']=='INCOMPLETE']
+        failed=[d for d in docs if d['state'] in ('INCOMPLETE','LANGUAGE_PENDING')]
+        for doc in docs:
+            if doc['state']=='LANGUAGE_PENDING':
+                db.execute('UPDATE edition_translation_waits SET automatic=0 WHERE document_id=?',(doc['document_id'],))
         ids=list(dict.fromkeys(i for d in failed for i in read(d['group_json'],{})['material_ids'])) if failed else read(original['material_ids_json'],[])
         received=original['received_at']
     else:
+        from .freshness import queued
+        queued(db)
         rows=db.execute("SELECT material_id,received_at FROM edition_materials WHERE queue_state='QUEUED' AND received_at<=? ORDER BY material_id",(cutoff,)).fetchall()
         if not rows:db.commit();return None
         ids=[r[0] for r in rows];received=min(r[1] for r in rows)
     job=uuid.uuid4().hex
     db.execute('INSERT INTO edition_jobs(job_id,retry_of,state,cutoff,received_at,material_ids_json,bundle_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
-               (job,retry_of,'QUEUED' if retry_of else 'PLANNING',cutoff,received,encoded(ids),bundle_hash,cutoff,cutoff))
+               (job,retry_of,'QUEUED' if retry_of else 'SCREENING',cutoff,received,encoded(ids),bundle_hash,cutoff,cutoff))
     if not retry_of:
         db.executemany("UPDATE edition_materials SET queue_state='CLAIMED' WHERE material_id=?",[(i,) for i in ids])
     db.commit();event(db,job,'start',{'material_ids':ids,'cutoff':cutoff,'retry_of':retry_of})
@@ -220,11 +258,13 @@ def lookup(db,job_id,query,*,late=False,topic_spec=None):
             from ..keyword_filter import evaluate
             from .source_text import body,text
             rows=[r for r in rows if evaluate(body(read(r['snapshot_json'],{})),topic_spec,text(read(r['snapshot_json'],{}).get('title')))['passed']][:limits['search_results']]
+    from .vacancies import context_material
+    rows=[r for r in rows if context_material(db,{**read(r['snapshot_json'],{}),'material_id':r[0]}) is not None]
     ids=[r[0] for r in rows]
     db.execute('UPDATE edition_jobs SET searches=searches+1,late_checked=CASE WHEN ? THEN 1 ELSE late_checked END,updated_at=? WHERE job_id=?',(int(late),stamp(),job_id))
     db.execute('INSERT INTO edition_lookups(job_id,kind,query,material_ids_json,created_at) VALUES(?,?,?,?,?)',(job_id,'arrivals' if late else 'context',query,encoded(ids),stamp()))
     db.commit()
-    return materials(db,ids)
+    return [context_material(db,m) for m in materials(db,ids)]
 
 
 def finish(db,job_id,state,reasons=None):
