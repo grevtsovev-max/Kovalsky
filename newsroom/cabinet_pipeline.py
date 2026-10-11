@@ -251,7 +251,9 @@ def pipeline_snapshot(db, config, params, posts, now=None):
     # The cabinet needs read evidence, not the archived article body. Project it
     # before SQLite sorts the rows so large source texts never fill the sorter.
     primary_expr = "CASE WHEN json_valid(i.primary_source_json) THEN json_object(" + ','.join(
-        "'" + key + "',i.primary_source_json -> '$." + key + "'"
+        "'" + key + "',json(CASE json_type(i.primary_source_json, '$." + key + "') "
+        "WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' "
+        "ELSE json_quote(json_extract(i.primary_source_json, '$." + key + "')) END)"
         for key in ('status', 'url', '_material_read', '_material_url')
     ) + ") ELSE '{}' END"
     rows = db.execute('SELECT '+revision_expr+' AS ingest_revision,i.item_id,i.source_id,i.title,i.url,i.canonical_url,i.published_at,'
