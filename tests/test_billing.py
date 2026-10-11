@@ -66,6 +66,19 @@ class BillingTests(unittest.TestCase):
         self.assertIsNone(report['actual'])
         self.assertEqual(sync(self.db, self.config, period='counter', now=self.now)['code'], 'PARTIAL_DAY_PERIOD')
 
+    def test_economics_charts_use_the_same_period_and_preserve_unknown_costs(self):
+        self.receipt('editorial')
+        self.receipt('triage', 'ERROR')
+        report = spending(self.db, self.config, period='today', now=self.now)
+        self.assertEqual(sum(row['calls'] for row in report['hourly']), report['local']['calls'])
+        self.assertEqual(sum(row['unpriced_calls'] for row in report['hourly']), 1)
+        self.assertAlmostEqual(sum(row['known_estimated_usd'] for row in report['hourly']),
+                               report['local']['known_estimated_usd'])
+        self.assertIsNone(report['cost_per_publication_usd'])
+        old = spending(self.db, self.config, period='custom', start='2026-09-01', end='2026-09-02', now=self.now)
+        self.assertEqual(old['hourly'], [])
+        self.assertEqual(old['local']['calls'], 0)
+
     def test_reported_total_with_unknown_period_is_never_allocated_to_tasks(self):
         save_owner_report(self.db, {'amount_usd': '63'}, self.now)
         self.receipt('editorial')
@@ -155,7 +168,7 @@ class BillingTests(unittest.TestCase):
         def make_server(address, handler):
             server = ThreadingHTTPServer(('127.0.0.1',0),handler)
             servers.append(server);ready.set();return server
-        with patch('newsroom.dashboard.ThreadingHTTPServer',side_effect=make_server):
+        with patch('newsroom.cabinet_server.ThreadingHTTPServer',side_effect=make_server):
             thread=threading.Thread(target=dashboard.serve,args=(self.config,),daemon=True)
             thread.start();self.assertTrue(ready.wait(3));server=servers[0]
             base='http://127.0.0.1:'+str(server.server_port)
@@ -171,12 +184,12 @@ class BillingTests(unittest.TestCase):
                         headers={'Content-Type':'application/json','X-Dashboard-Token':token})
                 with urllib.request.urlopen(request,timeout=3) as response:self.assertTrue(json.load(response)['ok'])
                 schema=self.db.execute('PRAGMA schema_version').fetchone()[0]
-                with urllib.request.urlopen(base+'/api/spending?period=month',timeout=3) as response:report=json.load(response)
+                with urllib.request.urlopen(urllib.request.Request(base+'/api/spending?period=month',headers={'X-Dashboard-Token':token}),timeout=3) as response:report=json.load(response)
                 self.assertEqual(report['owner_report']['amount_usd'],63)
                 self.assertIsNone(report['actual'])
                 self.assertEqual(self.db.execute('PRAGMA schema_version').fetchone()[0],schema)
                 with self.assertRaises(HTTPError) as bad:
-                    urllib.request.urlopen(base+'/api/spending?period=invalid',timeout=3)
+                    urllib.request.urlopen(urllib.request.Request(base+'/api/spending?period=invalid',headers={'X-Dashboard-Token':token}),timeout=3)
                 self.assertEqual(bad.exception.code,400);bad.exception.close()
             finally:
                 server.shutdown();server.server_close();thread.join(3)

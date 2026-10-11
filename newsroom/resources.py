@@ -8,6 +8,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 STAGES = {
+    'vacancy_extract':'Разбор вакансий',
+    'edition_retrospective':'Ретроспективный аудит',
+    'edition_semantic_filter':'Смысловой отбор материалов',
+    'edition_translator':'Перевод резервного текста', 'edition_translation_checker':'Проверка перевода',
     'edition_planner':'Группировка новостей', 'edition_writer':'Подготовка поста', 'edition_checker':'Проверка поста',
     'discovery_search': 'Поиск новых новостей', 'source_rss': 'Сбор RSS',
     'source_web': 'Сбор сайтов', 'source_telegram': 'Сбор Telegram',
@@ -28,7 +32,8 @@ STAGES = {
     'telegram_delivery': 'Обращения к Telegram', 'digest': 'Подготовка и доставка дайджеста',
     'verification': 'Проверка готового текста', 'drafting': 'Написание поста', 'unattributed': 'Этап не записан',
 }
-FUNCTION_STAGES = {'fetch_publisher_article':'source_read','fetch_google_news':'source_google_news','fetch_web_search':'discovery_search'}
+FUNCTION_STAGES = {
+    'edition_retrospective':'Ретроспективный аудит','fetch_publisher_article':'source_read','fetch_google_news':'source_google_news','fetch_web_search':'discovery_search'}
 
 PRICING_URL = 'https://developers.openai.com/api/docs/pricing'
 # Official standard text tariffs checked on 2026-10-06. Unknown models remain
@@ -44,10 +49,8 @@ def safe_stage(value):
     return value if value in STAGES else 'unattributed'
 
 
-
 def integer(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-
 
 
 def price_receipt(row, settings):
@@ -92,7 +95,6 @@ def price_receipt(row, settings):
             'tier': tier, 'reason': 'TIER_UNKNOWN' if reference_only else None}
 
 
-
 def _empty():
     return dict(calls=0, succeeded=0, errors=0, in_flight=0, unknown_usage=0,
                 incomplete=0, unknown_bytes=0, unknown_reasoning=0, unattributed_source=0, legacy_cache_hits=0,
@@ -105,13 +107,11 @@ def _empty():
                 reference_usd=0., priced_calls=0, reference_calls=0, unpriced_calls=0)
 
 
-
 def counter_start(db):
     row = db.execute("SELECT value FROM app_state WHERE key='pipeline_counter_epoch_v2'").fetchone()
     if not row:
         raise ValueError('Новый отсчёт материалов ещё не начат')
     return datetime.fromisoformat(json.loads(row[0])['started_at'])
-
 
 
 def snapshot(db, config, hours=24, now=None, item_id=None, start=None):
@@ -212,4 +212,3 @@ def snapshot(db, config, hours=24, now=None, item_id=None, start=None):
                       'Входные токены включают кешированные; выходные включают токены рассуждений.',
                       'Время операций суммируется по исполнителям без повторного учёта вложенных операций; время API входит в него.',
                       'Старые записи без этапа и режима оплаты остаются явно неполными.']}
-

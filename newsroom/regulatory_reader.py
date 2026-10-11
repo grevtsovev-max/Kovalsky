@@ -60,11 +60,9 @@ class DocumentHTML(HTMLParser):
         return '\n'.join(re.sub(r'\s+', ' ', line).strip() for line in ''.join(self.parts).splitlines() if line.strip())
 
 
-
 def attachment_url(url):
     path = urlsplit(url).path.lower()
     return any(part in path for part in ('.pdf','/file/','/document/','/bill/','/documents/'))
-
 
 
 def pdf_pages(payload):
@@ -90,7 +88,6 @@ def pdf_pages(payload):
     if result.returncode: raise ValueError('PDF_EXTRACTION_FAILED')
     result = json.loads(result.stdout)
     return result['pages'], result['ocr_pages']
-
 
 
 def read_source(url, archive=None):
@@ -133,4 +130,3 @@ def read_source(url, archive=None):
 
 def full_text(source):
     return '\n\n'.join('[Страница %d]\n%s' % (i+1, text) for i,text in enumerate(source['pages']))
-

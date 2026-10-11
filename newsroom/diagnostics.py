@@ -20,7 +20,6 @@ def error_location(exc):
             'sqlite_code': getattr(exc, 'sqlite_errorname', None)}
 
 
-
 def snapshot(db, config):
     root = Path(__file__).resolve().parent
     release = root.parent.name

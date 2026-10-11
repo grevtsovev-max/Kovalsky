@@ -13,8 +13,8 @@ def normalized(text):return ' '.join(str(text).split())
 
 
 def contains(material,quote):
-    from .source_text import canonical
-    return bool(quote and any(canonical(quote) in canonical(material.get(k,'')) for k in ('title','description','content')))
+    from .source_text import canonical,saved_fields
+    return bool(quote and any(canonical(quote) in canonical(value) for value in saved_fields(material).values()))
 
 
 def visible(block):
@@ -57,7 +57,9 @@ def material_source(material):
         if publisher.startswith('Упоминания:'):publisher=''
     try:host=urlsplit(url).hostname
     except ValueError:host=None
-    return (publisher.strip() or host or 'Источник',url)
+    # Adapter labels are not part of the public publisher name.
+    publisher = re.sub(r'\s*\((?:RSS|Telegram)\)\s*$', '', publisher, flags=re.I).strip()
+    return (publisher or host or 'Источник',url)
 
 
 def source_list(draft,materials):
@@ -67,6 +69,17 @@ def source_list(draft,materials):
         if material['material_id'] not in used:continue
         pair=material_source(material)
         if pair not in seen:seen.add(pair);result.append(pair)
+        from .source_text import saved_fields,canonical
+        fields=saved_fields(material)
+        primary_quotes=[c.get('quote') for c in citations(draft) if c.get('material_id')==material['material_id']]
+        if fields.get('primary_content') and any(quote and
+                any(canonical(quote) in canonical(fields.get(k,'')) for k in ('primary_title','primary_content')) and
+                not any(canonical(quote) in canonical(fields.get(k,'')) for k in ('title','content','description'))
+                for quote in primary_quotes):
+            metadata=material['primary_source_json']
+            if isinstance(metadata,str):metadata=json.loads(metadata)
+            pair=(metadata.get('publisher') or urlsplit(metadata['url']).hostname or 'Источник',metadata['url'])
+            if pair not in seen:seen.add(pair);result.append(pair)
     return result
 
 
@@ -103,6 +116,8 @@ def validate(draft,materials,group=None):
     if not isinstance(draft,dict) or not all(isinstance(draft.get(k),str) for k in ('headline','lead')) or not isinstance(draft.get('blocks'),list):
         return [problem('structure','','Некорректная структура текста')]
     headline=draft['headline'];lead=draft['lead'];evidence={m['material_id']:m for m in materials}
+    from .language import issues as language_issues
+    issues.extend(language_issues(draft))
     if len(headline)>limits['headline_max']:
         issues.append(problem('headline_length',headline,f"Заголовок: {len(headline)} символов; максимум {limits['headline_max']}"))
     # Recognise one leading emoji cluster, including flags, variation selectors and ZWJ sequences.
@@ -134,6 +149,9 @@ def validate(draft,materials,group=None):
             if not author or author not in block['text'] or quote not in block['text'] or not any(m and contains(m,quote) for m in valid):
                 issues.append(problem('quotes',text,'Цитата и автор должны присутствовать в тексте; цитата — точный фрагмент источника'))
     for kind,text,proofs in blocks:
+        from .source_text import promotional_sentence
+        if promotional_sentence(text):
+            issues.append(problem('body',text,'Рекламный призыв не является новостным фактом'))
         if kind!='headline' and len(text)>limits['block_max']:issues.append(problem('paragraph',text,f'Блок: {len(text)} символов; максимум 210'))
         if kind!='headline' and not isinstance(text,str):continue
         if not isinstance(proofs,list) or not proofs:

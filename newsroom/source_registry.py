@@ -130,6 +130,7 @@ def parse_tab(body, name):
     link_index = headers.index('ссылка')
     task_index = headers.index('что отслеживать') if 'что отслеживать' in headers else None
     enabled_index = headers.index('мониторинг') if 'мониторинг' in headers else None
+    publication_index = headers.index('название для публикации') if 'название для публикации' in headers else None
     result = []
     for number, row in enumerate(rows[1:], 2):
         if not any(v.strip() for v in row):
@@ -141,14 +142,28 @@ def parse_tab(body, name):
             continue
         if not title or len(title) > 250:
             raise ValueError('REGISTRY_NAME')
+        publication = row[publication_index].strip() if publication_index is not None and len(row) > publication_index else ''
+        if len(publication) > 100 or any(ord(c) < 32 for c in publication):
+            raise ValueError('REGISTRY_PUBLICATION_NAME')
         task = row[task_index].strip() if task_index is not None and len(row) > task_index else ''
         flag = row[enabled_index].strip().casefold() if enabled_index is not None and len(row) > enabled_index else ''
         if flag not in {'', 'true', 'false', 'истина', 'ложь', 'да', 'нет', '1', '0'}:
             raise ValueError('REGISTRY_MONITORING_FLAG')
         result.append({'section': name, 'row': number, 'name': title,
-                       'url': link, 'task': task[:1000],
+                       'url': link, 'task': task[:1000], 'publication_name': publication,
                        'enabled': enabled_index is None or flag in {'true', 'истина', 'да', '1'}})
     return result
+
+
+def publication_names(rows):
+    names = {}
+    for row in rows:
+        publication = row.get('publication_name', '').strip()
+        if row.get('url') and publication:
+            previous = names.setdefault(row['url'], publication)
+            if previous != publication:
+                raise ValueError('REGISTRY_PUBLICATION_NAME_CONFLICT')
+    return names
 
 
 def read_registry(settings):
@@ -161,6 +176,7 @@ def read_registry(settings):
     # Publish a snapshot only after every configured tab has been read.
     with ThreadPoolExecutor(max_workers=4) as executor:
         rows = [row for tab in executor.map(read, settings['tabs']) for row in tab]
+    publication_names(rows)  # Reject ambiguous labels before replacing the good cache.
     allowed = {}
     for row in rows:
         url = row['url']
@@ -201,8 +217,9 @@ def source_for(row, existing):
         return None, 'Нужна RSS-лента; сайт сохранён в справочнике'
     # A section is a monitoring hint, never proof of ownership or trust.
     old = existing.get(url, {})
-    label = old.get('name') or row['name']
-    if not old.get('name') and kind == 'telegram' and row.get('section') == 'Лица':
+    publication = row.get('publication_name', '').strip()
+    label = publication or old.get('name') or row['name']
+    if not publication and not old.get('name') and kind == 'telegram' and row.get('section') == 'Лица':
         label = 'Канал @' + parsed.path.strip('/')
     source = {**old, 'name': label[:100],
               'url': url, 'type': kind}
@@ -219,6 +236,7 @@ def apply_snapshot(config, snapshot):
     selected = {}
     rows = []
     linked_names = {}
+    publications = publication_names(snapshot.get('rows', []))
     for row in snapshot.get('rows', []):
         if row.get('url'):
             linked_names.setdefault(row['url'], set()).add(row['name'])
@@ -229,6 +247,7 @@ def apply_snapshot(config, snapshot):
             row.setdefault('enabled', existing.get(row['url'], {}).get('active', True))
         row['entity_monitored'] = row.get('enabled', True)
         source_row = dict(row)
+        source_row['publication_name'] = publications.get(row['url'], '')
         if len(linked_names.get(row['url'], set())) > 1 and row['url'].startswith('https://t.me/'):
             source_row['name'] = 'Канал @' + urlsplit(row['url']).path.strip('/')
         source, row['status'] = source_for(source_row, existing)

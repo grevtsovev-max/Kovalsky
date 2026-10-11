@@ -238,7 +238,7 @@ CREATE TABLE IF NOT EXISTS interest_feedback (
 def _schema_signature():
     # Any change to a schema owner or migration invalidates the fast path.
     modules = ('db', 'runtime', 'workflow', 'material_flow', 'delivery', 'decisions',
-               'knowledge', 'source_search', 'watch', 'archive_memory', 'edition/store')
+               'knowledge', 'source_search', 'watch', 'archive_memory', 'edition/store', 'filter_audit')
     digest = hashlib.sha256()
     for name in modules:
         digest.update((Path(__file__).parent / (name + '.py')).read_bytes())
@@ -305,6 +305,8 @@ def connect(path: str) -> sqlite3.Connection:
         db.execute('ALTER TABLE telegram_feedback_corrections ADD COLUMN next_attempt_at TEXT')
     from .delivery import SCHEMA as DELIVERY_SCHEMA
     db.executescript(DELIVERY_SCHEMA)
+    from .filter_audit import SCHEMA as FILTER_AUDIT_SCHEMA
+    db.executescript(FILTER_AUDIT_SCHEMA)
     from .decisions import SCHEMA as DECISION_SCHEMA
     db.executescript(DECISION_SCHEMA)
     from .knowledge import SCHEMA as KNOWLEDGE_SCHEMA

@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import datetime,timezone
 from . import model,store
 from .formatting import material_source
+from .layout_metrics import summary as layout_summary
 
-LABELS={'QUEUED':'Ожидает подготовки','PLANNING':'Группировка','DRAFTING':'Написание','CHECKING':'Проверка','READY':'Ожидает доставки',
+LABELS={'QUEUED':'Ожидает подготовки','SCREENING':'Смысловой отбор','PLANNING':'Группировка','DRAFTING':'Написание','CHECKING':'Проверка','READY':'Ожидает доставки',
         'SENDING':'Отправляется','PUBLISHED':'Опубликовано','INCOMPLETE':'Не завершено','REJECTED':'Не подготовлено','UNKNOWN':'Результат отправки неизвестен',
-        'FILTERED':'Не соответствует теме','CANCELLED':'Отменено владельцем'}
+        'FILTERED':'Не соответствует теме','DUPLICATE':'Повтор опубликованной новости','COVERED':'Покрыто другим выпуском','LANGUAGE_PENDING':'Ожидает русского перевода','CANCELLED':'Отменено владельцем'}
 
 
 def overview(db,config):
@@ -38,7 +39,8 @@ def overview(db,config):
     return {'enabled':config.get('editorial',{}).get('enabled') is True,'version':policy['version'],'bundle_hash':digest,
             'references':len(refs['references']),'counts':counts,'jobs':jobs,'target_minutes':[5,10],
             'published_sample':len(latencies),'within_10_minutes':sum(v<=600 for v in latencies),
-            'median_seconds':sorted(latencies)[len(latencies)//2] if latencies else None}
+            'median_seconds':sorted(latencies)[len(latencies)//2] if latencies else None,
+            'layout_efficiency':layout_summary(db)}
 
 
 def details(db,job_id):

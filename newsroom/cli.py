@@ -97,14 +97,12 @@ def telegram_token(config: dict) -> str:
     return token
 
 
-
 def telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -> dict:
     runtime = config.get('ai', {}).get('_runtime')
     if runtime:
         with runtime.measure('telegram_delivery', 'editor'):
             return _telegram_api(config, method, payload, timeout)
     return _telegram_api(config, method, payload, timeout)
-
 
 
 def _telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -> dict:
@@ -142,7 +140,6 @@ def _telegram_api(config: dict, method: str, payload: dict, timeout: int = 20) -
             raise DeliveryRejected(f"Telegram API rejected request ({code})")
         raise DeliveryUncertain("Telegram API uncertain rejection")
     return result.get("result")
-
 
 
 def telegram_format_text(text: str) -> str:
@@ -203,7 +200,6 @@ def telegram_format_text(text: str) -> str:
     return "\n".join(formatted_lines)
 
 
-
 def telegram_send(config: dict, text: str) -> str:
     settings = config.get("telegram", {})
     chat_id = os.getenv(settings.get("chat_id_env", "TELEGRAM_CHAT_ID")) or settings.get("chat_id")
@@ -216,7 +212,6 @@ def telegram_send(config: dict, text: str) -> str:
     return TelegramReceipt(result)
 
 
-
 def _telegram_message_url(config: dict, message_id: str) -> str | None:
     settings = config.get("telegram", {})
     chat_id = os.getenv(settings.get("chat_id_env", "TELEGRAM_CHAT_ID")) or settings.get("chat_id", "")
@@ -227,7 +222,6 @@ def _telegram_message_url(config: dict, message_id: str) -> str | None:
     if digits.startswith("100") and digits[3:].isdigit() and str(message_id).isdigit():
         return f"https://t.me/c/{digits[3:]}/{message_id}"
     return None
-
 
 
 def _run_collection_cycle(config, db_path, *, persistent=False):
@@ -271,7 +265,6 @@ def _safe_error_label(message: str) -> str:
     return "Источник ошибки учтён"
 
 
-
 def run_one_cycle(config, db_path):
     require_enabled(config)
     from .topic_registry import attach_cached
@@ -283,10 +276,14 @@ def main():
     parser = argparse.ArgumentParser(prog='newsroom', description='Сбор и хранение материалов')
     parser.add_argument('--config', default='config.toml')
     sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('telegram-login')
     control = sub.add_parser('agent')
     control.add_argument('action', choices=['disable', 'enable', 'status'])
     for name in ('init', 'once', 'run', 'health', 'pending', 'filter-audit-export'):
         sub.add_parser(name)
+    audit = sub.add_parser('retrospective')
+    audit.add_argument('--hours', type=int, default=24)
+    audit.add_argument('--journal-only', action='store_true')
     dashboard = sub.add_parser('dashboard')
     dashboard.add_argument('--host', choices=['127.0.0.1','localhost'], default='127.0.0.1')
     dashboard.add_argument('--port', type=int, default=8765)
@@ -294,6 +291,11 @@ def main():
     owner.add_argument('--request-key', required=True)
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.command == 'telegram-login':
+        from .telegram_reader import login
+        login(config.get('telegram_reader', {}))
+        print('Авторизация чтения Telegram сохранена')
+        return
     if args.command == 'agent':
         if args.action != 'status': set_enabled(config, args.action == 'enable')
         print('Агент включён' if agent_enabled(config) else 'Агент отключён')
@@ -327,7 +329,12 @@ def main():
     else:
         db = connect(db_path)
         try:
-            if args.command == 'filter-audit-export':
+            if args.command == 'retrospective':
+                from .retrospective import run
+                from .topic_registry import attach_cached
+                attach_cached(config)
+                print(json.dumps(run(db,config,args.hours,evaluate=not args.journal_only),ensure_ascii=False))
+            elif args.command == 'filter-audit-export':
                 from .filter_audit import export
                 export(db,sys.stdout)
             elif args.command == 'init': print('База готова')

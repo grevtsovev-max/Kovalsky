@@ -60,5 +60,3 @@ class ChannelTextParser(HTMLParser):
                 channel, _, message_id = self.post.partition('/')
                 if channel.casefold() == self.username and message_id.isdigit():
                     self.messages[message_id] = ''.join(self.parts).strip()
-
-

@@ -44,6 +44,8 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
     token = secrets.token_urlsafe(32)
     tasks_file = Path(__file__).resolve().parent.parent / "KANBAN.json"
     tasks_lock = threading.Lock()
+    vacancy_process_lock = threading.Lock()
+    vacancy_process = {"process":None}
     collection_state_lock = threading.Lock()
     collection_state = {"state": "idle", "started_at": None, "finished_at": None,
                         "outcomes": {}, "error": None}
@@ -53,6 +55,34 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
 
         def log_message(self, fmt, *args):
             return
+
+        def _local_request(self):
+            # A browser must not reach the local cabinet under an attacker host.
+            authorities = {f"127.0.0.1:{self.server.server_port}",
+                           f"localhost:{self.server.server_port}",
+                           f"[::1]:{self.server.server_port}"}
+            if self.server.server_port == 80:
+                authorities.update({"127.0.0.1", "localhost", "[::1]"})
+            hosts = self.headers.get_all("Host", [])
+            if (self.client_address[0] not in {"127.0.0.1", "::1"}
+                    or len(hosts) != 1 or hosts[0].lower() not in authorities):
+                self._json({"error": "Нет доступа"}, 403)
+                return False
+            origins = self.headers.get_all("Origin", [])
+            if origins and (len(origins) != 1 or origins[0] != "http://" + hosts[0]):
+                self._json({"error": "Нет доступа"}, 403)
+                return False
+            if self.headers.get("Sec-Fetch-Site") == "cross-site":
+                self._json({"error": "Нет доступа"}, 403)
+                return False
+            return True
+
+        def _authorized(self):
+            values = self.headers.get_all("X-Dashboard-Token", [])
+            if len(values) != 1 or not secrets.compare_digest(values[0], token):
+                self._json({"error": "Нет доступа"}, 403)
+                return False
+            return True
 
         def _json(self, payload: dict, status: int = 200):
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -82,13 +112,16 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
             return 10
 
         def do_GET(self):
+            if not self._local_request():
+                return
             parsed = urlparse(self.path)
             if parsed.path == "/":
-                view_names = { "vacancies", "published", "sources", "pipeline", "resources", "edition"}
+                view_names = { "vacancies", "published", "sources", "pipeline", "resources", "edition", "retrospective"}
                 requested_view = parse_qs(parsed.query).get("view", ["pipeline"])[0]
                 view = requested_view if requested_view in view_names else "pipeline"
                 headings = {
-                    "vacancies": ("Вакансии", "Объявления о работе и условия"),
+                    "vacancies": ("Вакансии", "Сохранённые объявления для подборок"),
+                    "retrospective": ("Ретроспективный аудит", "Качество отбора и путь материалов"),
                     "resources": ("Расход ресурсов", "Деньги и расходы по задачам"),
                     "published": ("Публикации", "Посты, отправленные в канал"),
                     "sources": ("Источники", "Подключённые новостные ленты"),
@@ -117,13 +150,22 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                 except (BrokenPipeError, ConnectionResetError):
                     return
                 return
+            if not self._authorized():
+                return
             try:
                 from .topic_registry import attach_cached
                 attach_cached(config)
                 if parsed.path == "/api/vacancies":
-                    from .vacancy_view import inbox
-                    db = self._read_db()
-                    try: self._json(inbox(db))
+                    from .jobs.view import inbox,is_running
+                    db = self._db()
+                    try:
+                        from .jobs.store import discover
+                        discover(db)
+                        data=inbox(db)
+                        with vacancy_process_lock:
+                            proc=vacancy_process["process"]
+                            data["running"]=(proc is not None and proc.poll() is None) or is_running(db_path)
+                        self._json(data)
                     finally: db.close()
                 elif parsed.path == "/api/topic-registry":
                     from .topic_registry import report
@@ -160,6 +202,11 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
                             policy,refs,digest=bundle();self._json({'policy':policy,'references':refs,'bundle_hash':digest})
                         else:self._json(overview(db,config))
                     except ValueError as exc:self._json({'error':str(exc)},400)
+                    finally:db.close()
+                elif parsed.path == "/api/retrospective":
+                    from .retrospective import latest
+                    db=self._read_db()
+                    try:self._json(latest(db))
                     finally:db.close()
                 elif parsed.path == "/api/summary":
                     self._json(self._summary())
@@ -307,16 +354,63 @@ def serve(config: dict, host: str = "127.0.0.1", port: int = 8765, config_path: 
             finally: db.close()
 
         def do_POST(self):
-            if self.client_address[0] not in {"127.0.0.1", "::1"} or not secrets.compare_digest(self.headers.get("X-Dashboard-Token", ""), token):
-                self._json({"error": "Нет доступа"}, 403); return
+            if not self._local_request() or not self._authorized():
+                return
             try:
                 size=int(self.headers.get("Content-Length", "0"))
                 if size > 8192: self._json({"error":"Слишком большой запрос"},413); return
                 parsed=urlparse(self.path); parts=[unquote(x) for x in parsed.path.strip('/').split('/')]
                 from .agent_control import enabled
-                if parts in (["api", "collect"], ["api", "intake-url"], ["api", "post-corrections"]) and not enabled(config):
+                if parts in (["api", "collect"], ["api", "intake-url"], ["api", "post-corrections"], ["api", "vacancies", "parse"]) and not enabled(config):
                     self._json({"error": "Агент отключён владельцем"}, 409)
                     return
+                if parts==['api','vacancies','parse']:
+                    from .agent_control import require_enabled
+                    require_enabled(config)
+                    import subprocess,sys
+                    with vacancy_process_lock:
+                        proc=vacancy_process['process']
+                        if proc is not None and proc.poll() is None:
+                            self._json({'error':'Разбор уже выполняется.'},409);return
+                        vacancy_process['process']=subprocess.Popen(
+                            [sys.executable,'-m','newsroom.jobs.worker','--config',str(config_file)],
+                            cwd=str(Path(__file__).resolve().parent.parent),stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+                    self._json({'ok':True,'state':'running'},202);return
+                if parts==['api','retrospective']:
+                    from .cli import load_config
+                    from .agent_control import require_enabled
+                    from .locking import acquire_named_lock
+                    try:
+                        payload=json.loads(self.rfile.read(size).decode('utf-8'))
+                        hours=payload.get('hours',24) if isinstance(payload,dict) else None
+                        if type(hours) is not int or not 1<=hours<=720:
+                            raise ValueError('INVALID_AUDIT_PERIOD')
+                    except (ValueError,UnicodeError):
+                        self._json({'error':'Выберите период отчёта от 1 до 720 часов'},400);return
+                    current=load_config(str(config_file))
+                    if not enabled(current):
+                        self._json({'error':'Агент отключён владельцем. Запуск ИИ-аудита недоступен.'},409);return
+                    if current['newsroom']['database']!=db_path:
+                        self._json({'error':'Настройки базы изменились. Нужно перезапустить кабинет.'},409);return
+                    lock=acquire_named_lock(db_path,'retrospective')
+                    if not lock:self._json({'error':'Аудит уже выполняется'},409);return
+                    def audit_task():
+                        db=None
+                        try:
+                            from .retrospective import run
+                            from .topic_registry import attach_cached
+                            attach_cached(current)
+                            db=self._db()
+                            run(db,current,hours,_locked=True)
+                        except Exception:
+                            if db and db.execute("SELECT 1 FROM sqlite_master WHERE name='retrospective_progress'").fetchone():
+                                db.execute("UPDATE retrospective_progress SET status='INTERRUPTED' WHERE status='RUNNING'");db.commit()
+                        finally:
+                            if db:db.close()
+                            lock.close()
+                    threading.Thread(target=audit_task,daemon=True,name='retrospective').start()
+                    self._json({'started':True},202);return
                 if parts==['api','edition','retry']:
                     from .edition.views import retry
                     from .cli import load_config

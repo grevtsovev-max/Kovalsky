@@ -55,4 +55,3 @@ CREATE TABLE IF NOT EXISTS post_memory (
  text_hash TEXT NOT NULL
 );
 """
-

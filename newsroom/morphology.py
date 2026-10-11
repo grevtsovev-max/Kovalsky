@@ -8,4 +8,3 @@ import re
 def _morphology():
     from pymorphy3 import MorphAnalyzer
     return MorphAnalyzer()
-

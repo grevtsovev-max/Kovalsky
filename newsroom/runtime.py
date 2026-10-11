@@ -63,11 +63,9 @@ def stamp():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-
 def account_unavailable(code):
     return code in {'CREDENTIALS_MISSING', 'HTTP_429:credit_balance_exhausted', 'HTTP_429:insufficient_quota',
                     'HTTP_429:billing_hard_limit_reached', 'HTTP_401:invalid_api_key'}
-
 
 
 class BudgetDeferred(RuntimeError):
@@ -86,7 +84,6 @@ class BudgetDeferred(RuntimeError):
     def user_reason(self):
         return ('недоступен счёт ИИ; требуется проверить баланс и доступ'
                 if self.reason == 'account' else 'нет свободного места или общего лимита запросов')
-
 
 
 class Runtime:
@@ -306,11 +303,9 @@ def attach(config):
     return settings.get("_runtime")
 
 
-
 def cache_key(stage, value):
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256((stage + ":" + encoded).encode()).hexdigest()
-
 
 
 def snapshot(db, now=None):
@@ -342,7 +337,6 @@ def snapshot(db, now=None):
     return result
 
 
-
 def health_lines(db, now=None):
     usage = snapshot(db, now)
     from .workflow import snapshot as queue_snapshot
@@ -366,4 +360,3 @@ def health_lines(db, now=None):
                      f"входных токенов {role['input_tokens'] if role['input_tokens'] is not None else 'неизвестно'} · "
                      f"выходных токенов {role['output_tokens'] if role['output_tokens'] is not None else 'неизвестно'}.")
     return lines
-

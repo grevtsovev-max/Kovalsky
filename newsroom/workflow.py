@@ -1,37 +1,11 @@
 from __future__ import annotations
 
-
-import copy
-
-
 import math
-
-
-import inspect
-
-
-import json
-
-
-import time
-
-
-import uuid
-
-
 from contextlib import nullcontext
-
-
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-
-
 from dataclasses import dataclass, field
-
-
 from datetime import datetime, timedelta, timezone
 
-
-from .runtime import SCOPE, cache_key, stamp
+from .runtime import cache_key
 
 
 SCHEMA = """
@@ -65,7 +39,8 @@ def enqueue(db, item_id, item, source, options, *, category="fresh"):
     if item_id is None:
         item_id = _save_item(db, source, item)
         if item_id is None:
-            # Failed duplicate INSERTs still acquire the SQLite write lock.
+            # A failed INSERT for an existing feed entry still starts a write
+            # transaction. Release it before the next entry or network wait.
             db.commit()
             return None
     revision = cache_key("material-version", {key: item.get(key) for key in (
@@ -80,6 +55,8 @@ def enqueue(db, item_id, item, source, options, *, category="fresh"):
         from .keyword_filter import screen
         screen(db, item_id, item, settings)
     db.commit()
+    from .source_reading import prepare
+    prepare(db,item_id,item,source,settings)
     from .edition.store import ingest
     ingest(db,item_id,settings)
     return item_id
@@ -116,7 +93,6 @@ def snapshot(db, now=None):
             "JOIN items i ON i.item_id=st.item_id AND i.ingest_revision=st.revision "
             "WHERE st.status IN ('READY','RUNNING','WAITING','ERROR') GROUP BY st.stage,st.status,st.block_kind")]
     return result
-
 
 
 @dataclass

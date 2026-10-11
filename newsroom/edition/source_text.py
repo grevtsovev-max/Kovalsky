@@ -32,6 +32,48 @@ def text(value):
     return '\n'.join(' '.join(line.split()) for line in value.splitlines() if line.strip()).strip()
 
 
+def saved_fields(material):
+    """Original fields and a successfully read, immutable linked source."""
+    import json
+    from urllib.parse import urlsplit
+    result={field:text(material.get(field,'')) for field in ('title','content','description')}
+    primary=material.get('primary_source_json') or {}
+    if isinstance(primary,str):
+        try:primary=json.loads(primary)
+        except (ValueError,TypeError):return result
+    if not isinstance(primary,dict) or primary.get('status')!='READ' or primary.get('type') not in ('OFFICIAL','LINKED_DOCUMENT'):return result
+    try:
+        url=urlsplit(primary.get('url',''))
+        if url.scheme not in ('http','https') or not url.hostname or url.username or url.password:return result
+    except (ValueError,TypeError):return result
+    if not isinstance(primary.get('content'),str) or not primary['content'].strip():return result
+    result['primary_title']=text(primary.get('title',''))
+    result['primary_content']=text(primary['content'])
+    return result
+
+
+def expand_link_preview(group,materials):
+    """A selected single-title link preview includes its already read article.
+
+    A digest mentioning a title is insufficient: the selected scope must consist
+    solely of that exact title followed by a publisher label and this source URL.
+    """
+    import json
+    result=copy.deepcopy(group)
+    for material in materials:
+        fields=saved_fields(material)
+        if not fields.get('primary_title') or not fields.get('primary_content'):continue
+        primary=material.get('primary_source_json') or {}
+        if isinstance(primary,str):primary=json.loads(primary)
+        pattern=r'^'+re.escape(fields['primary_title'])+r'\s*\|\s*[^|\n]+\s+'+re.escape(primary['url'])+r'\s*$'
+        selected=[f for f in result.get('focus',[]) if f.get('material_id')==material['material_id'] and f.get('scope')]
+        if not any(re.fullmatch(pattern,text(f['scope']),re.I) for f in selected):continue
+        if any(f['scope']==fields['primary_content'] for f in selected):continue
+        result['focus'].append({'material_id':material['material_id'],'excerpt':fields['primary_title'],
+                               'scope':fields['primary_content'],'summary':'Сохранённый прочитанный первоисточник выбранного анонса.'})
+    return result
+
+
 def canonical(value):return ' '.join(text(value).split()).casefold().replace('ё','е')
 
 
@@ -45,12 +87,32 @@ def sections(value):
     return [s.strip() for s in re.split(r'\s+(?=\d{1,2}[.)]\s+[А-ЯЁA-Z])',value) if s.strip()]
 
 
-def pieces(value,limit=210):
+def promotional_sentence(value):
+    """Explicit reader solicitation; reported company actions remain facts."""
+    value=re.sub(r'^[^\wА-ЯЁа-яё]+','',text(value))
+    return bool(re.match(r'(?:Хотите\s+(?:е[щш][её]|получить)|Подпис(?:ывайтесь|аться)|'
+        r'Читайте\s+(?:последние|свежие)|Будьте\s+на\s+шаг|'
+        r'(?:Вступайте|Присоединяйтесь)\s+(?:в|к)|Обсуждайте\s+новости|'
+        r'Подключ(?:ите|айтесь)\b|(?:Оставьте|Подайте|Заполните)\s+(?:заявку|форму)|'
+        r'Если\s+оборудование\s+уже\s+подключено,\s*проверьте)',value,re.I))
+
+
+def editorial_source(value):
+    """Remove discrete publisher promotions, preserving subsequent reporting."""
+    value=text(value)
+    value=re.split(r'\bThe post\b|(?:#\w+\s*){2,}|РОСКРИПТО\.РФ\s*\|',value,flags=re.I)[0]
+    sentences=re.split(r'(?<=[.!?])\s+(?=[А-ЯЁA-Z«\d])|\n+',value)
+    return '\n'.join(s.strip() for s in sentences if s.strip() and not promotional_sentence(s))
+
+
+def pieces(value,limit=210,*,sentences_only=False):
     """Split on sentence/word boundaries; never rewrite numbers or invent facts."""
     value=text(value)
     sentences=re.split(r'(?<=[.!?])\s+(?=[А-ЯЁA-Z«\d])|\n+',value)
     result=[]
     for sentence in sentences:
+        if sentences_only and len(sentence)>limit:
+            result.append(sentence);continue
         while len(sentence)>limit:
             cut=sentence.rfind(' ',0,limit+1)
             if cut<1:cut=limit
@@ -59,16 +121,16 @@ def pieces(value,limit=210):
     return result
 
 
-def formatted(draft):
+def formatted(draft,*,sentences_only=False):
     """Mechanical paragraph repair preserves the wording and evidence."""
     result=copy.deepcopy(draft)
-    lead=pieces(result.get('lead','')) if len(result.get('lead',''))>210 else [result.get('lead','')]
+    lead=pieces(result.get('lead',''),sentences_only=sentences_only) if len(result.get('lead',''))>210 else [result.get('lead','')]
     result['lead']=lead[0] if lead else ''
     blocks=[{'text':p,'kind':'paragraph','evidence':copy.deepcopy(result.get('lead_evidence',[])),
              'quote_text':'','quote_author':''} for p in lead[1:]]
     for block in result.get('blocks',[]):
         limit=208 if block.get('kind')=='bullet' else 210
-        parts=pieces(block.get('text',''),limit) if len(block.get('text',''))>limit or '\n' in block.get('text','') else [block.get('text','')]
+        parts=pieces(block.get('text',''),limit,sentences_only=sentences_only) if len(block.get('text',''))>limit or '\n' in block.get('text','') else [block.get('text','')]
         if block.get('kind')=='quote' and len(parts)>1:
             # Keep a direct quote intact in details, with the same author and evidence.
             for part in parts:

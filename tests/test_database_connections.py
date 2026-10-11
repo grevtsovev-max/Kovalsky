@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,3 +44,37 @@ class DatabaseConnectionTests(unittest.TestCase):
                     self.assertIn('signature', state)
                 finally:
                     other.close()
+
+    def test_legacy_clock_word_does_not_prevent_opening_database(self):
+        from newsroom.db import SCHEMA
+        path = str(Path(self.tmp.name) / 'legacy.sqlite3')
+        old = sqlite3.connect(path)
+        old.executescript(SCHEMA.replace(
+            'CREATE INDEX IF NOT EXISTS items_discovered_julian_idx ON items(julianday(discovered_at));', ''))
+        old.execute("INSERT INTO sources(source_id,name,type,url) VALUES(1,'Fixture','rss','https://example.org/rss')")
+        old.execute("INSERT INTO items(source_id,url,canonical_url,title,discovered_at,content_hash,title_hash) "
+                    "VALUES(1,'https://example.org/a','https://example.org/a','Fixture','now','fixture','fixture')")
+        old.commit()
+        old.close()
+        migrated = connect(path)
+        try:
+            self.assertEqual(migrated.execute('SELECT discovered_at FROM items').fetchone()[0], 'now')
+            self.assertIsNotNone(migrated.execute(
+                "SELECT name FROM sqlite_master WHERE name='filter_audit'").fetchone())
+        finally:
+            migrated.close()
+        reopened = connect(path)
+        try:
+            self.assertEqual(reopened.execute('SELECT COUNT(*) FROM items').fetchone()[0], 1)
+        finally:
+            reopened.close()
+
+    def test_filter_audit_schema_is_restored_after_external_change(self):
+        self.db.execute('DROP TABLE filter_audit')
+        self.db.commit()
+        other = connect(self.path)
+        try:
+            self.assertIsNotNone(other.execute(
+                "SELECT name FROM sqlite_master WHERE name='filter_audit'").fetchone())
+        finally:
+            other.close()

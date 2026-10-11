@@ -16,4 +16,3 @@ BEGIN SELECT RAISE(ABORT,'search history is append only'); END;
 CREATE TRIGGER IF NOT EXISTS source_search_no_delete BEFORE DELETE ON source_search_log
 BEGIN SELECT RAISE(ABORT,'search history is append only'); END;
 """
-

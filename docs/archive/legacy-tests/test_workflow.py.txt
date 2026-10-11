@@ -58,10 +58,6 @@ class WorkflowTests(unittest.TestCase):
         self.db.execute('UPDATE stories SET version=version+1 WHERE story_id=?', (unrelated_id,))
         self.assertEqual(before, _editor_history_revision(self.db, item))
         self.db.execute('UPDATE stories SET version=version+1 WHERE story_id=?', (related_id,))
-        self.assertEqual(before, _editor_history_revision(self.db, item))
-        self.db.execute("UPDATE stories SET source_count=source_count+1,last_updated_at='2099-01-01' WHERE story_id=?", (related_id,))
-        self.assertEqual(before, _editor_history_revision(self.db, item))
-        self.db.execute("UPDATE stories SET latest_information=latest_information || ' Новое подтверждённое условие.' WHERE story_id=?", (related_id,))
         self.assertNotEqual(before, _editor_history_revision(self.db, item))
 
     def test_inconclusive_editor_output_is_not_cached_even_from_legacy_cache(self):

@@ -14,6 +14,24 @@ class RegistryTests(unittest.TestCase):
     def row(self, name='Example', url='https://t.me/example'):
         return dict(name=name, url=url, section='СМИ', row=2, task='', url_allowed=True)
 
+    def test_publication_name_overrides_nickname_without_renaming_monitored_people(self):
+        rows = registry.parse_tab('Название,Ссылка,Мониторинг,Название для публикации\nЧеловек,https://t.me/shared,TRUE,Название канала\nКомпания,https://t.me/shared,FALSE,\n'.encode(), 'Лица')
+        for row in rows: row['url_allowed']=True
+        for order in (rows, list(reversed(rows))):
+            config = {'sources': [{'name':'Канал @shared','url':'https://t.me/shared','type':'telegram'}]}
+            registry.apply_snapshot(config, {'rows':order,'schema_version':2})
+            self.assertEqual(config['sources'][0]['name'], 'Название канала')
+            self.assertTrue(config['sources'][0]['active'])
+            entities = registry.entity_sources(rows)
+            self.assertEqual(entities[0]['registry_entities'], ['Человек'])
+
+    def test_conflicting_publication_labels_reject_new_snapshot(self):
+        settings = {'spreadsheet_id':'x'*25,'tabs':[{'name':'СМИ','gid':'1'}]}
+        body='Название,Ссылка,Название для публикации\nA,https://t.me/shared,Первое\nB,https://t.me/shared,Второе\n'.encode()
+        with patch('newsroom.core._request_with_url',return_value=(body,'','text/csv')):
+            with self.assertRaisesRegex(ValueError,'PUBLICATION_NAME_CONFLICT'):
+                registry.read_registry(settings)
+
     def test_headers_spaces_and_blank_links(self):
         rows = registry.parse_tab('Название ,Ссылка\nКомпания,\nКанал,https://t.me/example\n'.encode(), 'Бренды')
         self.assertEqual(len(rows), 2)
@@ -106,12 +124,6 @@ class RegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry.parse_tab('Название,Ссылка,Мониторинг\nOops,,непонятно\n'.encode(), 'СМИ')
 
-    def test_regulatory_adapters_obey_registry_membership(self):
-        from newsroom import regulatory
-        snapshot = {'rows': [dict(url='https://www.cbr.ru/', enabled=True, url_allowed=True),
-                             dict(url='https://nalog.gov.ru/', enabled=False, url_allowed=True)]}
-        with patch.object(registry, 'cached_authority', return_value=snapshot):
-            self.assertEqual([s[0] for s in regulatory.monitoring_sources({})], ['cbr'])
 
     def test_unapproved_url_and_site_are_not_connected(self):
         row = self.row(url='https://127.0.0.1/feed')

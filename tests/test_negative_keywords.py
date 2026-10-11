@@ -66,17 +66,23 @@ class NegativeKeywordsTests(unittest.TestCase):
         self.assertEqual(len(entries),1)
 
     def test_rejected_material_never_reaches_reading_or_ai(self):
+        from tests.edition_helpers import EditionCase
+        from newsroom.workflow import enqueue
         from unittest.mock import patch
-        from test_keyword_filter import KeywordFilterTests
-        runner=KeywordFilterTests();runner.setUp();self.addCleanup(runner.doCleanups)
-        runner.settings['_keyword_prefilter']['negative_keywords']=[self.entry('Vavada')]
-        runner.item['title']='Vavada создала цифровой депозитарий'
-        with patch('newsroom.core.fetch_publisher_article') as read, patch('newsroom.ai.request_response') as ai:
-            self.assertEqual(runner.process(),'NOISE')
-        read.assert_not_called();ai.assert_not_called()
         import json
+        runner=EditionCase();runner.setUp();self.addCleanup(runner.doCleanups)
+        source=dict(runner.db.execute('SELECT * FROM sources WHERE source_id=?',(runner.source,)).fetchone())
+        item={'url':'https://example.org/rejected','title':'Vavada создала цифровой депозитарий',
+              'content':'Цифровой депозитарий','description':''}
+        settings={'_edition_enabled':True,'_keyword_prefilter':{
+            'keywords':['цифровой депозитарий'],'negative_keywords':[self.entry('Vavada')]}}
+        with patch('newsroom.core.fetch_publisher_article') as read, patch('newsroom.ai.request_response') as ai:
+            enqueue(runner.db,None,item,source,{'settings':settings})
+        read.assert_not_called();ai.assert_not_called()
         saved=json.loads(runner.db.execute("SELECT result_json FROM material_stage_results WHERE stage='screening'").fetchone()[0])
+        self.assertFalse(saved['passed'])
         self.assertEqual(saved['matched_negative_keyword'],'Vavada')
+        self.assertEqual(runner.db.execute("SELECT COUNT(*) FROM edition_materials WHERE queue_state='QUEUED'").fetchone()[0],0)
 
     def test_registry_version_changes_and_invalid_rows_fail_atomic_read(self):
         from unittest.mock import patch

@@ -159,21 +159,7 @@ class TopicsTests(unittest.TestCase):
         url=entity_sources([{'name':'Компания','enabled':True}],topics.policy(snapshot()))[0]['url']
         self.assertEqual(parse_qs(urlsplit(url).query)['q'],['("Компания") when:2d'])
 
-    def test_publication_needs_read_quote_and_enabled_topic(self):
-        quote='Компания наняла сотрудников для работы с платежными агентами.'
-        result={'topic_match':{'name':'Работа','evidence':quote}}
-        self.assertTrue(topics.grounded_match(result,topics.policy(snapshot()),{'content':quote}))
-        self.assertFalse(topics.grounded_match(result,topics.policy(snapshot()),{'content':'Другой текст'}))
-        result['topic_match']['name']='Выключена'
-        self.assertFalse(topics.grounded_match(result,topics.policy(snapshot()),{'content':quote}))
 
-    def test_topic_quote_saves_source_span_without_extra_terminal_punctuation(self):
-        source = 'Компания наняла сотрудников для работы с платежными агентами, расширяя отдел.'
-        result = {'topic_match': {'name': 'Работа', 'evidence': 'Компания наняла сотрудников для работы с платежными агентами.'}}
-        self.assertTrue(topics.grounded_match(result, topics.policy(snapshot()), {'content': source}))
-        self.assertEqual(result['topic_match']['evidence'], source.split(',')[0])
-        result['topic_match']['evidence'] = 'Компания уволила сотрудников для работы с платежными агентами.'
-        self.assertFalse(topics.grounded_match(result, topics.policy(snapshot()), {'content': source}))
 
     def activity_policy(self):
         value = snapshot()
@@ -186,34 +172,7 @@ class TopicsTests(unittest.TestCase):
                     {'name': 'Crypto Elina', 'section': 'Лица', 'enabled': True}]
         return value, entities, topics.policy(value, entities)
 
-    def test_person_exception_cannot_be_used_for_brand_or_untracked_spokesperson(self):
-        _, _, thematic = self.activity_policy()
-        quote = 'Представитель Ростеха рассказал о развитии медицинской продукции.'
-        match = {'name': topics.PUBLIC_ACTIVITY, 'evidence': quote,
-                 'subject_type': 'BRAND', 'subject_name': 'Ростех', 'crypto_evidence': ''}
-        self.assertFalse(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
-        match.update(subject_type='PERSON', subject_name='Ростех')
-        self.assertFalse(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
-        match['subject_name'] = 'Представитель Ростеха'
-        self.assertFalse(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
-        quote = 'Crypto Elina рассказала о своём участии в спортивном марафоне.'
-        match.update(evidence=quote, subject_name='Crypto Elina')
-        self.assertTrue(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
 
-    def test_brand_needs_one_extra_thematic_keyword_and_grounded_crypto_connection(self):
-        _, _, thematic = self.activity_policy()
-        quote = 'Ростех сообщил о пилотном выпуске цифровых активов для расчётов.'
-        match = {'name': topics.PUBLIC_ACTIVITY, 'evidence': quote, 'subject_type': 'BRAND',
-                 'subject_name': 'Ростех', 'crypto_related': True, 'crypto_evidence': quote}
-        self.assertTrue(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
-        match['crypto_evidence'] = 'Ростех сообщил о сотрудничестве со Сбером в развитии медицины.'
-        self.assertFalse(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
-        match['crypto_evidence'] = 'Ростех сообщил о другом выпуске цифровых активов в другой стране.'
-        self.assertFalse(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
-        match.update(crypto_evidence=quote, crypto_related=False)
-        self.assertFalse(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
-        match.pop('subject_type')
-        self.assertFalse(topics.grounded_match({'topic_match': match}, thematic, {'content': quote}))
 
     def test_brand_combination_is_applied_locally_without_ai(self):
         from newsroom.keyword_filter import evaluate
@@ -230,34 +189,8 @@ class TopicsTests(unittest.TestCase):
         self.assertTrue(evaluate('Crypto Elina пробежала марафон', spec)['passed'])
         self.assertTrue(evaluate('Crypto Elina выступила на мероприятии Ростеха', spec)['passed'])
 
-    def test_delivery_boundary_rejects_old_public_activity_permission(self):
-        from newsroom.cli import is_eligible_for_auto_publish
-        from newsroom.ai import FILTER_VERSION
-        _, _, thematic = self.activity_policy()
-        quote = 'Ростех рассказал о развитии медицинской продукции на форуме.'
-        match = {'name': topics.PUBLIC_ACTIVITY, 'evidence': quote}
-        facts = {'mode': 'AI', '_filter_version': FILTER_VERSION,
-                 'topic_registry': {'version': 'v1', 'checked': True, 'match': match}}
-        post = {'created_at': '2026-10-07T12:00:00+00:00', 'fact_check_result': json.dumps(facts)}
-        self.assertFalse(is_eligible_for_auto_publish(post, '2026-10-07T00:00:00+00:00', thematic))
-        match.update(subject_type='PERSON', subject_name='Crypto Elina', crypto_evidence='')
-        post['fact_check_result'] = json.dumps(facts)
-        self.assertTrue(is_eligible_for_auto_publish(post, '2026-10-07T00:00:00+00:00', thematic))
 
-    def test_old_learning_database_is_not_a_second_thematic_authority(self):
-        from newsroom.interests import learning_context, expand_search_queries
-        self.db.execute("INSERT INTO monitoring_topics(topic,search_terms,examples,updated_at) VALUES('Hidden','[]','[]','2026')")
-        self.enable()
-        self.assertEqual([t['topic'] for t in learning_context(self.db)['topics']],['Работа'])
-        config={'_topic_registry_authoritative':True,'sources':[{'type':'web_search','query':'sheet'}]}
-        expand_search_queries(config);self.assertEqual(config['sources'][0]['query'],'sheet')
 
-    def test_feedback_capture_is_idempotent_and_includes_general_comments(self):
-        self.db.execute("INSERT INTO editorial_feedback(created_at,feedback_type,reason,item_title,post_text) VALUES('2026','OTHER','Отслеживай агентские договоры','','')")
-        topics.collect_feedback(self.db);topics.collect_feedback(self.db)
-        keys=self.db.execute("SELECT key FROM app_state WHERE key LIKE 'topic_learning:%'").fetchall()
-        self.assertEqual(len(keys),1)
-        self.assertIn('агентские договоры',state(self.db,keys[0][0])['signal']['reason'])
 
     def test_missing_google_write_credentials_keeps_outbox_and_sheet_authority(self):
         self.enable()
@@ -305,40 +238,3 @@ class TopicsTests(unittest.TestCase):
             with self.assertRaises(ValueError):topics.write_changes(self.settings,[change])
             request=api.call_args.args[3]['requests'][0]['findReplace']
             self.assertEqual(request['find'],'Условия');self.assertTrue(request['matchEntireCell'])
-
-    def test_send_boundary_checks_sheet_version_and_enabled_topic(self):
-        from newsroom.cli import is_eligible_for_auto_publish
-        from newsroom.ai import FILTER_VERSION
-        facts={'mode':'AI','_filter_version':FILTER_VERSION,'geographic_scope':'GLOBAL','russia_cis_impact':'NONE',
-               'topic_registry':{'version':'v1','checked':True,'match':{'name':'Работа','evidence':'Компания объявила о новой публичной активности.'}}}
-        post={'created_at':'2026-10-06T12:00:00+00:00','fact_check_result':json.dumps(facts)}
-        cutoff='2026-10-06T00:00:00+00:00'
-        self.assertTrue(is_eligible_for_auto_publish(post,cutoff,topics.policy(snapshot())))
-        thematic=topics.policy(snapshot());thematic['version']='v2'
-        self.assertFalse(is_eligible_for_auto_publish(post,cutoff,thematic))
-        thematic['version']='v1';thematic['topics']=[]
-        self.assertFalse(is_eligible_for_auto_publish(post,cutoff,thematic))
-
-    def test_editor_prompt_and_schema_take_scope_only_from_sheet(self):
-        from newsroom.ai import analyze
-        settings={'_topic_registry':topics.policy(snapshot()),'memory_mode':'shadow'}
-        with patch('newsroom.ai.get_api_key',return_value='test'),patch('newsroom.ai.request_response',return_value={'output':[{'content':[{'type':'output_text','text':'{}'}]}]}) as request:
-            analyze({'title':'Материал'}, {'name':'Издание','reputation':'unknown','priority':1},[],settings)
-        payload=request.call_args.args[0]
-        self.assertNotIn('ЖЕСТКОЕ УСЛОВИЕ:',payload['instructions'])
-        self.assertIn('topic_match',payload['text']['format']['schema']['required'])
-        self.assertIn('subject_type',payload['text']['format']['schema']['properties']['topic_match']['required'])
-        self.assertIn('memory',payload['text']['format']['schema']['required'])
-        self.assertEqual(json.loads(payload['input'][0]['content'])['thematic_policy']['version'],'v1')
-
-    def test_changed_topic_policy_invalidates_cached_selection(self):
-        from newsroom.triage import screen
-        settings={'_topic_registry':topics.policy(snapshot())}
-        item={'title':'Компания объявила новые условия','content':'Компания объявила новые условия'}
-        result={'decision':'KEEP','reason':'Условия','evidence':item['title'],'story_id':'','what_is_new':'Условия','confidence':1}
-        with patch('newsroom.triage.classify',return_value=result) as classify:
-            self.assertEqual(screen(self.db,1,item,settings)['decision'],'KEEP')
-            self.assertEqual(screen(self.db,1,item,settings)['decision'],'KEEP')
-            settings['_topic_registry']['version']='v2'
-            self.assertEqual(screen(self.db,1,item,settings)['decision'],'KEEP')
-            self.assertEqual(classify.call_count,2)

@@ -28,4 +28,3 @@ BEGIN SELECT RAISE(ABORT, 'rule snapshots are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS rule_snapshots_no_delete BEFORE DELETE ON rule_snapshots
 BEGIN SELECT RAISE(ABORT, 'rule snapshots are immutable'); END;
 """
-

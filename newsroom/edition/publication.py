@@ -12,6 +12,12 @@ def gate(db,document_id,text,post_id=None):
     if not doc or doc['state'] not in ('READY','SENDING','PUBLISHED'):raise DeliveryRejected('EDITION_NOT_READY')
     if post_id is not None and doc['post_id']!=post_id:raise DeliveryRejected('EDITION_POST_MISMATCH')
     draft=store.read(doc['draft_json'],{});materials=store.read(doc['materials_json'],[])
+    from .freshness import assess
+    origins=set(store.read(doc['group_json'],{}).get('material_ids',[]))
+    if any(assess(m)['decision']=='STALE' for m in materials if m['material_id'] in origins):
+        raise DeliveryRejected('EDITION_SOURCE_TOO_OLD')
+    from .language import issues as language_issues
+    if language_issues(draft):raise DeliveryRejected('EDITION_RUSSIAN_REQUIRED')
     rendered,plain=render(draft,materials)
     if rendered!=text or rendered!=doc['rendered_text'] or plain!=doc['plain_text']:raise DeliveryRejected('EDITION_TEXT_CHANGED')
     policy_hash=model.bundle()[2]
@@ -28,11 +34,22 @@ def gate(db,document_id,text,post_id=None):
     if not proof or proof['draft_hash']!=store.sha(draft) or proof['rendered_hash']!=store.sha(text) or proof['bundle_hash']!=policy_hash or proof['evidence_hash']!=store.sha(materials):
         raise DeliveryRejected('EDITION_PROOF_MISMATCH')
     review=store.read(proof['review_json'],{});mode=review.get('release_mode','CHECKED')
-    if mode=='SOURCE':
+    if mode in ('SHORT','SHORT_SOURCE'):
+        from .short_release import verify
+        try:verify(draft,store.read(proof['response_json'],{}),materials,store.read(doc['group_json'],{}))
+        except (ValueError,TypeError,KeyError) as exc:raise DeliveryRejected(str(exc)) from None
+    elif mode in ('SOURCE','TRANSLATED_SOURCE'):
         from .fallback import source_draft
-        if draft!=source_draft(store.read(doc['group_json'],{}),materials):raise DeliveryRejected('EDITION_SOURCE_TEXT_CHANGED')
-        if store.read(proof['response_json'],{}).get('kind')!='source_fallback':raise DeliveryRejected('EDITION_SOURCE_RECEIPT_MISSING')
-        physical={'headline_length','headline_emoji','paragraph','length','telegram_length','structure','sources'}
+        original=source_draft(store.read(doc['group_json'],{}),materials)
+        if mode=='SOURCE':
+            if draft!=original:raise DeliveryRejected('EDITION_SOURCE_TEXT_CHANGED')
+            if store.read(proof['response_json'],{}).get('kind')!='source_fallback':raise DeliveryRejected('EDITION_SOURCE_RECEIPT_MISSING')
+        else:
+            translation=db.execute('SELECT draft_json,receipt_json FROM edition_source_translations WHERE source_hash=? AND bundle_hash=?',(store.sha(original),policy_hash)).fetchone()
+            receipt=store.read(translation['receipt_json'],{}) if translation else {}
+            if not translation or draft!=store.read(translation['draft_json'],{}) or receipt!=store.read(proof['response_json'],{}) or receipt.get('kind')!='translated_source' or not receipt.get('translation_receipt',{}).get('response_id') or not receipt.get('check_receipt',{}).get('response_id') or receipt.get('verdict')!={'approved':True,'issues':[]}:
+                raise DeliveryRejected('EDITION_TRANSLATION_PROOF_MISSING')
+        physical={'language','headline_length','headline_emoji','paragraph','length','telegram_length','structure','sources','facts','evidence','scope'}
         if any(i['code'] in physical for i in validate(draft,materials,store.read(doc['group_json'],{}))):
             raise DeliveryRejected('EDITION_SOURCE_FORMAT_INVALID')
     else:
@@ -67,20 +84,42 @@ def published(db,doc,config,message_id):
     seconds=(datetime.fromisoformat(now)-datetime.fromisoformat(min(received) if received else job[0])).total_seconds()
     store.event(db,doc['job_id'],'published',{'message_id':str(message_id),'received_to_channel_seconds':seconds},doc['document_id'])
     state=db.execute('SELECT state FROM edition_jobs WHERE job_id=?',(doc['job_id'],)).fetchone()[0]
-    if state in ('READY','INCOMPLETE') and not db.execute("SELECT 1 FROM edition_documents WHERE job_id=? AND state NOT IN ('PUBLISHED','FILTERED')",(doc['job_id'],)).fetchone():
-        store.finish(db,doc['job_id'],'PUBLISHED',[])
+    if state in ('READY','INCOMPLETE') and all(s in ('PUBLISHED','FILTERED') for s in store.document_states(db,doc['job_id'])):
+        reasons=db.execute('SELECT reasons_json FROM edition_jobs WHERE job_id=?',(doc['job_id'],)).fetchone()[0]
+        store.finish(db,doc['job_id'],'PUBLISHED',store.read(reasons,[]))
     return str(message_id)
 
 
 def publish_document(db,document_id,config,*,send=None):
     doc=db.execute('SELECT * FROM edition_documents WHERE document_id=?',(document_id,)).fetchone()
     if not doc:raise ValueError('EDITION_DOCUMENT_MISSING')
+    if doc['state'] in ('DUPLICATE','FILTERED'):return None
     if doc['state']=='UNKNOWN':
         return None
+    if doc['state'] in ('LANGUAGE_PENDING','SHORT_PENDING'):return None
+    if doc['state']=='COVERED':
+        related=db.execute('SELECT d.state,p.external_id FROM edition_source_coverage c JOIN edition_documents d ON d.document_id=c.covered_by LEFT JOIN posts p ON p.post_id=d.post_id WHERE c.document_id=?',(document_id,)).fetchone()
+        return related['external_id'] if related and related['state']=='PUBLISHED' else None
     if doc['state']=='PUBLISHED':
         return db.execute('SELECT external_id FROM posts WHERE post_id=?',(doc['post_id'],)).fetchone()[0]
+    from .freshness import protect_document
+    if not protect_document(db,doc):return None
     try:
         doc,proof=gate(db,document_id,doc['rendered_text'])
+        if store.read(proof['review_json'],{}).get('release_mode') in ('SOURCE','TRANSLATED_SOURCE','SHORT','SHORT_SOURCE') and doc['post_id'] is None:
+            # Only identical source releases in this frozen job are covered.
+            # Genuine different stories from one source retain their own delivery.
+            candidates=db.execute("SELECT d.*,c.review_json FROM edition_documents d JOIN edition_checks c ON c.check_id=(SELECT MAX(check_id) FROM edition_checks WHERE document_id=d.document_id AND passed=1) WHERE d.job_id=? AND d.document_id<>? AND d.state IN ('READY','SENDING','UNKNOWN','PUBLISHED') AND d.rendered_text=? ORDER BY d.created_at,d.document_id",(doc['job_id'],document_id,doc['rendered_text'])).fetchall()
+            representative=next((r for r in candidates if store.read(r['review_json'],{}).get('release_mode') in ('SOURCE','TRANSLATED_SOURCE','SHORT','SHORT_SOURCE') and
+                (r['state'] in ('SENDING','UNKNOWN','PUBLISHED') or (r['created_at'],r['document_id'])<(doc['created_at'],document_id))),None)
+            if representative:
+                reason={'code':'source_duplicate','reason':'Идентичный резервный текст покрыт одним выпуском.',
+                        'covered_by':representative['document_id'],'material_ids':store.read(doc['group_json'],{}).get('material_ids',[])}
+                db.execute('INSERT OR IGNORE INTO edition_source_coverage VALUES(?,?,?)',(document_id,representative['document_id'],store.stamp()))
+                reasons=store.read(doc['reasons_json'],[])+[reason]
+                db.execute("UPDATE edition_documents SET state='COVERED',reasons_json=?,updated_at=? WHERE document_id=?",(store.encoded(reasons),store.stamp(),document_id));db.commit()
+                store.event(db,doc['job_id'],'source_covered',reason,document_id)
+                return publish_document(db,document_id,config,send=send)
         if doc['post_id'] is None:
             now=store.stamp();draft=store.read(doc['draft_json'],{});group=store.read(doc['group_json'],{})
             sources=store.read(doc['materials_json'],[]);origin=next(m for m in sources if m['material_id'] in group['material_ids'])
