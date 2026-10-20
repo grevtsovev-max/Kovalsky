@@ -1,0 +1,58 @@
+--- a/newsroom/cli.py
++++ b/newsroom/cli.py
+@@ -229,7 +229,10 @@
+     # SQLite write collision must not kill in-flight editorial/API work.
+     import sqlite3
+     try:
+-        return run_one_cycle(config, db_path)
++        result = run_one_cycle(config, db_path)
++        if persistent:
++            _handoff_collection(config, db_path)
++        return result
+     except sqlite3.OperationalError as exc:
+         code = getattr(exc, 'sqlite_errorcode', None)
+         busy = ((code is not None and (code & 255) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+@@ -238,6 +241,20 @@
+             raise
+         print('Сбор отложен: база временно занята.', flush=True)
+         return None
++
++
++def _handoff_collection(config, db_path):
++    """Freeze completed collection before its lock is handed to the next cycle."""
++    if config.get('editorial', {}).get('enabled') is not True:
++        return None
++    require_enabled(config)
++    from .edition import model, store
++    db = connect(db_path)
++    try:
++        store.initialize(db)
++        return store.start(db, model.bundle()[2])
++    finally:
++        db.close()
+ 
+ 
+ def _safe_error_label(message: str) -> str:
+--- a/newsroom/edition/worker.py
++++ b/newsroom/edition/worker.py
+@@ -82,12 +82,14 @@
+         for doc in db.execute("SELECT document_id FROM edition_documents WHERE state='READY' ORDER BY created_at").fetchall():
+             if publish:publish_document(db,doc[0],config,send=send)
+         from ..locking import acquire_cycle_lock
+-        cohort_lock=acquire_cycle_lock(config['newsroom']['database'])
+-        if cohort_lock is None:return None
+-        try:
+-            job=db.execute("SELECT job_id FROM edition_jobs WHERE state='SCREENING' OR (state='QUEUED' AND retry_of IS NOT NULL) ORDER BY created_at LIMIT 1").fetchone()
+-            job_id=job[0] if job else store.start(db,model.bundle()[2])
+-        finally:cohort_lock.close()
++        job=db.execute("SELECT job_id FROM edition_jobs WHERE state='SCREENING' OR (state='QUEUED' AND retry_of IS NOT NULL) ORDER BY created_at LIMIT 1").fetchone()
++        job_id=job[0] if job else None
++        if job_id is None:
++            cohort_lock=acquire_cycle_lock(config['newsroom']['database'])
++            if cohort_lock is None:return None
++            try:
++                job_id=store.start(db,model.bundle()[2])
++            finally:cohort_lock.close()
+         if job_id:
+             return process(db,job_id,settings,send=send,publish=publish)
+         store.archive_step(db)

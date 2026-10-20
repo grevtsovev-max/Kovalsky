@@ -164,12 +164,39 @@ def _public_host_addresses(host: str, port: int = 443) -> list[str]:
     return sorted(addresses)
 
 
-def _validate_public_http_url(url: str) -> None:
+def _validate_public_http_url(url: str, *, allow_http: bool = False) -> None:
     parsed = urllib.parse.urlsplit(url)
-    if (parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password
-            or parsed.port not in (None, 443)):
+    scheme = parsed.scheme.lower()
+    port = {"https": 443, "http": 80}.get(scheme)
+    if (scheme not in ({"http", "https"} if allow_http else {"https"})
+            or not parsed.hostname or parsed.username or parsed.password
+            or parsed.port not in (None, port)):
         raise ValueError("URL_NOT_ALLOWED")
-    _public_host_addresses(parsed.hostname)
+    _public_host_addresses(parsed.hostname, port)
+
+
+class _PublicHttpConnection(http.client.HTTPConnection):
+    def connect(self):
+        if self.port != 80 or self._tunnel_host:
+            raise ValueError("URL_NOT_ALLOWED")
+        addresses = _public_host_addresses(self.host, self.port)
+        deadline = time.monotonic() + float(self.timeout)
+        for index, address in enumerate(addresses):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("PUBLIC_CONNECTION_TIMEOUT")
+            try:
+                self.sock = socket.create_connection(
+                    (address, self.port), remaining / (len(addresses) - index), self.source_address)
+                return
+            except OSError:
+                if index == len(addresses) - 1:
+                    raise
+
+
+class _PublicHttpHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PublicHttpConnection, req)
 
 
 class _PublicHttpsConnection(http.client.HTTPSConnection):
@@ -212,22 +239,25 @@ class _PublicHttpsHandler(urllib.request.HTTPSHandler):
 
 
 class _PublicHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, *, allow_http=False):
+        self.allow_http = allow_http
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urllib.parse.urljoin(req.full_url, newurl)
-        _validate_public_http_url(target)
+        _validate_public_http_url(target, allow_http=self.allow_http)
         if urllib.parse.urlsplit(req.full_url).scheme.lower() == "https" and urllib.parse.urlsplit(target).scheme.lower() != "https":
             raise ValueError("HTTPS_REDIRECT_DOWNGRADE")
         return super().redirect_request(req, fp, code, msg, headers, target)
 
 
 def _request_with_url(url: str, timeout: int = 20, public_only: bool = False) -> tuple[bytes, str, str]:
-    if public_only:
-        _validate_public_http_url(url)
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _PublicHttpsHandler(context=TLS_CONTEXT),
-            _PublicHttpsRedirectHandler())
-    else:
-        opener = None
+    # All source traffic is public-only. The legacy flag retains the stricter
+    # HTTPS policy for manual intake and registry probes, never a safety bypass.
+    _validate_public_http_url(url, allow_http=not public_only)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _PublicHttpHandler(),
+        _PublicHttpsHandler(context=TLS_CONTEXT),
+        _PublicHttpsRedirectHandler(allow_http=not public_only))
     request_headers = [
         {"User-Agent": "KovalskyNewsroom/0.1 (+RSS reader)", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*"},
         {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -237,8 +267,7 @@ def _request_with_url(url: str, timeout: int = 20, public_only: bool = False) ->
     for attempt, headers in enumerate(request_headers):
         req = urllib.request.Request(url, headers=headers)
         try:
-            response_context = (opener.open(req, timeout=timeout) if opener else
-                                urllib.request.urlopen(req, timeout=timeout, context=TLS_CONTEXT))
+            response_context = opener.open(req, timeout=timeout)
             with response_context as response:
                 payload = response.read(10_000_001)
                 if len(payload) > 10_000_000:
@@ -1112,6 +1141,9 @@ def fetch_rss(url: str) -> list[dict]:
     if not entries:
         entries = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "entry"]
     result = []
+    feed = urllib.parse.urlsplit(url)
+    cbr_decisions = (feed.hostname in {"cbr.ru", "www.cbr.ru"}
+                     and feed.path.rstrip("/").lower() == "/rss/rbr")
     for node in entries:
         fields = {child.tag.rsplit("}", 1)[-1].lower(): child for child in node}
         def val(*names: str) -> str:
@@ -1123,6 +1155,13 @@ def fetch_rss(url: str) -> list[dict]:
                     return " ".join(child.itertext()).strip()
             return ""
         link = val("link", "guid", "id")
+        # CBR decisions use opaque RSS GUIDs and omit <link>. Resolve only
+        # this documented feed's msg_N identifiers to individual decisions.
+        if cbr_decisions and not val("link"):
+            match = re.fullmatch(r"msg_(\d+)", val("guid"))
+            if not match:
+                continue
+            link = "https://www.cbr.ru/rbr/rbr_fr/doc?id=" + match[1]
         if not link:
             continue
         content = val("encoded", "content", "description", "summary")
@@ -1131,6 +1170,15 @@ def fetch_rss(url: str) -> list[dict]:
                        "content": re.sub(r"\s+", " ", content).strip(), "author": val("author", "creator"),
                        "published_at": parse_date(val("pubdate", "published", "updated", "date")),
                        "updated_at": parse_date(val("updated"))})
+        if cbr_decisions and result[-1]["content"]:
+            # This first-party feed contains the complete decision. The HTML
+            # document may expose only a heading to generic article readers.
+            result[-1].update(description=result[-1]["content"], material_read=True,
+                              material_url=link, publisher_name="Банк России",
+                              primary_source_url=link, primary_source_title=result[-1]["title"],
+                              primary_source_content=result[-1]["content"],
+                              primary_source_type="OFFICIAL", primary_source_publisher="Банк России",
+                              primary_source_status="READ")
     return result
 
 
@@ -1747,11 +1795,16 @@ def _run_cycle(config, db, cleanup):
         since = source["recovery_since"] or source["last_seen_published_at"] or (
             datetime.now(timezone.utc) - timedelta(hours=config["newsroom"].get("freshness_window_hours", 24))
         ).isoformat(timespec="seconds")
-        if source_cfg.get("telegram_transport", "preview") == "api":
+        if source_cfg.get("telegram_transport", config.get("telegram_reader", {}).get("default_transport", "preview")) == "api":
             from .telegram_reader import fetch
-            return fetch(source["url"], config.get("telegram_reader", {}), since=since,
-                         before=source["recovery_before"],
-                         max_pages=config["newsroom"].get("telegram_recovery_pages", 5))
+            try:
+                return fetch(source["url"], config.get("telegram_reader", {}), since=since,
+                             before=source["recovery_before"],
+                             max_pages=config["newsroom"].get("telegram_recovery_pages", 5))
+            except ValueError as exc:
+                if str(exc) != "TELEGRAM_API_RATE_LIMITED":
+                    raise
+                _log_timing("telegram_api_cooldown", source=source["name"], transport="preview")
         return fetch_telegram(source["url"], since=since, before=source["recovery_before"],
                               max_pages=config["newsroom"].get("telegram_recovery_pages", 5))
 

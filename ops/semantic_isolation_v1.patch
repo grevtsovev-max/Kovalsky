@@ -1,0 +1,86 @@
+--- a/newsroom/edition/semantic_filter.py
++++ b/newsroom/edition/semantic_filter.py
+@@ -9,6 +9,21 @@
+     db.executescript(vacancies.SCHEMA)
+     from .freshness import admit
+     materials,date_excluded=admit(db,materials)
++    # Intake ran before article reading. Check exclusions against the saved
++    # full text as well, before cached semantic decisions or source recovery.
++    from ..keyword_filter import apply_negatives
++    negative_excluded=[]; admitted=[]
++    spec=settings.get('_keyword_prefilter') or {}
++    for material in materials:
++        body='\n'.join(str(material.get(k) or '') for k in ('title','description','content'))
++        result=apply_negatives({'passed':True},body,material.get('title',''),spec)
++        if result.get('matched_negative_keyword'):
++            exclusion={'material_id':material['material_id'],'kind':'out_of_scope',
++                       'code':'negative_keyword','reason':result['reason']}
++            negative_excluded.append(exclusion)
++            store.event(db,job_id,'negative_keyword_rejection',{**exclusion,'filter':result})
++        else:admitted.append(material)
++    materials=admitted
+     # Runtime reserves AI usage through another SQLite connection. Even an
+     # INSERT OR IGNORE in freshness.admit holds the writer lock until commit.
+     # Finish local admission before any external request or budget reservation.
+@@ -37,16 +52,6 @@
+             entries=result.get('decisions',[])
+             if len(entries)!=len(known) or {e.get('material_id') for e in entries}!=set(known):
+                 raise ValueError('EDITION_SEMANTIC_COVERAGE')
+-            for entry in entries:
+-                vacancies.validate(entry,known[entry['material_id']])
+-                if entry.get('decision') not in ('allow','reject','uncertain') or not entry.get('reason'):
+-                    raise ValueError('EDITION_INVALID_SEMANTIC_DECISION')
+-                if any(e.get('material_id')!=entry['material_id'] or not contains(known[entry['material_id']],e.get('quote')) for e in entry.get('evidence',[])):
+-                    raise ValueError('EDITION_UNGROUNDED_SEMANTIC_EVIDENCE')
+-                if entry['decision']=='reject' and (not entry.get('evidence') or any(
+-                    e.get('material_id')!=entry['material_id'] or not contains(known[entry['material_id']],e.get('quote'))
+-                    for e in entry['evidence'])):
+-                    raise ValueError('EDITION_UNGROUNDED_SEMANTIC_REJECTION')
+         except Exception as exc:
+             # Unavailability is not evidence of irrelevance. Preserve the error;
+             # planner/checker still apply the same event-level exclusion.
+@@ -58,14 +63,26 @@
+                       'reason':'Смысловой отбор недоступен; решение не подтверждено.','evidence':[]} for m in batch]
+             receipt={'kind':'semantic_unavailable'}
+         for entry in entries:
++            entry_receipt=receipt
++            if receipt.get('kind')!='semantic_unavailable':
++                try:
++                    _validate_entry(entry,known[entry['material_id']])
++                except Exception as exc:
++                    code=getattr(exc,'code',None) or (str(exc) if re.fullmatch(r'EDITION_[A-Z_]+',str(exc)) else type(exc).__name__)
++                    store.event(db,job_id,'semantic_error',{'code':code,
++                        'sqlite_errorname':getattr(exc,'sqlite_errorname',None),
++                        'material_ids':[entry['material_id']]})
++                    entry={'material_id':entry['material_id'],'decision':'uncertain',
++                           'reason':'Смысловой отбор недоступен; решение не подтверждено.','evidence':[]}
++                    entry_receipt={'kind':'semantic_unavailable'}
+             db.execute('INSERT INTO edition_semantic_decisions VALUES(?,?,?,?,?) ON CONFLICT(material_id,bundle_hash) DO UPDATE SET result_json=excluded.result_json,receipt_json=excluded.receipt_json,created_at=excluded.created_at',
+-                       (entry['material_id'],digest,store.encoded(entry),store.encoded(receipt),store.stamp()))
++                       (entry['material_id'],digest,store.encoded(entry),store.encoded(entry_receipt),store.stamp()))
+             decisions[entry['material_id']]=entry
+         db.commit()
+     excluded=[{'material_id':mid,'kind':'out_of_scope','code':entry.get('rule_code','onchain_noise'),
+                'reason':entry['reason'],'evidence':entry.get('evidence',[])}
+               for mid,entry in decisions.items() if entry['decision']=='reject']
+-    excluded=date_excluded+excluded
++    excluded=date_excluded+negative_excluded+excluded
+     if excluded:
+         job=db.execute('SELECT reasons_json FROM edition_jobs WHERE job_id=?',(job_id,)).fetchone()
+         reasons=store.read(job[0],[])
+@@ -79,3 +96,15 @@
+             excluded.append({'material_id':material['material_id'],'kind':'out_of_scope','code':'vacancy_inbox','reason':'Объявление сохранено отдельно для подборок; в новостной выпуск не направляется.'})
+         elif entry['decision']!='reject':allowed.append(routed)
+     return allowed,excluded
++
++def _validate_entry(entry,material):
++    from . import vacancies
++    vacancies.validate(entry,material)
++    if entry.get('decision') not in ('allow','reject','uncertain') or not entry.get('reason'):
++        raise ValueError('EDITION_INVALID_SEMANTIC_DECISION')
++    if any(e.get('material_id')!=entry['material_id'] or not contains(material,e.get('quote')) for e in entry.get('evidence',[])):
++        raise ValueError('EDITION_UNGROUNDED_SEMANTIC_EVIDENCE')
++    if entry['decision']=='reject' and (not entry.get('evidence') or any(
++        e.get('material_id')!=entry['material_id'] or not contains(material,e.get('quote'))
++        for e in entry['evidence'])):
++        raise ValueError('EDITION_UNGROUNDED_SEMANTIC_REJECTION')

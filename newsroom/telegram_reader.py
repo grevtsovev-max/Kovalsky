@@ -3,10 +3,15 @@ import asyncio
 import getpass
 import re
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+
+# Bound simultaneous connections even when the collector uses twelve workers.
+_API_SLOTS = threading.BoundedSemaphore(1)
 
 def _settings(settings):
     api_id = os.environ.get(settings.get('api_id_env', 'TELEGRAM_API_ID'), '')
@@ -37,16 +42,16 @@ async def _read(channel, settings, since, before, max_pages):
     _, _, session = _settings(settings)
     if not session.is_file():
         raise ValueError('TELEGRAM_API_AUTHORIZATION_REQUIRED')
-    # Copy authorization into memory: concurrent readers never write the session database.
-    from telethon.sessions import SQLiteSession, MemorySession
-    stored = SQLiteSession(str(session))
-    memory = MemorySession()
+    cooldown = session.with_suffix('.cooldown')
     try:
-        memory.set_dc(stored.dc_id, stored.server_address, stored.port)
-        memory.auth_key = stored.auth_key
-    finally:
-        stored.close()
-    client = _client(settings, memory)
+        until = float(cooldown.read_text())
+    except FileNotFoundError:
+        until = 0
+    if until > time.time():
+        raise ValueError('TELEGRAM_API_RATE_LIMITED')
+    # One connection owns the session at a time. Persist entity/access-hash cache
+    # so subsequent cycles need no repeated ResolveUsername calls.
+    client = _client(settings, session)
     batch = TelegramBatch()
     cutoff = datetime.fromisoformat(since.replace('Z', '+00:00')) if since else None
     if cutoff and cutoff.tzinfo is None:
@@ -58,12 +63,34 @@ async def _read(channel, settings, since, before, max_pages):
         account = await client.get_me()
         if getattr(account, 'bot', False):
             raise ValueError('TELEGRAM_API_USER_ACCOUNT_REQUIRED')
-        entity = await client.get_entity(channel)
-        if not getattr(entity, 'broadcast', False) or not getattr(entity, 'username', None):
+        try:
+            entity = client.session.get_input_entity(channel)
+        except ValueError:
+            # New usernames are resolved gently; known channels use the durable cache.
+            resolved_at = session.with_suffix('.resolve-at')
+            try:
+                delay = max(0, float(resolved_at.read_text()) + 2 - time.time())
+            except FileNotFoundError:
+                delay = 0
+            if delay:
+                await asyncio.sleep(delay)
+            resolved_at.write_text(str(time.time()))
+            resolved_at.chmod(0o600)
+            entity = await client.get_input_entity(channel)
+        if type(entity).__name__ != 'InputPeerChannel':
             raise ValueError('TELEGRAM_API_PUBLIC_CHANNEL_REQUIRED')
         async def page(offset):
             oldest = None
             reached = False
+            history_at = session.with_suffix('.history-at')
+            try:
+                delay = max(0, float(history_at.read_text()) + 3 - time.time())
+            except FileNotFoundError:
+                delay = 0
+            if delay:
+                await asyncio.sleep(delay)
+            history_at.write_text(str(time.time()))
+            history_at.chmod(0o600)
             async for message in client.iter_messages(entity, limit=100, offset_id=offset):
                 oldest = message.id
                 if cutoff and message.date < cutoff:
@@ -72,7 +99,7 @@ async def _read(channel, settings, since, before, max_pages):
                 text = message.message or ''
                 if not text:
                     continue
-                url = f'https://t.me/{entity.username}/{message.id}'
+                url = f'https://t.me/{channel}/{message.id}'
                 links = []
                 for item in message.entities or []:
                     href = getattr(item, 'url', None)
@@ -92,8 +119,8 @@ async def _read(channel, settings, since, before, max_pages):
         for index in range(max(2, int(max_pages))):
             try:
                 oldest, reached = await page(cursor)
-            except Exception:
-                if not cursor:
+            except Exception as exc:
+                if type(exc).__name__ == 'FloodWaitError' or not cursor:
                     raise
                 batch.recovery_before = cursor
                 batch.recovery_error = 'TELEGRAM_API_READ_FAILED'
@@ -107,6 +134,15 @@ async def _read(channel, settings, since, before, max_pages):
                 cursor = oldest
             batch.recovery_before = cursor
         return batch
+    except Exception as exc:
+        if type(exc).__name__ == 'FloodWaitError':
+            from .core import _log_timing
+            _log_timing('telegram_api_rate_limit', seconds=int(exc.seconds),
+                        request=type(getattr(exc, 'request', None)).__name__)
+            cooldown.write_text(str(time.time() + max(1, int(exc.seconds))))
+            cooldown.chmod(0o600)
+            raise ValueError('TELEGRAM_API_RATE_LIMITED') from None
+        raise
     finally:
         await client.disconnect()
 
@@ -114,10 +150,54 @@ async def _read(channel, settings, since, before, max_pages):
 def fetch(channel_url, settings, since=None, before=None, max_pages=5):
     channel = urlsplit(channel_url).path.strip('/').split('/')[-1]
     try:
-        return asyncio.run(asyncio.wait_for(_read(channel, settings, since, before, max_pages),
-                                          timeout=float(settings.get('timeout_seconds', 45))))
-    except (ValueError, TimeoutError):
+        timeout = float(settings.get('timeout_seconds', 45))
+        if not _API_SLOTS.acquire(timeout=timeout):
+            raise TimeoutError('TELEGRAM_API_QUEUE_TIMEOUT')
+        try:
+            return asyncio.run(asyncio.wait_for(_read(channel, settings, since, before, max_pages),
+                                              timeout=timeout))
+        finally:
+            _API_SLOTS.release()
+    except (asyncio.TimeoutError,TimeoutError):
+        raise TimeoutError('TELEGRAM_API_READ_TIMEOUT') from None
+    except ValueError:
         raise
+    except Exception:
+        raise ValueError('TELEGRAM_API_READ_FAILED') from None
+
+
+async def _delivery_message(target,message_id,settings):
+    """Read one exact message; no updates consumer and no changes to the session."""
+    _,_,session=_settings(settings)
+    if not session.is_file():raise ValueError('TELEGRAM_API_AUTHORIZATION_REQUIRED')
+    from telethon.sessions import SQLiteSession,MemorySession
+    from telethon.utils import get_peer_id
+    stored=SQLiteSession(str(session));memory=MemorySession()
+    try:memory.set_dc(stored.dc_id,stored.server_address,stored.port);memory.auth_key=stored.auth_key
+    finally:stored.close()
+    client=_client(settings,memory)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():raise ValueError('TELEGRAM_API_AUTHORIZATION_REQUIRED')
+        entity=await client.get_entity(int(target) if target.lstrip('-').isdigit() else target)
+        if not getattr(entity,'broadcast',False):raise ValueError('TELEGRAM_CHANNEL_REQUIRED')
+        identity={'id':get_peer_id(entity),'username':getattr(entity,'username',None)}
+        if target!=str(identity['id']) and target.casefold()!='@'+str(identity['username']).casefold():
+            raise ValueError('TELEGRAM_CHANNEL_IDENTITY_MISMATCH')
+        message=await client.get_messages(entity,ids=int(message_id))
+        if not message or not message.message:return []
+        return [{'message_id':message.id,'date':int(message.date.timestamp()),'chat':identity,
+                 'text':message.message,'_source_urls':[e.url for e in message.entities or [] if getattr(e,'url',None)]}]
+    finally:await client.disconnect()
+
+
+def delivery_message(target,message_id,settings):
+    try:
+        return asyncio.run(asyncio.wait_for(_delivery_message(str(target),int(message_id),settings),
+                                           timeout=float(settings.get('timeout_seconds',45))))
+    except (asyncio.TimeoutError,TimeoutError):
+        raise TimeoutError('TELEGRAM_API_READ_TIMEOUT') from None
+    except ValueError:raise
     except Exception:
         raise ValueError('TELEGRAM_API_READ_FAILED') from None
 

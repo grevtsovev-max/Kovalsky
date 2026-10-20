@@ -82,12 +82,14 @@ def run_once(config,*,send=None,publish=True):
         for doc in db.execute("SELECT document_id FROM edition_documents WHERE state='READY' ORDER BY created_at").fetchall():
             if publish:publish_document(db,doc[0],config,send=send)
         from ..locking import acquire_cycle_lock
-        cohort_lock=acquire_cycle_lock(config['newsroom']['database'])
-        if cohort_lock is None:return None
-        try:
-            job=db.execute("SELECT job_id FROM edition_jobs WHERE state='SCREENING' OR (state='QUEUED' AND retry_of IS NOT NULL) ORDER BY created_at LIMIT 1").fetchone()
-            job_id=job[0] if job else store.start(db,model.bundle()[2])
-        finally:cohort_lock.close()
+        job=db.execute("SELECT job_id FROM edition_jobs WHERE state='SCREENING' OR (state='QUEUED' AND retry_of IS NOT NULL) ORDER BY created_at LIMIT 1").fetchone()
+        job_id=job[0] if job else None
+        if job_id is None:
+            cohort_lock=acquire_cycle_lock(config['newsroom']['database'])
+            if cohort_lock is None:return None
+            try:
+                job_id=store.start(db,model.bundle()[2])
+            finally:cohort_lock.close()
         if job_id:
             return process(db,job_id,settings,send=send,publish=publish)
         store.archive_step(db)

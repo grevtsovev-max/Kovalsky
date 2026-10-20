@@ -141,6 +141,10 @@ def _review(db,document,draft,materials,settings):
             store.event(db,document['job_id'],'review_response',{'verdict':exc.review,'receipt':exc.receipt,'draft_hash':store.sha(draft),'error':exc.code},document['document_id'])
         raise
     store.event(db,document['job_id'],'review_response',{'verdict':verdict,'receipt':receipt,'draft_hash':store.sha(draft)},document['document_id'])
+    update_issues=publication_history.update_issues(verdict,history,materials,group,draft)
+    if update_issues:
+        verdict={**verdict,'approved':False,'issues':[*verdict.get('issues',[]),*update_issues]}
+        store.event(db,document['job_id'],'publication_update_invalid',{'issues':update_issues},document['document_id'])
     verdict=model.reconcile_review(verdict,draft,materials)
     model.validate_review(verdict)
     if verdict.get('source_scope')=='out_of_scope':

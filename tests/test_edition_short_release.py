@@ -30,6 +30,38 @@ class ShortReleaseTests(EditionCase):
                         ('short-test',job,store.encoded(group(self.mid)),store.encoded(materials),now,now))
         self.db.commit();return self.db.execute('SELECT * FROM edition_documents').fetchone()
 
+    def test_forklog_navigation_is_never_selected_as_offline_lead(self):
+        headline='В Южной Корее начали выдавать кредиты под залог биткоина'
+        fact='Южнокорейский Jeonbuk Bank первым среди банков страны начал выдавать бизнесу кредиты в вонах под залог первой криптовалюты.'
+        source='Искусственный интеллект\nДайджест месяца\nКорпораты\nЦены криптовалют\nСпецпроекты\nНовости\n'+headline+'\n'+fact+'\nМы используем файлы cookie для улучшения качества работы.'
+        mid=self.material(text=source,title=headline)
+        selected={**group(mid),'focus':[{'material_id':mid,'scope':source,'excerpt':source}]}
+        materials=store.materials(self.db,[mid])
+        result=short_release.extractive(selected,materials)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['headline'],'📰 '+headline)
+        self.assertEqual(result['lead'],fact)
+        self.assertEqual(short_release.problems(result,materials,selected),[])
+        short_release.verify(result,{'kind':'short_source','group_hash':store.sha(selected)},materials,selected)
+        bad={**result,'lead':'Искусственный интеллект',
+             'lead_evidence':[{'material_id':mid,'quote':'Искусственный интеллект'}]}
+        with self.assertRaisesRegex(ValueError,'EDITION_SHORT_SOURCE_CHANGED'):
+            short_release.verify(bad,{'kind':'short_source','group_hash':store.sha(selected)},materials,selected)
+
+    def test_offline_label_guard_preserves_verbless_access_conditions(self):
+        source='Банк запустил сервис переводов. Сервис работает в пяти сетях. Доступ только для квалифицированных инвесторов.'
+        mid=self.material(text=source,title='Банк запустил сервис переводов')
+        selected={**group(mid),'focus':[{'material_id':mid,'scope':source,'excerpt':source}]}
+        result=short_release.extractive(selected,store.materials(self.db,[mid]))
+        self.assertIsNotNone(result)
+        self.assertIn('Доступ только для квалифицированных инвесторов.',[b['text'] for b in result['blocks']])
+
+    def test_service_prose_and_labels_cannot_supply_offline_news(self):
+        for source in ('Искусственный интеллект\nЦены криптовалют\nНовости',
+                       'Мы используем файлы cookie для улучшения качества работы. Пользуясь сайтом, вы соглашаетесь с Политикой приватности.'):
+            mid=self.material(text=source,title='Новости криптовалют')
+            self.assertIsNone(short_release.extractive(group(mid),store.materials(self.db,[mid])))
+
     def test_model_headline_bold_markers_do_not_leak_into_telegram(self):
         from newsroom.edition.formatting import render
         candidate=copy.deepcopy(self.candidate)

@@ -1,0 +1,9 @@
+{
+  "newsroom/edition/semantic_filter.py": "00cabb253a25f5b33beee588753a09eb56f9af9bfcc6b589d546676ef8d7160e",
+  "newsroom/edition/model.py": "36121cb87e128380c2a2746998c64a1561d301f91807b5d56b85bf568106abad",
+  "newsroom/edition/publication_history.py": "f6acfae75d6164cc06d69085a05176691988da6c4bc57a817e1162be0d9f9e32",
+  "newsroom/edition/pipeline.py": "8be2e174429dea16fa08fcd7e17ec458f9f90bac8164ffcab3ff3975468e7423",
+  "newsroom/edition/short_release.py": "15f6c25d798d87f3be57c3d8f6e8a47472ad276cff2ec109c7a825feee8b517e",
+  "AGENT_LOGIC.md": "e9e85241167ef9ca343876e6a481f4790861cd24cea8b1616e9e0c7028ebbb9f",
+  "EDITORIAL_RULES.md": "8ea6140e8eca5ada5d0a2542cee0c9aef38f4516a32485114dbf30f486b2cdc3"
+}

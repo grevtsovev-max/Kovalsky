@@ -1,0 +1,7 @@
+{
+  "newsroom/edition/ranking.py": null,
+  "newsroom/edition/digests.py": "2b6e35bed909e01da54296aa9cbf35d7234764f1dff4e693b93408f38511186e",
+  "newsroom/cabinet_pipeline.py": "6a0b9b48495d067cf0229a0c7d2533ea0333788013d7b570a146ce0e64de5506",
+  "newsroom/cabinet_page.py": "149e46d356243e708082a0623e1ecdcabdc6c9338a60f4e3ae1317c73e9e3257",
+  "newsroom/cabinet_server.py": "d770cf8842b597f4ed86fa9556ce7e1975e42b733c93489b9b04074c3d85f8df"
+}

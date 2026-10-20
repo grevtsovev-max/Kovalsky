@@ -1,0 +1,199 @@
+--- a/newsroom/edition/semantic_filter.py
++++ b/newsroom/edition/semantic_filter.py
+@@ -1,4 +1,5 @@
+ """Durable semantic admission before any editorial model work."""
++import re
+ from . import model,store
+ from .formatting import contains
+ 
+@@ -8,12 +9,18 @@
+     db.executescript(vacancies.SCHEMA)
+     from .freshness import admit
+     materials,date_excluded=admit(db,materials)
++    # Runtime reserves AI usage through another SQLite connection. Even an
++    # INSERT OR IGNORE in freshness.admit holds the writer lock until commit.
++    # Finish local admission before any external request or budget reservation.
++    db.commit()
+     digest=model.bundle()[2]
+     decisions={};pending=[]
+     for material in materials:
+-        row=db.execute('SELECT result_json FROM edition_semantic_decisions WHERE material_id=? AND bundle_hash=?',
++        row=db.execute('SELECT result_json,receipt_json FROM edition_semantic_decisions WHERE material_id=? AND bundle_hash=?',
+                        (material['material_id'],digest)).fetchone()
+-        if row and (store.read(row[0],{}).get('decision')=='reject' or not vacancies.candidate(material) or 'content_kind' in store.read(row[0],{})):decisions[material['material_id']]=store.read(row[0],{})
++        cached=store.read(row[0],{}) if row else {}
++        unavailable=row and store.read(row[1],{}).get('kind')=='semantic_unavailable'
++        if row and not unavailable and (cached.get('decision')=='reject' or not vacancies.candidate(material) or 'content_kind' in cached):decisions[material['material_id']]=cached
+         else:pending.append(material)
+     # Bound transport, not source text: a long article is never truncated.
+     batches=[];batch=[];size=0
+@@ -43,7 +50,10 @@
+         except Exception as exc:
+             # Unavailability is not evidence of irrelevance. Preserve the error;
+             # planner/checker still apply the same event-level exclusion.
+-            store.event(db,job_id,'semantic_error',{'code':getattr(exc,'code',None) or type(exc).__name__})
++            code=getattr(exc,'code',None) or (str(exc) if re.fullmatch(r'EDITION_[A-Z_]+',str(exc)) else type(exc).__name__)
++            store.event(db,job_id,'semantic_error',{'code':code,
++                'sqlite_errorname':getattr(exc,'sqlite_errorname',None),
++                'material_ids':list(known)})
+             entries=[{'material_id':m['material_id'],'decision':'uncertain',
+                       'reason':'Смысловой отбор недоступен; решение не подтверждено.','evidence':[]} for m in batch]
+             receipt={'kind':'semantic_unavailable'}
+--- a/newsroom/edition/model.py
++++ b/newsroom/edition/model.py
+@@ -52,7 +52,8 @@
+ ISSUE = obj({'code':{'type':'string','enum':[r['id'] for r in bundle()[0]['rules']]+['unsupported_fact','main_conflict','new_clarification']},'post_fragment':S,'source_fragment':S,'material_id':I,'reason':S,'main_fact':B})
+ REVIEW_RULES=tuple(r['id'] for r in bundle()[0]['rules'] if r['check']=='review' or r['id']=='duplicates')
+ ASSESSMENT=obj({'passed':B,'explanation':S})
+-CHECK = obj({'source_scope':{'type':'string','enum':['in_scope','out_of_scope','uncertain']},'assessments':obj({key:ASSESSMENT for key in REVIEW_RULES}),'approved':B,'issues':arr(ISSUE),'publication_history':obj({'decision':{'type':'string','enum':['duplicate','new_facts','uncertain']},'post_id':I,'reason':S,'published_fragment':S,'evidence':arr(CITATION)})})
++HISTORY_UPDATE=obj({'material_id':I,'quote':S,'post_fragment':S})
++CHECK = obj({'source_scope':{'type':'string','enum':['in_scope','out_of_scope','uncertain']},'assessments':obj({key:ASSESSMENT for key in REVIEW_RULES}),'approved':B,'issues':arr(ISSUE),'publication_history':obj({'decision':{'type':'string','enum':['duplicate','new_facts','uncertain']},'post_id':I,'reason':S,'published_fragment':S,'evidence':arr(CITATION),'updates':arr(HISTORY_UPDATE)})})
+ SHORT_CHECK=obj({'final_draft':DRAFT,'corrections':arr(S),'headline_supported':B,'lead_supported':B,'blocks_supported':arr(B),
+     'issues':arr(obj({'field':{'type':'string','enum':['headline','lead','block']},'block_index':I,'reason':S})),
+     'publication_history':CHECK['properties']['publication_history']})
+@@ -299,7 +300,16 @@
+         'подтверждения означают false. Для publication_history сравни ВСЕ существенные факты '
+         'исходников группы с переданными опубликованными постами: duplicate только если новых '
+         'фактов нет, с post_id, точным published_fragment и evidence каждого initial material_id. '
+-        'Новый существенный факт означает new_facts. Без истории или достаточных данных — uncertain.',
++        'Новый существенный факт означает new_facts только если он сохранён в final_draft. '
++        'Факт из соседнего события, удалённого блока или не вошедший в final_draft не разрешает '
++        'повторную публикацию прежней новости. Сравни итоговый текст со всеми постами истории. '
++        'Перефразирование, пояснение прежнего факта и детализация маршрутов переводов сами по себе '
++        'не являются новым существенным событием. Для new_facts заполни updates: material_id, '
++        'дословную quote из выбранного focus.scope и точный post_fragment из final_draft, '
++        'который передаёт новое существенное сведение, отсутствующее во ВСЕХ постах истории. '
++        'При duplicate или uncertain updates пуст. Проверяй самый свежий пост об этом событии, '
++        'а не только старую менее подробную публикацию. Если итоговый текст повторяет уже '
++        'опубликованные факты, выбирай duplicate. Без истории или достаточных данных — uncertain.',
+         {'draft':draft_data,'materials':materials,'group':group,'publication_history':publication_history or []},settings)
+ 
+ 
+@@ -386,14 +396,23 @@
+         'Отдельно заполни publication_history: сравни событие и ВСЕ существенные факты выбранной группы '
+         'в исходниках с переданными опубликованными постами. duplicate только когда то же событие уже '
+         'опубликовано и ни один исходник группы не добавляет существенных новых фактов. Не ограничивайся '
+-        'черновиком: пропущенный редактором новый факт исключает duplicate. Совпадения бренда или темы '
++        'выбранным текстом: новые факты соседних событий исходника не разрешают повтор этой новости. '
++        'Если новый факт выбранного события отсутствует в черновике, укажи его как new_clarification '
++        'для однократной доработки, чтобы повтор не вышел без обновления. Совпадения бренда или темы '
+         'недостаточно. Уточнение, опровержение, новые участники, числа, даты, условия и изменение статуса '
+         'означают new_facts. Смена источника и пересказ прежних фактов не являются обновлением. '
+         'При недостатке данных или отсутствии истории — uncertain. Для duplicate укажи post_id из '
+         'истории, точный published_fragment, evidence с точными цитатами каждого initial material_id '
+         'и reason, почему все существенные факты уже покрыты. Для остальных решений post_id=0, '
+         'published_fragment пустой. Историю не используй как доказательство фактов нового текста. '
+-        'Это отдельное решение, не стилистическое замечание duplicates и не причина доработки.',
++        'Для new_facts заполни updates: material_id, дословную quote из выбранного focus.scope '
++        'и точный post_fragment черновика, который передаёт новое существенное сведение, '
++        'отсутствующее во ВСЕХ постах истории. Если новый факт выбранного события пропущен, '
++        'post_fragment оставь пустым и добавь new_clarification. Факты соседних событий '
++        'не включай в updates. При duplicate или uncertain updates пуст. '
++        'Проверяй самый свежий пост об этом событии, а не только старую менее подробную публикацию. '
++        'Это отдельное решение, не стилистическое замечание duplicates; пропуск обновления '
++        'выбранного события требует единственной доработки.',
+         {'draft':draft_data,'rendered_html':rendered,'plain_text':plain,'materials':materials,
+          'group':group,'publication_history':publication_history or [],'thematic_policy':settings.get('_topic_registry',{})},settings)
+ 
+--- a/newsroom/edition/publication_history.py
++++ b/newsroom/edition/publication_history.py
+@@ -25,7 +25,9 @@
+ def candidates(db,draft,group,*,now=None):
+     now=now or datetime.now(timezone.utc)
+     rows=db.execute("SELECT post_id,external_id,published_at,text FROM posts WHERE status='PUBLISHED' AND external_id IS NOT NULL AND julianday(published_at)>=julianday(?) AND julianday(published_at)<=julianday(?) ORDER BY published_at DESC,post_id DESC",((now-timedelta(days=7)).isoformat(),now.isoformat())).fetchall()
+-    query=terms(' '.join([draft.get('headline',''),draft.get('lead',''),group.get('subject',''),*group.get('entities',[])]))
++    query=terms(' '.join([draft.get('headline',''),draft.get('lead',''),
++        *(b.get('text','') for b in draft.get('blocks',[])),
++        group.get('subject',''),group.get('event_key',''),*group.get('entities',[])]))
+     if not rows or not query:return []
+     documents=[terms(r['text']) for r in rows]
+     frequency=Counter(t for doc in documents for t in doc)
+@@ -49,10 +51,43 @@
+     return result
+ 
+ 
++def update_issues(verdict,history,materials,group,draft):
++    """New facts must belong to the selected event and appear in the post.
++
++    Older saved verdicts have no updates field; do not invalidate their proof.
++    Current structured responses always include it, even when the list is empty.
++    """
++    decision=verdict.get('publication_history',{})
++    if not history or decision.get('decision')!='new_facts' or 'updates' not in decision:return []
++    from .formatting import contains
++    initial=set(group.get('material_ids',[]));sources={m['material_id']:m for m in materials}
++    fields=[draft.get('headline',''),draft.get('lead',''),*(b.get('text','') for b in draft.get('blocks',[]))]
++    anchor=draft.get('lead') or draft.get('headline','')
++    issues=[];updates=decision.get('updates')
++    if not isinstance(updates,list) or not updates:
++        return [{'code':'duplicates','material_id':next(iter(initial),0),'post_fragment':anchor,
++                 'source_fragment':'','reason':'Допуск как обновления не содержит доказательства нового факта выбранного события в тексте поста.','main_fact':False}]
++    for update in updates:
++        mid=update.get('material_id');quote=update.get('quote');fragment=update.get('post_fragment')
++        scopes=[f['scope'] for f in group.get('focus',[]) if f.get('material_id')==mid and f.get('scope')]
++        grounded=mid in initial and contains(sources.get(mid,{}),quote)
++        selected=grounded and (not scopes or any(contains({'content':s},quote) for s in scopes))
++        retained=isinstance(fragment,str) and bool(fragment.strip()) and any(fragment in field for field in fields)
++        if selected and retained:continue
++        issues.append({'code':'new_clarification' if selected else 'duplicates',
++            'material_id':mid if mid in initial else next(iter(initial),0),'post_fragment':anchor,
++            'source_fragment':quote if selected else '',
++            'reason':('Новое существенное сведение выбранного события не вошло в текст поста.' if selected else
++                      'Сведение для допуска обновления не подтверждено выбранным событием; соседний сюжет не разрешает повтор.'),
++            'main_fact':False})
++    return issues
++
++
+ def confirmed(verdict,history,materials,group):
+     """Require a selected delivered post and verbatim evidence on both sides."""
+     decision=verdict.get('publication_history',{})
+     if not isinstance(decision,dict) or decision.get('decision')!='duplicate':return None
++    if decision.get('updates'):return None  # Contradictory novelty is not proof of a repeat.
+     if not isinstance(decision.get('reason'),str) or not decision['reason'].strip():return None
+     post=next((p for p in history if p['post_id']==decision.get('post_id')),None)
+     fragment=decision.get('published_fragment')
+--- a/newsroom/edition/pipeline.py
++++ b/newsroom/edition/pipeline.py
+@@ -141,6 +141,10 @@
+             store.event(db,document['job_id'],'review_response',{'verdict':exc.review,'receipt':exc.receipt,'draft_hash':store.sha(draft),'error':exc.code},document['document_id'])
+         raise
+     store.event(db,document['job_id'],'review_response',{'verdict':verdict,'receipt':receipt,'draft_hash':store.sha(draft)},document['document_id'])
++    update_issues=publication_history.update_issues(verdict,history,materials,group,draft)
++    if update_issues:
++        verdict={**verdict,'approved':False,'issues':[*verdict.get('issues',[]),*update_issues]}
++        store.event(db,document['job_id'],'publication_update_invalid',{'issues':update_issues},document['document_id'])
+     verdict=model.reconcile_review(verdict,draft,materials)
+     model.validate_review(verdict)
+     if verdict.get('source_scope')=='out_of_scope':
+--- a/newsroom/edition/short_release.py
++++ b/newsroom/edition/short_release.py
+@@ -275,6 +275,13 @@
+             db.execute("UPDATE edition_short_work SET status='DUPLICATE',updated_at=? WHERE document_id=?",(store.stamp(),docid));db.commit()
+             return
+         draft,omitted=finalized(candidate,verdict,materials,group)
++        update_issues=publication_history.update_issues(verdict,history,materials,group,draft)
++        if update_issues:
++            store.event(db,document['job_id'],'publication_update_invalid',{'issues':update_issues},docid)
++            # A failed novelty proof is uncertainty, not a confirmed duplicate
++            # or a reason to repeat the terminal checker. Preserve release.
++            verdict={**verdict,'publication_history':{**verdict['publication_history'],
++                'decision':'uncertain','updates':[]}}
+         if omitted:store.event(db,document['job_id'],'short_optional_omitted',{'issues':omitted},docid)
+         issues=problems(draft,materials,group)
+         if any(i['code'] in ('length','telegram_length') for i in issues):raise ValueError('EDITION_FALLBACK_NEEDS_SPLIT')
+--- a/AGENT_LOGIC.md
++++ b/AGENT_LOGIC.md
+@@ -44,3 +44,5 @@
+ Правило audience_relevance: смысловой AI-фильтр до планирования проверяет конкретное значение каждого события для рынка и аудитории РФ/СНГ. Отсутствие связи означает reject с цитатами и причиной; отклонение сохраняется и исключает резерв после сбоя/перезапуска. Планировщик применяет правило к отдельным событиям смешанных материалов; редактор получает правило; обычный и короткий финальные проверяющие не оценивают значимость для РФ/СНГ. Правило имеет приоритет над brand_events и другими исключениями. Техническая ошибка остаётся uncertain по существующему контракту; это не подтверждение значимости.
+ 
+ Для audience_relevance final_review_enabled=false: обычная и короткая финальные проверки не получают это правило или связанный допуск brand_events, не пересматривают значимость для РФ/СНГ через scope и не требуют местной связи. Отбор остаётся до подготовки; после допуска действует обязательный выпуск с прежними правилами доработки и резерва.
++
++Исправление качества отбора (`filter-quality-v1`): локальные решения давности завершают транзакцию до резервирования AI-запроса через другое соединение. Технический semantic_unavailable не является подтверждённым допуском и при следующем обращении к материалу проверяется заново; подтверждённые отказы не переоткрываются. Ошибки сохраняют безопасный код SQLite и затронутые material_ids. Поиск опубликованной истории учитывает тело поста. В существующем ответе проверяющего updates связывает новый факт выбранного события с цитатой источника и фрагментом текста; пропуск факта использует единственную обычную доработку. Неопределённое обновление на коротком этапе сохраняется с причиной и не создаёт нового запроса, ручного одобрения или запрета выпуска. Только доказанный duplicate исключает доставку.
+--- a/EDITORIAL_RULES.md
++++ b/EDITORIAL_RULES.md
+@@ -176,3 +176,5 @@
+ Проверка давности (`source_age`): известная дата источника старше 48 часов на момент получения исключает материал из выпуска до подготовки, включая резерв и восстановление. Исходник остаётся доступным для контекста. Неизвестная или нераспознанная дата не блокирует выпуск; решение записывается в журнал. Время получения не подменяет дату публикации.
+ 
+ Для audience_relevance final_review_enabled=false: обычная и короткая финальные проверки не получают это правило или связанный допуск brand_events, не пересматривают значимость для РФ/СНГ через scope и не требуют местной связи. Отбор остаётся до подготовки; после допуска действует обязательный выпуск с прежними правилами доработки и резерва.
++
++Подтверждение обновления (`filter-quality-v1`): в том же ответе обычного или короткого проверяющего updates содержит material_id, дословную quote выбранного события и post_fragment итогового текста. Это не отдельный этап или запрос к модели. Пропущенное обновление использует существующую единственную доработку; неопределённое подтверждение на коротком этапе сохраняется с причиной и не блокирует выпуск. Повтор исключается только при доказанном duplicate; совпадения темы недостаточно. Ручное одобрение не добавляется.

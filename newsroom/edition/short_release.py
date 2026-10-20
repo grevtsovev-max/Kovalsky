@@ -125,6 +125,13 @@ def problems(draft,materials,group):
     return code
 
 
+def reporting_fragment(value):
+    """Offline prose must report an action, not a navigation or service label."""
+    if len(value.split())<3:return False
+    if re.search(r'\b(?:файлы? cookie|политик\w* приватности|пользуясь сайтом|подписывайтесь|все права защищены)\b',value,re.I):return False
+    return bool(re.search(r'\b\w+(?:ил[аи]?|али|ет|ют|ут|ется|ятся|ены|лся|лась|л[аи]?|ёт)\b',value,re.I))
+
+
 def extractive(group,materials):
     """Offline safety net: complete Russian source clauses, never a chopped article."""
     # A brand bundle can contain unrelated events. Verbatim snippets cannot
@@ -155,7 +162,7 @@ def extractive(group,materials):
         entities=group.get('entities',[]) if mixed_scope else []
         return not entities or any(canonical(entity) in canonical(value) for entity in entities if entity)
     for lead,proof in fragments:
-        if not matching_entity(lead):continue
+        if not matching_entity(lead) or not reporting_fragment(lead):continue
         # Keep the actor, action, negation and modality. Drop only trailing detail
         # introduced after the event predicate; the full condition remains in lead.
         words=lead.split();head=lead
@@ -175,7 +182,7 @@ def extractive(group,materials):
         head=re.sub(r'^[^\wА-ЯЁа-яё]+','',head).rstrip('.!?')
         if canonical(head)==canonical(lead.rstrip('.!?')):
             additional=next(((v,p) for v,p in fragments if canonical(v)!=canonical(lead) and matching_entity(v) and
-                             not re.match(r'^\d',v) and len(v)<=190),None)
+                             not re.match(r'^\d',v) and len(v)<=190 and reporting_fragment(v)),None)
             if additional:lead,lead_proof=additional
             else:
                 detail=re.search(r'\s+(?:для|на рынке)\b',head,re.I)
@@ -196,7 +203,7 @@ def extractive(group,materials):
         covered={p['material_id'] for p in [*proof,*lead_proof]}
         for mid in group['material_ids']:
             if mid in covered:continue
-            additional=next(((v,p) for v,p in fragments if p[0]['material_id']==mid and len(v)<=190),None)
+            additional=next(((v,p) for v,p in fragments if p[0]['material_id']==mid and len(v)<=190 and reporting_fragment(v)),None)
             if not additional:break
             value,evidence=additional
             result['blocks'].append({'text':value,'kind':'bullet','evidence':evidence,'quote_text':'','quote_author':''})
@@ -275,6 +282,13 @@ def prepare(db,document,settings,reason=None):
             db.execute("UPDATE edition_short_work SET status='DUPLICATE',updated_at=? WHERE document_id=?",(store.stamp(),docid));db.commit()
             return
         draft,omitted=finalized(candidate,verdict,materials,group)
+        update_issues=publication_history.update_issues(verdict,history,materials,group,draft)
+        if update_issues:
+            store.event(db,document['job_id'],'publication_update_invalid',{'issues':update_issues},docid)
+            # A failed novelty proof is uncertainty, not a confirmed duplicate
+            # or a reason to repeat the terminal checker. Preserve release.
+            verdict={**verdict,'publication_history':{**verdict['publication_history'],
+                'decision':'uncertain','updates':[]}}
         if omitted:store.event(db,document['job_id'],'short_optional_omitted',{'issues':omitted},docid)
         issues=problems(draft,materials,group)
         if any(i['code'] in ('length','telegram_length') for i in issues):raise ValueError('EDITION_FALLBACK_NEEDS_SPLIT')

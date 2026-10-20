@@ -1,0 +1,181 @@
+--- /dev/null
++++ b/newsroom/edition/ranking.py
+@@ -0,0 +1,103 @@
++"""Advisory importance of published news; never an admission or delivery gate."""
++import html
++import json
++import re
++from datetime import datetime,timedelta,timezone
++from . import model,store
++from ..agent_control import require_enabled,AgentDisabled
++
++VERSION='news-importance-v1'
++LEVELS={'HIGH':'Высокий','MEDIUM':'Средний','ORDINARY':'Обычный'}
++CRITERIA={
++ 'HIGH':{'law_adopted':'Принятый закон', 'sanctions_rf':'Санкции на РФ',
++         'major_exchange_loss':'Потеря клиентских средств крупных мировых бирж',
++         'rf_cis_loss':'Потеря клиентских средств любого участника РФ/СНГ',
++         'rf_cis_access':'Изменение доступа для РФ/СНГ',
++         'cbr_register':'Вступление в реестры ЦБ',
++         'crypto_launch':'Запуск криптобирж, цифровых депозитариев или криптообменников',
++         'aml_launch':'Запуск AML-решений'},
++ 'MEDIUM':{'regulation_draft':'Проект регулирования','product_launch':'Запуск продукта',
++           'substantive_update':'Существенное обновление известного события',
++           'event':'Ивенты','tracked_statement':'Высказывания отслеживаемых лиц'},
++ 'ORDINARY':{'local_event':'Локальное событие','minor_service_change':'Небольшое изменение сервиса',
++             'commentary':'Комментарий без новых последствий'}}
++SCHEMA='''CREATE TABLE IF NOT EXISTS edition_post_ranks (
++ post_id INTEGER PRIMARY KEY REFERENCES posts(post_id),text_hash TEXT NOT NULL,
++ policy_hash TEXT NOT NULL,level TEXT,status TEXT NOT NULL,reason TEXT NOT NULL,
++ criterion TEXT,quote TEXT,receipt_json TEXT NOT NULL,next_at TEXT,updated_at TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS edition_rank_events (
++ event_id INTEGER PRIMARY KEY,post_ids_json TEXT NOT NULL,payload_json TEXT NOT NULL,created_at TEXT NOT NULL
++);'''
++RESPONSE=model.obj({'ranks':model.arr(model.obj({'post_id':model.I,
++ 'level':{'type':'string','enum':list(LEVELS)},'criterion':model.S,'reason':model.S,'quote':model.S}))})
++
++
++def policy_hash(config):
++    people=config.get('ai',{}).get('_keyword_prefilter',{}).get('people',[])
++    return store.sha({'version':VERSION,'criteria':CRITERIA,'tracked_people':people})
++
++
++def text(value):return html.unescape(re.sub('<[^>]*>','',value))
++
++
++def lookup(db,posts):
++    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='edition_post_ranks'").fetchone():return {}
++    saved={r['post_id']:dict(r) for r in db.execute('SELECT * FROM edition_post_ranks')}
++    result={}
++    for post in posts:
++        row=saved.get(post['post_id'])
++        if row and row['text_hash']==store.sha(post.get('text','')) and row['status']=='RANKED' and store.read(row['receipt_json'],{}).get('rank_version')==VERSION:
++            result[post['post_id']]={'level':row['level'],'label':LEVELS[row['level']],
++                'reason':row['reason'],'criterion':row['criterion'],'quote':row['quote']}
++    return result
++
++
++def classify(db,config,*,now=None):
++    require_enabled(config)
++    db.executescript(SCHEMA)
++    now=now or datetime.now(timezone.utc);digest=policy_hash(config)
++    cutoff=(now-timedelta(days=7)).isoformat();pending=[]
++    for row in db.execute("SELECT p.*,r.text_hash AS ranked_hash,r.policy_hash,r.status AS rank_status,r.next_at FROM posts p LEFT JOIN edition_post_ranks r USING(post_id) WHERE p.status='PUBLISHED' AND julianday(p.published_at)>=julianday(?) ORDER BY p.published_at DESC,p.post_id DESC",(cutoff,)):
++        if row['ranked_hash']==store.sha(row['text']) and row['policy_hash']==digest:
++            if row['rank_status']=='RANKED' or row['next_at'] and row['next_at']>now.isoformat():continue
++        pending.append({'post_id':row['post_id'],'text':row['text']})
++        if len(pending)==20:break
++    if not pending:return 0
++    db.commit();known={p['post_id']:p for p in pending}
++    result=None;receipt={};error=None
++    try:
++        result,receipt=model.ask('news_ranker',RESPONSE,
++            'Оцени важность УЖЕ опубликованных новостей по rank_criteria. Это отдельная оценка для порядка в дайджесте; '
++            'не проверяй допуск, не отклоняй новости и не переписывай их. '
++            'При нескольких критериях выбери самый высокий применимый уровень. '
++            'Принятый закон не путай с проектом. Запуск инфраструктуры/AML выше обычного запуска продукта. '
++            'Высказывание лица из tracked_people — MEDIUM, обычный комментарий без новых последствий — ORDINARY. '
++            'Если высказывание сообщает событие HIGH, выбирай HIGH. '
++            'Географию, масштаб потери средств, статус и последствия не придумывай. '
++            'Вес и известность источника не определяют важность события. '
++            'Верни ровно одну запись на каждый post_id: level, criterion из соответствующего уровня, '
++            'короткую причину по-русски и дословную quote из текста поста. '
++            'Все посты останутся в дайджесте.',
++            {'rank_criteria':CRITERIA,'tracked_people':config.get('ai',{}).get('_keyword_prefilter',{}).get('people',[]),
++             'posts':[{'post_id':p['post_id'],'text':text(p['text'])} for p in pending]},
++            {**config.get('ai',{}),'_agent_control_config':config,'edition_max_output_tokens':6000})
++        entries=result.get('ranks',[])
++        if len(entries)!=len(known) or {e.get('post_id') for e in entries}!=set(known):raise ValueError('RANK_COVERAGE')
++    except AgentDisabled:raise
++    except Exception as exc:
++        error=getattr(exc,'code',None) or type(exc).__name__;entries=[]
++    receipt={**receipt,'rank_version':VERSION}
++    db.execute('INSERT INTO edition_rank_events(post_ids_json,payload_json,created_at) VALUES(?,?,?)',
++               (store.encoded(list(known)),store.encoded({'result':result,'receipt':receipt,'error':error}),store.stamp()))
++    by_id={e['post_id']:e for e in entries};ranked=0
++    for pid,post in known.items():
++        entry=by_id.get(pid);valid=bool(entry and entry.get('level') in LEVELS and entry.get('criterion') in CRITERIA[entry['level']]
++            and entry.get('reason') and entry.get('quote') and ' '.join(entry['quote'].split()) in ' '.join(text(post['text']).split()))
++        status='RANKED' if valid else 'UNRANKED'
++        if valid:ranked+=1
++        db.execute('INSERT OR REPLACE INTO edition_post_ranks VALUES(?,?,?,?,?,?,?,?,?,?,?)',
++            (pid,store.sha(post['text']),digest,entry['level'] if valid else None,status,
++             entry['reason'] if valid else 'Важность пока не подтверждена.',entry['criterion'] if valid else None,
++             entry['quote'] if valid else None,store.encoded(receipt),(now+timedelta(minutes=30)).isoformat() if not valid else None,store.stamp()))
++    db.commit();return ranked
+--- a/newsroom/edition/digests.py
++++ b/newsroom/edition/digests.py
+@@ -60,6 +60,12 @@
+         identity=' '.join(row['text'].casefold().split())
+         if not headline or not url or identity in seen:continue
+         seen.add(identity);result.append({'post_id':row['post_id'],'headline':headline,'url':url})
++    from .ranking import lookup
++    ranks=lookup(db,[dict(r) for r in db.execute("SELECT post_id,text FROM posts WHERE status='PUBLISHED'")])
++    for post in result:post['importance']=ranks.get(post['post_id'])
++    # Stable ordering within each level preserves publication chronology.
++    weights={'HIGH':0,'MEDIUM':1,'ORDINARY':2}
++    result.sort(key=lambda p:weights.get((p.get('importance') or {}).get('level'),3))
+     return result
+ 
+ 
+@@ -139,6 +145,9 @@
+                 lock=acquire_named_lock(config['newsroom']['database'],'digests')
+                 if lock:
+                     db=connect(config['newsroom']['database']);tick(db,config)
++                    from ..topic_registry import attach_cached
++                    from .ranking import classify
++                    attach_cached(config);classify(db,config)
+         except AgentDisabled:pass
+         except Exception as exc:
+             logging.getLogger('newsroom.edition').error('DIGEST_WORKER:%s',getattr(exc,'code',None) or type(exc).__name__)
+--- a/newsroom/cabinet_pipeline.py
++++ b/newsroom/cabinet_pipeline.py
+@@ -543,6 +543,9 @@
+         post['source_ids'] = obj(post.get('source_ids'))
+         post['telegram_url'] = _telegram_message_url(config, post['external_id']) if post.get('external_id') else None
+         output.append(post)
++    from .edition.ranking import lookup
++    importance=lookup(db,output)
++    for post in output:post['importance']=importance.get(post['post_id'])
+     from .post_metrics import for_posts
+     metrics = for_posts(db, [p['post_id'] for p in output])
+     for post in output:
+--- a/newsroom/cabinet_page.py
++++ b/newsroom/cabinet_page.py
+@@ -93,10 +93,11 @@
+ async function forceCollect(){if(!confirm('Запустить полный цикл сбора сейчас? Если появятся материалы, подходящие под правила автопубликации, они могут быть отправлены в Telegram.'))return;const button=document.getElementById('force-collect-button');button.disabled=true;button.textContent='Запускаю…';try{await api('/api/collect',{method:'POST',body:'{}'});collectionWasRunning=true;showNotice('Полный цикл сбора запущен');await refreshCollectionStatus()}catch(e){button.disabled=false;button.textContent='↻ Собрать сейчас';showNotice(e.message);await refreshCollectionStatus()}}
+ function inlineText(s){let out='',i=0,re=/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g,m;while((m=re.exec(s))){out+=esc(s.slice(i,m.index));out+=m[1]?`<a href="${esc(safeUrl(m[2]))}" target="_blank" rel="noopener noreferrer">${esc(m[1])}</a>`:`<strong>${esc(m[3])}</strong>`;i=re.lastIndex}return out+esc(s.slice(i))}
+ function postText(raw){let groups=String(raw||'').trim().split(/\n\s*\n/).filter(Boolean),html='';for(let i=0;i<groups.length;i++){let g=groups[i].trim(),next=groups[i+1]||'';if(/^\*\*.+?:\*\*$/.test(g)&&next.split(/\n/).every(x=>/^➠\s*/.test(x.trim()))){let label=g.replace(/^\*\*|\*\*$/g,'').replace(/:$/,'');html+=`<details class="post-details"><summary>${inlineText(label)}</summary><div class="post-details-body">${next.split(/\n/).map(x=>`<p>${inlineText(x.trim().replace(/^➠\s*/,''))}</p>`).join('')}</div></details>`;i++;continue}html+=`<p>${g.split(/\n/).map(inlineText).join('<br>')}</p>`}return `<div class="excerpt post-copy">${html}</div>`}
++function newsImportanceHtml(p){const r=p.importance;return r?`<div class="meta news-importance"><b>Важность: ${esc(r.label)}</b> · ${esc(r.reason)}</div>`:'<div class="meta news-importance">Важность пока не оценена</div>'}
+ function postMetricsHtml(p){const m=p.ai_metrics||{},num=v=>typeof v==='number'?v.toLocaleString('ru-RU',{maximumFractionDigits:2}):'нет данных',money=v=>typeof v==='number'?'$'+v.toFixed(4):'нет данных',labels={planning:'Планирование (доля)',draft:'Написание',review_response:'Проверка',repair:'Доработка'},stages=Object.entries(m.stages||{}).filter(([k,v])=>v.calls!==0||k==='planning').map(([k,v])=>`${labels[k]}: ${num(v.seconds)} сек. · ${money(v.usd)}`).join(' · ');return `<div class="meta post-ai-metrics">AI-вызовов: ${num(m.calls)} · Время AI: ${num(m.api_seconds)} сек. · Написание и проверка: ${money(m.usd)}</div><div class="meta">От получения до поста: ${num(m.received_to_post_seconds)} сек. · Учтённая стоимость пути: ${money(m.accounted_path_usd)}</div><details class="post-details"><summary>Время и стоимость по этапам</summary><div class="post-details-body">${esc(stages||'Нет сохранённых замеров')}<p>Общее планирование распределено поровну между документами подготовки (${num(m.planning_documents)}). Стоимость пути — оценка учтённых AI-вызовов; транспортные повторы, резервный выпуск и инфраструктура не включены.</p></div></details>`}
+ 
+-function postStatusLabel(v){return ({PENDING:'В обработке',PUBLISHED:'Опубликован',REJECTED:'Не опубликован',ON_HOLD:'На автоматической перепроверке'})[v]||'Статус не определён'}function postCard(p){let facts=p.facts||{},modeLabel=p.mode==='RULE_BASED'?'Резервный режим':p.mode==='AI'?'AI-разбор':p.mode,scopeLabel=({RUSSIA:'Россия',CIS:'СНГ',RUSSIA_CIS:'Россия и СНГ'})[facts.geographic_scope]||facts.geographic_scope,importanceLabel=({HIGH:'Высокая важность',MEDIUM:'Средняя важность',LOW:'Низкая важность'})[facts.importance]||facts.importance;let meta=[modeLabel,scopeLabel,importanceLabel,p.source_name].filter(Boolean).join(' · ');return `<article class="row-card"><div class="row-title">${esc(p.headline||('Пост #'+p.post_id))}</div><div class="meta"><span>${date(p.created_at||p.published_at)}</span>${pill(postStatusLabel(p.status),p.status==='PENDING'?'amber':p.status==='PUBLISHED'?'green':'')}</div>${postText(p.text)}${postMetricsHtml(p)}${p.status==='PENDING'&&p.auto_reason?`<div class="queue-reason ${p.auto_reason.startsWith('Подходит')?'ready':''}">${esc(p.auto_reason)}</div>`:''}${meta?`<div class="meta">${esc(meta)}</div>`:''}<div class="actions">${p.url?`<a class="btn" href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">Источник ↗</a>`:''}${p.telegram_url?`<a class="btn" href="${esc(safeUrl(p.telegram_url))}" target="_blank" rel="noopener">В канале ↗</a>`:''}</div></article>`}
+-function pipelinePostHtml(p){let trace=p.publication_trace,linkLabel=({EXPLICIT:'прямая запись',LEGACY_SOURCE_URL:'совпадение URL источника в старой записи',LEGACY_PROCESSING_TIME:'совпадение источника и времени в старой записи'})[p.link_method]||'связь с материалом не подтверждена',telegram=p.telegram_url?`<a href="${esc(safeUrl(p.telegram_url))}" target="_blank" rel="noopener">Открыть сообщение в Telegram ↗</a>`:p.external_id?`ID сообщения Telegram: ${esc(p.external_id)}`:'Ответ Telegram не сохранён';return `<details class="post-details"><summary>Пост #${esc(p.post_id)} · ${esc(postStatusLabel(p.status))}${trace?` · ${esc(trace.status_label)}`:''}</summary><div class="post-details-body"><div class="meta">Связь: ${esc(linkLabel)} · создан ${date(p.created_at)}${p.published_at?` · опубликован ${date(p.published_at)}`:''}</div>${postText(p.text)}${postMetricsHtml(p)}<p>${telegram}</p>${trace?`<p>${esc(trace.status_label)} · попыток отправки: ${esc(trace.attempt_count)}${trace.telegram_message_id?` · ID Telegram: ${esc(trace.telegram_message_id)}`:''}${trace.error_code?` · ${esc(processingError(trace.error_code))}`:''}</p>${trace.events?.length?`<ol>${trace.events.map(e=>`<li>${esc(e.status)} · ${date(e.at)}</li>`).join('')}</ol>`:''}`:`<p>${p.status==='PUBLISHED'?'Подробный ответ Telegram отсутствует в старой записи.':'Попытка отправки ещё не сохранена.'}</p>`}</div></details>`}
++function postStatusLabel(v){return ({PENDING:'В обработке',PUBLISHED:'Опубликован',REJECTED:'Не опубликован',ON_HOLD:'На автоматической перепроверке'})[v]||'Статус не определён'}function postCard(p){let facts=p.facts||{},modeLabel=p.mode==='RULE_BASED'?'Резервный режим':p.mode==='AI'?'AI-разбор':p.mode,scopeLabel=({RUSSIA:'Россия',CIS:'СНГ',RUSSIA_CIS:'Россия и СНГ'})[facts.geographic_scope]||facts.geographic_scope,importanceLabel=({HIGH:'Высокая важность',MEDIUM:'Средняя важность',LOW:'Низкая важность'})[facts.importance]||facts.importance;let meta=[modeLabel,scopeLabel,importanceLabel,p.source_name].filter(Boolean).join(' · ');return `<article class="row-card"><div class="row-title">${esc(p.headline||('Пост #'+p.post_id))}</div><div class="meta"><span>${date(p.created_at||p.published_at)}</span>${pill(postStatusLabel(p.status),p.status==='PENDING'?'amber':p.status==='PUBLISHED'?'green':'')}</div>${postText(p.text)}${newsImportanceHtml(p)}${postMetricsHtml(p)}${p.status==='PENDING'&&p.auto_reason?`<div class="queue-reason ${p.auto_reason.startsWith('Подходит')?'ready':''}">${esc(p.auto_reason)}</div>`:''}${meta?`<div class="meta">${esc(meta)}</div>`:''}<div class="actions">${p.url?`<a class="btn" href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener">Источник ↗</a>`:''}${p.telegram_url?`<a class="btn" href="${esc(safeUrl(p.telegram_url))}" target="_blank" rel="noopener">В канале ↗</a>`:''}</div></article>`}
++function pipelinePostHtml(p){let trace=p.publication_trace,linkLabel=({EXPLICIT:'прямая запись',LEGACY_SOURCE_URL:'совпадение URL источника в старой записи',LEGACY_PROCESSING_TIME:'совпадение источника и времени в старой записи'})[p.link_method]||'связь с материалом не подтверждена',telegram=p.telegram_url?`<a href="${esc(safeUrl(p.telegram_url))}" target="_blank" rel="noopener">Открыть сообщение в Telegram ↗</a>`:p.external_id?`ID сообщения Telegram: ${esc(p.external_id)}`:'Ответ Telegram не сохранён';return `<details class="post-details"><summary>Пост #${esc(p.post_id)} · ${esc(postStatusLabel(p.status))}${trace?` · ${esc(trace.status_label)}`:''}</summary><div class="post-details-body"><div class="meta">Связь: ${esc(linkLabel)} · создан ${date(p.created_at)}${p.published_at?` · опубликован ${date(p.published_at)}`:''}</div>${postText(p.text)}${newsImportanceHtml(p)}${postMetricsHtml(p)}<p>${telegram}</p>${trace?`<p>${esc(trace.status_label)} · попыток отправки: ${esc(trace.attempt_count)}${trace.telegram_message_id?` · ID Telegram: ${esc(trace.telegram_message_id)}`:''}${trace.error_code?` · ${esc(processingError(trace.error_code))}`:''}</p>${trace.events?.length?`<ol>${trace.events.map(e=>`<li>${esc(e.status)} · ${date(e.at)}</li>`).join('')}</ol>`:''}`:`<p>${p.status==='PUBLISHED'?'Подробный ответ Telegram отсутствует в старой записи.':'Попытка отправки ещё не сохранена.'}</p>`}</div></details>`}
+ function processingError(code){return ({DELIVERY_UNKNOWN:'Telegram не подтвердил результат отправки; повтор заблокирован до сверки с каналом.',AUTO_PUBLISH_GATE_FAILED:'Черновик не прошёл обязательный автоматический допуск.',TELEGRAM_REJECTED:'Telegram отклонил отправку; агент повторит её в установленном лимите.'})[code]||`Последняя ошибка: ${code}`}
+ function ageMinutes(timestamp){let time=Date.parse(timestamp||'');return Number.isFinite(time)?Math.max(0,Math.floor((Date.now()-time)/60000)):0}
+ function pipelineHistoryHtml(i){let events=i.decision_history||[];if(!events.length)return '';return `<details style="margin-top:10px;border-top:1px solid var(--line);padding-top:8px"><summary style="cursor:pointer;color:#536174;font-weight:650">История обработки · ${events.length}</summary><ol style="margin:8px 0 0;padding-left:20px">${events.map(h=>`<li style="margin:0 0 9px"><b>${esc(h.decision)}</b> · ${date(h.at)}${h.steps?.length?`<div style="color:var(--muted);margin:3px 0">${esc(h.steps.join(' → '))}</div>`:''}<div>${esc(h.reason)}</div></li>`).join('')}</ol></details>`}
+@@ -166,7 +167,7 @@
+  }catch(e){if(e.name!=='AbortError'&&request===pipelineRequest){root.innerHTML=`<div class="empty error">Не удалось загрузить материалы: ${esc(e.message)}</div>`;document.getElementById('pipeline-selection').textContent='Данные списка не обновлены';document.getElementById('pipeline-pagination').innerHTML=''}}
+  finally{if(request===pipelineRequest){root.setAttribute('aria-busy','false');pipelineController=null}}
+ }
+-function postCard(p){return `<article class="row-card"><div class="meta">${pill('Опубликован','green')}<span>${date(p.published_at)}</span></div>${postText(p.text)}${postMetricsHtml(p)}${p.telegram_url?`<div class="actions"><a class="btn" href="${esc(safeUrl(p.telegram_url))}" target="_blank" rel="noopener">Открыть в Telegram ↗</a></div>`:''}</article>`}
++function postCard(p){return `<article class="row-card"><div class="meta">${pill('Опубликован','green')}<span>${date(p.published_at)}</span></div>${postText(p.text)}${newsImportanceHtml(p)}${postMetricsHtml(p)}${p.telegram_url?`<div class="actions"><a class="btn" href="${esc(safeUrl(p.telegram_url))}" target="_blank" rel="noopener">Открыть в Telegram ↗</a></div>`:''}</article>`}
+ function renderPublished(){let q=(document.getElementById('published-search').value||'').toLowerCase(),p=posts.filter(x=>x.status==='PUBLISHED'&&(!q||(`${x.headline} ${x.text}`).toLowerCase().includes(q)));document.getElementById('published-list').innerHTML=p.length?p.map(x=>postCard(x)).join(''):'<div class="empty">Публикаций пока нет</div>'}
+ function renderSources(){
+  const query=document.getElementById('source-search').value.trim().toLocaleLowerCase('ru-RU'),section=document.getElementById('source-section'),chosen=section.value,state=document.getElementById('source-state').value,showInactive=document.getElementById('show-inactive-sources').checked;
+--- a/newsroom/cabinet_server.py
++++ b/newsroom/cabinet_server.py
+@@ -293,7 +293,9 @@
+                 rows=db.execute("SELECT post_id,COALESCE((SELECT plain_text FROM edition_documents d WHERE d.post_id=posts.post_id),text) AS text,status,external_id,published_at FROM posts WHERE status='PUBLISHED' ORDER BY published_at DESC LIMIT 200").fetchall()
+                 from .post_metrics import for_posts
+                 metrics = for_posts(db, [r['post_id'] for r in rows])
+-                return [{**dict(r),'ai_metrics':metrics[r['post_id']], 'headline':r['text'].splitlines()[0] if r['text'] else '',
++                from .edition.ranking import lookup
++                ranks=lookup(db,[dict(p) for p in db.execute("SELECT post_id,text FROM posts WHERE status='PUBLISHED' ORDER BY published_at DESC LIMIT 200")])
++                return [{**dict(r),'importance':ranks.get(r['post_id']),'ai_metrics':metrics[r['post_id']], 'headline':r['text'].splitlines()[0] if r['text'] else '',
+                          'telegram_url':_telegram_message_url(config,r['external_id']) if r['external_id'] else None} for r in rows]
+             finally: db.close()
+ 

@@ -1,0 +1,44 @@
+--- a/newsroom/edition/formatting.py
++++ b/newsroom/edition/formatting.py
+@@ -83,14 +83,33 @@
+     return result
+ 
+ 
++def redundant_source_block(block,sources):
++    """Recognize only an entire metadata line duplicated by the source footer."""
++    if block.get('kind')=='quote' or block.get('quote_text'):
++        return False
++    text=normalized(block.get('text',''))
++    for label,url in sources:
++        labels={label,label+' (Telegram)'} if urlsplit(url).hostname in {'t.me','telegram.me'} else {label}
++        candidates={'Источник: '+url}
++        for name in labels:
++            candidates.add('Источник: '+name)
++            for separator in (' — ',' – ',' - ',': ',' '):
++                candidates.add('Источник: '+name+separator+url)
++        if text in candidates:
++            return True
++    return False
++
++
+ def render(draft,materials):
+     output=['<b>'+html.escape(draft['headline'])+'</b>',html.escape(draft['lead'])]
+     plain=[draft['headline'],draft['lead']]
++    sources=source_list(draft,materials)
+     details=[]
+     def flush():
+         if details:
+             output.append('<blockquote expandable>'+'\n\n'.join(details)+'</blockquote>');details.clear()
+     for block in draft.get('blocks',[]):
++        if redundant_source_block(block,sources):continue
+         text=visible(block);escaped=html.escape(text)
+         plain.append(text)
+         if block['kind']=='details':details.append(escaped)
+@@ -98,7 +117,6 @@
+             flush()
+             output.append('<blockquote>'+escaped+'</blockquote>' if block['kind']=='quote' else escaped)
+     flush()
+-    sources=source_list(draft,materials)
+     for label,url in sources:
+         label=label if len(label)<=180 else label[:179]+'…'
+         parsed=urlsplit(url)

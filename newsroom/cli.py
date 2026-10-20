@@ -229,7 +229,10 @@ def _run_collection_cycle(config, db_path, *, persistent=False):
     # SQLite write collision must not kill in-flight editorial/API work.
     import sqlite3
     try:
-        return run_one_cycle(config, db_path)
+        result = run_one_cycle(config, db_path)
+        if persistent:
+            _handoff_collection(config, db_path)
+        return result
     except sqlite3.OperationalError as exc:
         code = getattr(exc, 'sqlite_errorcode', None)
         busy = ((code is not None and (code & 255) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
@@ -238,6 +241,20 @@ def _run_collection_cycle(config, db_path, *, persistent=False):
             raise
         print('Сбор отложен: база временно занята.', flush=True)
         return None
+
+
+def _handoff_collection(config, db_path):
+    """Freeze completed collection before its lock is handed to the next cycle."""
+    if config.get('editorial', {}).get('enabled') is not True:
+        return None
+    require_enabled(config)
+    from .edition import model, store
+    db = connect(db_path)
+    try:
+        store.initialize(db)
+        return store.start(db, model.bundle()[2])
+    finally:
+        db.close()
 
 
 def _safe_error_label(message: str) -> str:
@@ -315,6 +332,8 @@ def main():
             from .edition.worker import run as run_editor
             editor_stop=threading.Event()
             threading.Thread(target=run_editor,args=(args.config,editor_stop),daemon=True,name='newsroom-edition').start()
+            from .edition.digests import run as run_digests
+            threading.Thread(target=run_digests,args=(args.config,editor_stop),daemon=True,name='newsroom-digests').start()
         while True:
             started = time.monotonic()
             config = load_config(args.config)

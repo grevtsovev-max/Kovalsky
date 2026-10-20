@@ -5,6 +5,7 @@ import uuid
 
 from .edition import model, store
 from .agent_control import require_enabled
+from .filter_audit import snapshot as filter_snapshot
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS retrospective_reports (
@@ -55,7 +56,7 @@ def collect(db, hours=24):
                 p=db.execute('SELECT * FROM posts WHERE post_id=?',(d['post_id'],)).fetchone()
                 if p:posts.append(dict(p))
         events=[dict(e) for job in dict.fromkeys(jobs) for e in db.execute('SELECT * FROM edition_events WHERE job_id=? ORDER BY event_id',(job,))]
-        filters=[store.read(r[0],{}) for r in db.execute('SELECT snapshot_json FROM filter_audit WHERE item_id=? ORDER BY audit_id',(item['item_id'],))] if 'filter_audit' in tables else []
+        filters=[filter_snapshot(db,r) for r in db.execute('SELECT * FROM filter_audit WHERE item_id=? ORDER BY audit_id',(item['item_id'],))] if 'filter_audit' in tables else []
         published=[p for p in posts if p['status']=='PUBLISHED' and p['published_at']]
         unknown=any(d['state'] in ('UNKNOWN','SENDING') for d in docs)
         job_states=[j['state'] for j in job_rows if j['job_id'] in jobs]
@@ -151,6 +152,7 @@ def _run(db,config,hours=24,*,evaluate=True):
 
 
 def run(db,config,hours=24,*,evaluate=True,_locked=False):
+    raise ValueError("Модуль отключён владельцем")
     from .locking import acquire_named_lock
     if evaluate:require_enabled(config)
     lock=None if _locked else acquire_named_lock(config['newsroom']['database'],'retrospective')

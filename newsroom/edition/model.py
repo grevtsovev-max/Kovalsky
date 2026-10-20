@@ -52,7 +52,8 @@ PLAN_SELECTION=obj({'groups':arr(obj({'subject':S,'entities':arr(S),'event_key':
 ISSUE = obj({'code':{'type':'string','enum':[r['id'] for r in bundle()[0]['rules']]+['unsupported_fact','main_conflict','new_clarification']},'post_fragment':S,'source_fragment':S,'material_id':I,'reason':S,'main_fact':B})
 REVIEW_RULES=tuple(r['id'] for r in bundle()[0]['rules'] if r['check']=='review' or r['id']=='duplicates')
 ASSESSMENT=obj({'passed':B,'explanation':S})
-CHECK = obj({'source_scope':{'type':'string','enum':['in_scope','out_of_scope','uncertain']},'assessments':obj({key:ASSESSMENT for key in REVIEW_RULES}),'approved':B,'issues':arr(ISSUE),'publication_history':obj({'decision':{'type':'string','enum':['duplicate','new_facts','uncertain']},'post_id':I,'reason':S,'published_fragment':S,'evidence':arr(CITATION)})})
+HISTORY_UPDATE=obj({'material_id':I,'quote':S,'post_fragment':S})
+CHECK = obj({'source_scope':{'type':'string','enum':['in_scope','out_of_scope','uncertain']},'assessments':obj({key:ASSESSMENT for key in REVIEW_RULES}),'approved':B,'issues':arr(ISSUE),'publication_history':obj({'decision':{'type':'string','enum':['duplicate','new_facts','uncertain']},'post_id':I,'reason':S,'published_fragment':S,'evidence':arr(CITATION),'updates':arr(HISTORY_UPDATE)})})
 SHORT_CHECK=obj({'final_draft':DRAFT,'corrections':arr(S),'headline_supported':B,'lead_supported':B,'blocks_supported':arr(B),
     'issues':arr(obj({'field':{'type':'string','enum':['headline','lead','block']},'block_index':I,'reason':S})),
     'publication_history':CHECK['properties']['publication_history']})
@@ -299,7 +300,16 @@ def short_check(draft_data,materials,group,settings,*,publication_history=None):
         'подтверждения означают false. Для publication_history сравни ВСЕ существенные факты '
         'исходников группы с переданными опубликованными постами: duplicate только если новых '
         'фактов нет, с post_id, точным published_fragment и evidence каждого initial material_id. '
-        'Новый существенный факт означает new_facts. Без истории или достаточных данных — uncertain.',
+        'Новый существенный факт означает new_facts только если он сохранён в final_draft. '
+        'Факт из соседнего события, удалённого блока или не вошедший в final_draft не разрешает '
+        'повторную публикацию прежней новости. Сравни итоговый текст со всеми постами истории. '
+        'Перефразирование, пояснение прежнего факта и детализация маршрутов переводов сами по себе '
+        'не являются новым существенным событием. Для new_facts заполни updates: material_id, '
+        'дословную quote из выбранного focus.scope и точный post_fragment из final_draft, '
+        'который передаёт новое существенное сведение, отсутствующее во ВСЕХ постах истории. '
+        'При duplicate или uncertain updates пуст. Проверяй самый свежий пост об этом событии, '
+        'а не только старую менее подробную публикацию. Если итоговый текст повторяет уже '
+        'опубликованные факты, выбирай duplicate. Без истории или достаточных данных — uncertain.',
         {'draft':draft_data,'materials':materials,'group':group,'publication_history':publication_history or []},settings)
 
 
@@ -386,14 +396,23 @@ def check(draft_data,materials,settings,*,group=None,publication_history=None):
         'Отдельно заполни publication_history: сравни событие и ВСЕ существенные факты выбранной группы '
         'в исходниках с переданными опубликованными постами. duplicate только когда то же событие уже '
         'опубликовано и ни один исходник группы не добавляет существенных новых фактов. Не ограничивайся '
-        'черновиком: пропущенный редактором новый факт исключает duplicate. Совпадения бренда или темы '
+        'выбранным текстом: новые факты соседних событий исходника не разрешают повтор этой новости. '
+        'Если новый факт выбранного события отсутствует в черновике, укажи его как new_clarification '
+        'для однократной доработки, чтобы повтор не вышел без обновления. Совпадения бренда или темы '
         'недостаточно. Уточнение, опровержение, новые участники, числа, даты, условия и изменение статуса '
         'означают new_facts. Смена источника и пересказ прежних фактов не являются обновлением. '
         'При недостатке данных или отсутствии истории — uncertain. Для duplicate укажи post_id из '
         'истории, точный published_fragment, evidence с точными цитатами каждого initial material_id '
         'и reason, почему все существенные факты уже покрыты. Для остальных решений post_id=0, '
         'published_fragment пустой. Историю не используй как доказательство фактов нового текста. '
-        'Это отдельное решение, не стилистическое замечание duplicates и не причина доработки.',
+        'Для new_facts заполни updates: material_id, дословную quote из выбранного focus.scope '
+        'и точный post_fragment черновика, который передаёт новое существенное сведение, '
+        'отсутствующее во ВСЕХ постах истории. Если новый факт выбранного события пропущен, '
+        'post_fragment оставь пустым и добавь new_clarification. Факты соседних событий '
+        'не включай в updates. При duplicate или uncertain updates пуст. '
+        'Проверяй самый свежий пост об этом событии, а не только старую менее подробную публикацию. '
+        'Это отдельное решение, не стилистическое замечание duplicates; пропуск обновления '
+        'выбранного события требует единственной доработки.',
         {'draft':draft_data,'rendered_html':rendered,'plain_text':plain,'materials':materials,
          'group':group,'publication_history':publication_history or [],'thematic_policy':settings.get('_topic_registry',{})},settings)
 

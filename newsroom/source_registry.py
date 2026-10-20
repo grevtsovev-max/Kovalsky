@@ -209,6 +209,8 @@ def source_for(row, existing):
         kind = 'telegram'
     elif host == 'news.google.com' and parsed.path.startswith('/rss/'):
         kind = 'google_news'
+    elif host in {'cbr.ru', 'www.cbr.ru'} and parsed.path.rstrip('/').lower() in {'/rss/rbr', '/rss/rssnews'}:
+        kind = 'rss'
     elif url in existing:
         kind = existing[url].get('type', 'rss')
     elif re.search(r'(?:\.rss|\.xml|/feed/?|/rss/?)$', parsed.path, re.I):
@@ -259,6 +261,21 @@ def apply_snapshot(config, snapshot):
         if not row.get('enabled', True):
             row['status'] = 'Выключен в таблице'
         rows.append(row)
+    # The general CBR feed announces the decisions index, not its individual
+    # records. Follow its dedicated feed under the same registry authority.
+    decisions_url = 'https://www.cbr.ru/rss/rbr'
+    parents = [s for s in selected.values()
+               if urlsplit(s['url']).hostname in {'cbr.ru', 'www.cbr.ru'}
+               and urlsplit(s['url']).path.rstrip('/').lower() == '/rss/rssnews']
+    if parents and decisions_url not in selected:
+        parent = next((s for s in parents if s.get('active', True)), parents[0])
+        selected[decisions_url] = {
+            **parent, **existing.get(decisions_url, {}),
+            'name': 'Банк России · решения об участниках рынка',
+            'url': decisions_url, 'type': 'rss',
+            'active': any(s.get('active', True) for s in parents)
+                      and existing.get(decisions_url, {}).get('active', True),
+        }
     config['sources'] = list(selected.values())
     config['_registry_authoritative'] = True
     config['_registry_rows'] = rows

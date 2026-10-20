@@ -543,6 +543,9 @@ def cabinet_posts(db, config):
         post['source_ids'] = obj(post.get('source_ids'))
         post['telegram_url'] = _telegram_message_url(config, post['external_id']) if post.get('external_id') else None
         output.append(post)
+    from .edition.ranking import lookup
+    importance=lookup(db,output)
+    for post in output:post['importance']=importance.get(post['post_id'])
     from .post_metrics import for_posts
     metrics = for_posts(db, [p['post_id'] for p in output])
     for post in output:

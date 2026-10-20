@@ -305,8 +305,8 @@ def connect(path: str) -> sqlite3.Connection:
         db.execute('ALTER TABLE telegram_feedback_corrections ADD COLUMN next_attempt_at TEXT')
     from .delivery import SCHEMA as DELIVERY_SCHEMA
     db.executescript(DELIVERY_SCHEMA)
-    from .filter_audit import SCHEMA as FILTER_AUDIT_SCHEMA
-    db.executescript(FILTER_AUDIT_SCHEMA)
+    from .filter_audit import initialize as initialize_filter_audit
+    initialize_filter_audit(db)
     from .decisions import SCHEMA as DECISION_SCHEMA
     db.executescript(DECISION_SCHEMA)
     from .knowledge import SCHEMA as KNOWLEDGE_SCHEMA

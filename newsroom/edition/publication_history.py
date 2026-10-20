@@ -25,7 +25,9 @@ def terms(value):
 def candidates(db,draft,group,*,now=None):
     now=now or datetime.now(timezone.utc)
     rows=db.execute("SELECT post_id,external_id,published_at,text FROM posts WHERE status='PUBLISHED' AND external_id IS NOT NULL AND julianday(published_at)>=julianday(?) AND julianday(published_at)<=julianday(?) ORDER BY published_at DESC,post_id DESC",((now-timedelta(days=7)).isoformat(),now.isoformat())).fetchall()
-    query=terms(' '.join([draft.get('headline',''),draft.get('lead',''),group.get('subject',''),*group.get('entities',[])]))
+    query=terms(' '.join([draft.get('headline',''),draft.get('lead',''),
+        *(b.get('text','') for b in draft.get('blocks',[])),
+        group.get('subject',''),group.get('event_key',''),*group.get('entities',[])]))
     if not rows or not query:return []
     documents=[terms(r['text']) for r in rows]
     frequency=Counter(t for doc in documents for t in doc)
@@ -49,10 +51,43 @@ def context(db,document,draft,group):
     return result
 
 
+def update_issues(verdict,history,materials,group,draft):
+    """New facts must belong to the selected event and appear in the post.
+
+    Older saved verdicts have no updates field; do not invalidate their proof.
+    Current structured responses always include it, even when the list is empty.
+    """
+    decision=verdict.get('publication_history',{})
+    if not history or decision.get('decision')!='new_facts' or 'updates' not in decision:return []
+    from .formatting import contains
+    initial=set(group.get('material_ids',[]));sources={m['material_id']:m for m in materials}
+    fields=[draft.get('headline',''),draft.get('lead',''),*(b.get('text','') for b in draft.get('blocks',[]))]
+    anchor=draft.get('lead') or draft.get('headline','')
+    issues=[];updates=decision.get('updates')
+    if not isinstance(updates,list) or not updates:
+        return [{'code':'duplicates','material_id':next(iter(initial),0),'post_fragment':anchor,
+                 'source_fragment':'','reason':'Допуск как обновления не содержит доказательства нового факта выбранного события в тексте поста.','main_fact':False}]
+    for update in updates:
+        mid=update.get('material_id');quote=update.get('quote');fragment=update.get('post_fragment')
+        scopes=[f['scope'] for f in group.get('focus',[]) if f.get('material_id')==mid and f.get('scope')]
+        grounded=mid in initial and contains(sources.get(mid,{}),quote)
+        selected=grounded and (not scopes or any(contains({'content':s},quote) for s in scopes))
+        retained=isinstance(fragment,str) and bool(fragment.strip()) and any(fragment in field for field in fields)
+        if selected and retained:continue
+        issues.append({'code':'new_clarification' if selected else 'duplicates',
+            'material_id':mid if mid in initial else next(iter(initial),0),'post_fragment':anchor,
+            'source_fragment':quote if selected else '',
+            'reason':('Новое существенное сведение выбранного события не вошло в текст поста.' if selected else
+                      'Сведение для допуска обновления не подтверждено выбранным событием; соседний сюжет не разрешает повтор.'),
+            'main_fact':False})
+    return issues
+
+
 def confirmed(verdict,history,materials,group):
     """Require a selected delivered post and verbatim evidence on both sides."""
     decision=verdict.get('publication_history',{})
     if not isinstance(decision,dict) or decision.get('decision')!='duplicate':return None
+    if decision.get('updates'):return None  # Contradictory novelty is not proof of a repeat.
     if not isinstance(decision.get('reason'),str) or not decision['reason'].strip():return None
     post=next((p for p in history if p['post_id']==decision.get('post_id')),None)
     fragment=decision.get('published_fragment')

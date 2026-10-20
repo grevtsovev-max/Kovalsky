@@ -13,6 +13,7 @@ from ..runtime import Runtime,BudgetDeferred
 from . import model,store
 
 def process_one(db,config,queue_id=None):
+    raise ValueError("Модуль отключён владельцем")
     require_enabled(config)
     if queue_id is None:
         row=db.execute("SELECT * FROM recruitment_queue WHERE state IN ('PENDING','WAITING') AND next_at<=? ORDER BY id LIMIT 1",(store.stamp(),)).fetchone()
@@ -48,6 +49,7 @@ def process_one(db,config,queue_id=None):
     return True
 
 def run(config,once=False):
+    raise ValueError("Модуль отключён владельцем")
     database=config['newsroom']['database']
     lock=Path(database).with_suffix('.recruitment.lock').open('a+')
     try:fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
